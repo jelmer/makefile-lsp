@@ -1,0 +1,82 @@
+{
+  "name": "coc-make",
+  "version": "0.1.0",
+  "description": "Makefile language server support for coc.nvim",
+  "main": "lib/index.js",
+  "engines": {
+    "coc": "^0.0.80"
+  },
+  "keywords": [
+    "coc.nvim",
+    "makefile",
+    "make",
+    "lsp"
+  ],
+  "author": "Jelmer Vernooij",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/jelmer/makefile-lsp"
+  },
+  "homepage": "https://github.com/jelmer/makefile-lsp#readme",
+  "bugs": {
+    "url": "https://github.com/jelmer/makefile-lsp/issues"
+  },
+  "activationEvents": [
+    "onLanguage:make"
+  ],
+  "contributes": {
+    "configuration": {
+      "type": "object",
+      "title": "coc-make configuration",
+      "properties": {
+        "make.enable": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable makefile language server"
+        },
+        "make.serverPath": {
+          "type": "string",
+          "default": "makefile-lsp",
+          "description": "Path to makefile-lsp executable"
+        }
+      }
+    },
+    "semanticTokenTypes": [
+      {
+        "id": "makefileTarget",
+        "superType": "function",
+        "description": "Makefile target name"
+      },
+      {
+        "id": "makefileVariable",
+        "superType": "variable",
+        "description": "Makefile variable reference"
+      },
+      {
+        "id": "makefilePrerequisite",
+        "superType": "type",
+        "description": "Makefile prerequisite/dependency"
+      },
+      {
+        "id": "makefileRecipe",
+        "superType": "string",
+        "description": "Makefile recipe command"
+      }
+    ]
+  },
+  "scripts": {
+    "build": "tsc -p .",
+    "watch": "tsc -p . -w",
+    "test": "jest",
+    "test:watch": "jest --watch"
+  },
+  "devDependencies": {
+    "@types/node": "^12.12.0",
+    "@types/jest": "^29.0.0",
+    "coc.nvim": "^0.0.82",
+    "jest": "^29.0.0",
+    "ts-jest": "^29.0.0",
+    "typescript": "^4.9.0"
+  }
+}
