@@ -10,6 +10,7 @@ use tower_lsp_server::{Client, LanguageServer, LspService, Server};
 mod completion;
 mod diagnostics;
 mod folding;
+mod goto;
 mod position;
 mod semantic;
 mod symbols;
@@ -69,6 +70,7 @@ impl LanguageServer for Backend {
                     all_commit_characters: None,
                     completion_item: None,
                 }),
+                definition_provider: Some(OneOf::Left(true)),
                 folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
                 document_symbol_provider: Some(OneOf::Left(true)),
                 semantic_tokens_provider: Some(
@@ -159,6 +161,25 @@ impl LanguageServer for Backend {
         } else {
             Ok(Some(CompletionResponse::Array(completions)))
         }
+    }
+
+    async fn goto_definition(
+        &self,
+        params: GotoDefinitionParams,
+    ) -> Result<Option<GotoDefinitionResponse>> {
+        let uri = &params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+
+        let files = self.files.lock().await;
+        let Some(file_info) = files.get(uri) else {
+            return Ok(None);
+        };
+
+        let makefile = file_info.parsed.tree();
+        let result = goto::goto_definition(&makefile, &file_info.text, position, uri);
+        drop(files);
+
+        Ok(result)
     }
 
     async fn semantic_tokens_full(
