@@ -11,6 +11,7 @@ mod completion;
 mod diagnostics;
 mod folding;
 mod goto;
+mod hover;
 mod position;
 mod semantic;
 mod symbols;
@@ -70,6 +71,7 @@ impl LanguageServer for Backend {
                     all_commit_characters: None,
                     completion_item: None,
                 }),
+                hover_provider: Some(HoverProviderCapability::Simple(true)),
                 definition_provider: Some(OneOf::Left(true)),
                 folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
                 document_symbol_provider: Some(OneOf::Left(true)),
@@ -161,6 +163,22 @@ impl LanguageServer for Backend {
         } else {
             Ok(Some(CompletionResponse::Array(completions)))
         }
+    }
+
+    async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
+        let uri = &params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+
+        let files = self.files.lock().await;
+        let Some(file_info) = files.get(uri) else {
+            return Ok(None);
+        };
+
+        let makefile = file_info.parsed.tree();
+        let result = hover::get_hover(&makefile, &file_info.text, position);
+        drop(files);
+
+        Ok(result)
     }
 
     async fn goto_definition(
