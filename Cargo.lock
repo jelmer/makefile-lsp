@@ -209,9 +209,7 @@ dependencies = [
 
 [[package]]
 name = "makefile-lossless"
-version = "0.3.29"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4c741b7fb8c560314dac3b6e1cce721cd4ad68463bc0f036b7b6654267935aaa"
+version = "0.3.30"
 dependencies = [
  "log",
  "rowan",
