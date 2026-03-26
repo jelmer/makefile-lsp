@@ -13,6 +13,7 @@ mod folding;
 mod goto;
 mod hover;
 mod position;
+mod references;
 mod semantic;
 mod symbols;
 
@@ -72,6 +73,7 @@ impl LanguageServer for Backend {
                     completion_item: None,
                 }),
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
+                references_provider: Some(OneOf::Left(true)),
                 definition_provider: Some(OneOf::Left(true)),
                 folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
                 document_symbol_provider: Some(OneOf::Left(true)),
@@ -162,6 +164,32 @@ impl LanguageServer for Backend {
             Ok(None)
         } else {
             Ok(Some(CompletionResponse::Array(completions)))
+        }
+    }
+
+    async fn references(&self, params: ReferenceParams) -> Result<Option<Vec<Location>>> {
+        let uri = &params.text_document_position.text_document.uri;
+        let position = params.text_document_position.position;
+
+        let files = self.files.lock().await;
+        let Some(file_info) = files.get(uri) else {
+            return Ok(None);
+        };
+
+        let makefile = file_info.parsed.tree();
+        let refs = references::find_references(
+            &makefile,
+            &file_info.text,
+            position,
+            uri,
+            params.context.include_declaration,
+        );
+        drop(files);
+
+        if refs.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(refs))
         }
     }
 
