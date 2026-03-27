@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use makefile_lossless::{Makefile, Parse, VariableReference};
+use makefile_lossless::{Makefile, MakefileItem, Parse, VariableReference};
 use rowan::ast::AstNode;
 use tower_lsp_server::ls_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Position, Range};
 
@@ -183,6 +183,8 @@ pub fn get_diagnostics(
     diagnostics.extend(check_empty_variable_references(source_text, &makefile));
     diagnostics.extend(check_self_dependency(source_text, &makefile));
     diagnostics.extend(check_duplicate_targets(source_text, &makefile));
+    diagnostics.extend(check_missing_phony_targets(source_text, &makefile));
+    diagnostics.extend(check_include_missing_path(source_text, &makefile));
 
     diagnostics
 }
@@ -358,6 +360,57 @@ fn check_self_dependency(source_text: &str, makefile: &Makefile) -> Vec<Diagnost
                     DiagnosticSeverity::WARNING,
                     "self-dependency",
                     format!("target '{}' lists itself as a prerequisite", prereq),
+                ));
+            }
+        }
+    }
+
+    diagnostics
+}
+
+/// Check for `.PHONY` prerequisites that are never defined as targets.
+fn check_missing_phony_targets(source_text: &str, makefile: &Makefile) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+
+    let defined_targets: HashSet<String> = makefile
+        .rules()
+        .flat_map(|r| r.targets().collect::<Vec<_>>())
+        .collect();
+
+    for rule in makefile.rules_by_target(".PHONY") {
+        let rule_range = text_range_to_lsp_range(source_text, rule.syntax().text_range());
+        for prereq in rule.prerequisites() {
+            if !defined_targets.contains(&prereq) {
+                diagnostics.push(make_diagnostic(
+                    rule_range,
+                    DiagnosticSeverity::WARNING,
+                    "undefined-phony-target",
+                    format!(
+                        "target '{}' is declared .PHONY but is never defined",
+                        prereq
+                    ),
+                ));
+            }
+        }
+    }
+
+    diagnostics
+}
+
+/// Check for `include` directives with missing paths.
+fn check_include_missing_path(source_text: &str, makefile: &Makefile) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+
+    for item in makefile.items() {
+        if let MakefileItem::Include(inc) = item {
+            let path = inc.path().unwrap_or_default();
+            if path.is_empty() {
+                let range = text_range_to_lsp_range(source_text, inc.syntax().text_range());
+                diagnostics.push(make_diagnostic(
+                    range,
+                    DiagnosticSeverity::ERROR,
+                    "include-missing-path",
+                    "include directive has no file path".to_string(),
                 ));
             }
         }
@@ -576,5 +629,44 @@ mod tests {
             .collect();
         assert_eq!(self_deps.len(), 1);
         assert!(self_deps[0].message.contains("foo"));
+    }
+
+    // Undefined .PHONY target tests
+
+    #[test]
+    fn test_undefined_phony_target() {
+        let text = ".PHONY: clean\n";
+        let codes = diag_codes(text);
+        assert!(codes.contains(&"undefined-phony-target".to_string()));
+    }
+
+    #[test]
+    fn test_defined_phony_target_ok() {
+        let text = ".PHONY: clean\nclean:\n\trm -f *.o\n";
+        let codes = diag_codes(text);
+        assert!(!codes.contains(&"undefined-phony-target".to_string()));
+    }
+
+    #[test]
+    fn test_phony_partially_defined() {
+        let text = ".PHONY: all clean\nall: build\n\techo done\n";
+        let diags = get_diags(text);
+        let phony_diags: Vec<_> = diags
+            .iter()
+            .filter(|d| {
+                d.code == Some(NumberOrString::String("undefined-phony-target".to_string()))
+            })
+            .collect();
+        assert_eq!(phony_diags.len(), 1);
+        assert!(phony_diags[0].message.contains("clean"));
+    }
+
+    // Include missing path tests
+
+    #[test]
+    fn test_include_with_path_ok() {
+        let text = "include config.mk\n";
+        let codes = diag_codes(text);
+        assert!(!codes.contains(&"include-missing-path".to_string()));
     }
 }
