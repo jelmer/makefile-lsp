@@ -1,8 +1,9 @@
 //! Diagnostics for Makefile files.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
-use makefile_lossless::{Makefile, Parse};
+use makefile_lossless::{Makefile, Parse, VariableReference};
+use rowan::ast::AstNode;
 use tower_lsp_server::ls_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Position, Range};
 
 use crate::position::text_range_to_lsp_range;
@@ -180,6 +181,10 @@ pub fn get_diagnostics(
 
     let makefile = parsed.tree();
     diagnostics.extend(check_undefined_variables(source_text, &makefile));
+    diagnostics.extend(check_recursive_variable_self_reference(
+        source_text, &makefile,
+    ));
+    diagnostics.extend(check_duplicate_targets(source_text, &makefile));
 
     diagnostics
 }
@@ -207,6 +212,114 @@ fn check_undefined_variables(source_text: &str, makefile: &Makefile) -> Vec<Diag
             "undefined-variable",
             format!("variable '{}' is not defined", name),
         ));
+    }
+
+    diagnostics
+}
+
+/// Check for recursive variables that reference themselves, which causes infinite expansion.
+///
+/// Only flags `=` (recursively-expanded) assignments, since `:=`/`::=`/`:::=` expand
+/// immediately and self-references are valid there (they refer to the previous value).
+fn check_recursive_variable_self_reference(
+    source_text: &str,
+    makefile: &Makefile,
+) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+
+    for var_def in makefile.variable_definitions() {
+        let Some(name) = var_def.name() else {
+            continue;
+        };
+        let op = var_def.assignment_operator().unwrap_or_default();
+        if op != "=" {
+            continue;
+        }
+
+        // Walk the EXPR descendants of this variable definition for self-references
+        for child in var_def.syntax().descendants() {
+            if let Some(var_ref) = VariableReference::cast(child) {
+                if var_ref.name().as_deref() == Some(&name) {
+                    let range = text_range_to_lsp_range(source_text, var_ref.text_range());
+                    diagnostics.push(make_diagnostic(
+                        range,
+                        DiagnosticSeverity::WARNING,
+                        "recursive-variable-reference",
+                        format!(
+                            "variable '{}' references itself in a recursively-expanded definition",
+                            name
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+
+    diagnostics
+}
+
+/// Special targets where duplicate definitions are expected (they accumulate prerequisites).
+const ACCUMULATING_TARGETS: &[&str] = &[
+    ".PHONY",
+    ".SUFFIXES",
+    ".PRECIOUS",
+    ".INTERMEDIATE",
+    ".SECONDARY",
+    ".IGNORE",
+    ".SILENT",
+    ".NOTPARALLEL",
+];
+
+/// Check for duplicate target definitions.
+///
+/// In GNU Make, when the same target appears in multiple single-colon rules,
+/// only the last one's recipe is used, which is almost always a mistake.
+/// Double-colon rules (`::`) are intentionally excluded since they allow
+/// multiple recipe blocks.
+fn check_duplicate_targets(source_text: &str, makefile: &Makefile) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+    let mut seen: HashMap<String, Range> = HashMap::new();
+
+    for rule in makefile.rules() {
+        for target in rule.targets() {
+            // Skip pattern rules (contain %)
+            if target.contains('%') {
+                continue;
+            }
+            // Skip special targets that accumulate prerequisites
+            if ACCUMULATING_TARGETS.contains(&target.as_str()) {
+                continue;
+            }
+            // Skip double-colon rules (they intentionally allow multiple definitions)
+            if rule.is_double_colon() {
+                continue;
+            }
+
+            let rule_range = text_range_to_lsp_range(source_text, rule.syntax().text_range());
+            // Narrow the range to just the target name
+            let target_range = Range {
+                start: rule_range.start,
+                end: Position::new(
+                    rule_range.start.line,
+                    rule_range.start.character + target.len() as u32,
+                ),
+            };
+
+            if let Some(first_range) = seen.get(&target) {
+                diagnostics.push(make_diagnostic(
+                    target_range,
+                    DiagnosticSeverity::WARNING,
+                    "duplicate-target",
+                    format!(
+                        "target '{}' already defined on line {}",
+                        target,
+                        first_range.start.line + 1
+                    ),
+                ));
+            } else {
+                seen.insert(target, target_range);
+            }
+        }
     }
 
     diagnostics
@@ -288,5 +401,95 @@ mod tests {
         let text = "CFLAGS = $(FOO) $(BAR)\n";
         let codes = diag_codes(text);
         assert_eq!(codes, vec!["undefined-variable", "undefined-variable"]);
+    }
+
+    // Recursive self-reference tests
+
+    #[test]
+    fn test_recursive_self_reference() {
+        let text = "FOO = $(FOO) bar\n";
+        let codes = diag_codes(text);
+        assert!(codes.contains(&"recursive-variable-reference".to_string()));
+    }
+
+    #[test]
+    fn test_simple_expand_self_reference_ok() {
+        // := expands immediately, so self-reference is valid (refers to previous value)
+        let text = "FOO := $(FOO) bar\n";
+        let codes = diag_codes(text);
+        assert!(!codes.contains(&"recursive-variable-reference".to_string()));
+    }
+
+    #[test]
+    fn test_append_self_reference_ok() {
+        let text = "FOO += bar\n";
+        let codes = diag_codes(text);
+        assert!(!codes.contains(&"recursive-variable-reference".to_string()));
+    }
+
+    #[test]
+    fn test_recursive_self_reference_message() {
+        let text = "FOO = $(FOO)\n";
+        let diags = get_diags(text);
+        let self_ref: Vec<_> = diags
+            .iter()
+            .filter(|d| {
+                d.code == Some(NumberOrString::String("recursive-variable-reference".to_string()))
+            })
+            .collect();
+        assert_eq!(self_ref.len(), 1);
+        assert!(self_ref[0].message.contains("FOO"));
+    }
+
+    // Duplicate target tests
+
+    #[test]
+    fn test_duplicate_target() {
+        let text = "all: build\n\techo first\n\nall: test\n\techo second\n";
+        let codes = diag_codes(text);
+        assert!(codes.contains(&"duplicate-target".to_string()));
+    }
+
+    #[test]
+    fn test_no_duplicate_different_targets() {
+        let text = "all: build\n\techo all\n\nbuild:\n\techo build\n";
+        let codes = diag_codes(text);
+        assert!(!codes.contains(&"duplicate-target".to_string()));
+    }
+
+    #[test]
+    fn test_duplicate_target_phony_ok() {
+        // .PHONY can appear multiple times
+        let text = ".PHONY: all\n.PHONY: build\n";
+        let codes = diag_codes(text);
+        assert!(!codes.contains(&"duplicate-target".to_string()));
+    }
+
+    #[test]
+    fn test_duplicate_target_double_colon_ok() {
+        // Double-colon rules intentionally allow duplicates
+        let text = "all:: dep1\n\techo first\n\nall:: dep2\n\techo second\n";
+        let codes = diag_codes(text);
+        assert!(!codes.contains(&"duplicate-target".to_string()));
+    }
+
+    #[test]
+    fn test_duplicate_target_message() {
+        let text = "all: build\n\techo first\n\nall: test\n\techo second\n";
+        let diags = get_diags(text);
+        let dups: Vec<_> = diags
+            .iter()
+            .filter(|d| d.code == Some(NumberOrString::String("duplicate-target".to_string())))
+            .collect();
+        assert_eq!(dups.len(), 1);
+        assert!(dups[0].message.contains("all"));
+        assert!(dups[0].message.contains("line 1"));
+    }
+
+    #[test]
+    fn test_pattern_rule_not_duplicate() {
+        let text = "%.o: %.c\n\t$(CC) -c $<\n\n%.o: %.cpp\n\t$(CXX) -c $<\n";
+        let codes = diag_codes(text);
+        assert!(!codes.contains(&"duplicate-target".to_string()));
     }
 }
