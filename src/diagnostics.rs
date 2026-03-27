@@ -185,6 +185,8 @@ pub fn get_diagnostics(
         source_text, &makefile,
     ));
     diagnostics.extend(check_duplicate_targets(source_text, &makefile));
+    diagnostics.extend(check_empty_variable_references(source_text, &makefile));
+    diagnostics.extend(check_self_dependency(source_text, &makefile));
 
     diagnostics
 }
@@ -318,6 +320,49 @@ fn check_duplicate_targets(source_text: &str, makefile: &Makefile) -> Vec<Diagno
                 ));
             } else {
                 seen.insert(target, target_range);
+            }
+        }
+    }
+
+    diagnostics
+}
+
+/// Check for empty variable references like `$()` or `${}`.
+fn check_empty_variable_references(source_text: &str, makefile: &Makefile) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+
+    for var_ref in makefile.variable_references() {
+        if var_ref.name().is_none() {
+            let range = text_range_to_lsp_range(source_text, var_ref.text_range());
+            diagnostics.push(make_diagnostic(
+                range,
+                DiagnosticSeverity::WARNING,
+                "empty-variable-reference",
+                "empty variable reference".to_string(),
+            ));
+        }
+    }
+
+    diagnostics
+}
+
+/// Check for targets that list themselves as prerequisites.
+fn check_self_dependency(source_text: &str, makefile: &Makefile) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+
+    for rule in makefile.rules() {
+        let targets: Vec<String> = rule.targets().collect();
+        for prereq in rule.prerequisites() {
+            if targets.contains(&prereq) {
+                // Find the prerequisite position within the PREREQUISITES node
+                let rule_range =
+                    text_range_to_lsp_range(source_text, rule.syntax().text_range());
+                diagnostics.push(make_diagnostic(
+                    rule_range,
+                    DiagnosticSeverity::WARNING,
+                    "self-dependency",
+                    format!("target '{}' lists itself as a prerequisite", prereq),
+                ));
             }
         }
     }
@@ -491,5 +536,49 @@ mod tests {
         let text = "%.o: %.c\n\t$(CC) -c $<\n\n%.o: %.cpp\n\t$(CXX) -c $<\n";
         let codes = diag_codes(text);
         assert!(!codes.contains(&"duplicate-target".to_string()));
+    }
+
+    // Empty variable reference tests
+
+    #[test]
+    fn test_empty_variable_reference() {
+        let text = "FOO = $()\n";
+        let codes = diag_codes(text);
+        assert!(codes.contains(&"empty-variable-reference".to_string()));
+    }
+
+    #[test]
+    fn test_non_empty_variable_reference_ok() {
+        let text = "FOO = $(BAR)\n";
+        let codes = diag_codes(text);
+        assert!(!codes.contains(&"empty-variable-reference".to_string()));
+    }
+
+    // Self-dependency tests
+
+    #[test]
+    fn test_self_dependency() {
+        let text = "foo: foo bar\n\techo $@\n";
+        let codes = diag_codes(text);
+        assert!(codes.contains(&"self-dependency".to_string()));
+    }
+
+    #[test]
+    fn test_no_self_dependency() {
+        let text = "foo: bar baz\n\techo $@\n";
+        let codes = diag_codes(text);
+        assert!(!codes.contains(&"self-dependency".to_string()));
+    }
+
+    #[test]
+    fn test_self_dependency_message() {
+        let text = "foo: foo\n\techo $@\n";
+        let diags = get_diags(text);
+        let self_deps: Vec<_> = diags
+            .iter()
+            .filter(|d| d.code == Some(NumberOrString::String("self-dependency".to_string())))
+            .collect();
+        assert_eq!(self_deps.len(), 1);
+        assert!(self_deps[0].message.contains("foo"));
     }
 }
