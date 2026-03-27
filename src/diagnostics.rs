@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use makefile_lossless::{Makefile, Parse, TextRange, VariableReference};
+use makefile_lossless::{Makefile, Parse, VariableReference};
 use rowan::ast::AstNode;
 use tower_lsp_server::ls_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Position, Range};
 
@@ -157,14 +157,9 @@ fn is_known_variable(name: &str) -> bool {
 }
 
 /// Collect diagnostics from parse errors and semantic analysis.
-///
-/// If `changed_range` is `Some`, only items overlapping that range are rechecked
-/// for per-item diagnostics. Whole-file diagnostics (like duplicate targets) and
-/// parse errors are always fully recomputed.
 pub fn get_diagnostics(
     source_text: &str,
     parsed: &Parse<makefile_lossless::Makefile>,
-    changed_range: Option<TextRange>,
 ) -> Vec<Diagnostic> {
     let mut diagnostics: Vec<Diagnostic> = parsed
         .positioned_errors()
@@ -181,52 +176,27 @@ pub fn get_diagnostics(
         .collect();
 
     let makefile = parsed.tree();
-    diagnostics.extend(check_undefined_variables(
-        source_text,
-        &makefile,
-        changed_range,
-    ));
+    diagnostics.extend(check_undefined_variables(source_text, &makefile));
     diagnostics.extend(check_recursive_variable_self_reference(
-        source_text,
-        &makefile,
-        changed_range,
+        source_text, &makefile,
     ));
-    diagnostics.extend(check_empty_variable_references(
-        source_text,
-        &makefile,
-        changed_range,
-    ));
-    diagnostics.extend(check_self_dependency(
-        source_text,
-        &makefile,
-        changed_range,
-    ));
-    // Duplicate targets is inherently whole-file — always recompute
+    diagnostics.extend(check_empty_variable_references(source_text, &makefile));
+    diagnostics.extend(check_self_dependency(source_text, &makefile));
     diagnostics.extend(check_duplicate_targets(source_text, &makefile));
 
     diagnostics
 }
 
 /// Check for references to undefined variables.
-fn check_undefined_variables(
-    source_text: &str,
-    makefile: &Makefile,
-    changed_range: Option<TextRange>,
-) -> Vec<Diagnostic> {
+fn check_undefined_variables(source_text: &str, makefile: &Makefile) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
 
-    // Defined vars are always computed from the whole file
     let defined_vars: HashSet<String> = makefile
         .variable_definitions()
         .filter_map(|v| v.name())
         .collect();
 
-    let refs: Box<dyn Iterator<Item = VariableReference>> = match changed_range {
-        Some(range) => Box::new(makefile.variable_references_in_range(range)),
-        None => Box::new(makefile.variable_references()),
-    };
-
-    for var_ref in refs {
+    for var_ref in makefile.variable_references() {
         let Some(name) = var_ref.name() else {
             continue;
         };
@@ -252,16 +222,10 @@ fn check_undefined_variables(
 fn check_recursive_variable_self_reference(
     source_text: &str,
     makefile: &Makefile,
-    changed_range: Option<TextRange>,
 ) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
 
-    let var_defs: Vec<_> = match changed_range {
-        Some(range) => makefile.variable_definitions_in_range(range).collect(),
-        None => makefile.variable_definitions().collect(),
-    };
-
-    for var_def in var_defs {
+    for var_def in makefile.variable_definitions() {
         let Some(name) = var_def.name() else {
             continue;
         };
@@ -360,19 +324,10 @@ fn check_duplicate_targets(source_text: &str, makefile: &Makefile) -> Vec<Diagno
 }
 
 /// Check for empty variable references like `$()` or `${}`.
-fn check_empty_variable_references(
-    source_text: &str,
-    makefile: &Makefile,
-    changed_range: Option<TextRange>,
-) -> Vec<Diagnostic> {
+fn check_empty_variable_references(source_text: &str, makefile: &Makefile) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
 
-    let refs: Box<dyn Iterator<Item = VariableReference>> = match changed_range {
-        Some(range) => Box::new(makefile.variable_references_in_range(range)),
-        None => Box::new(makefile.variable_references()),
-    };
-
-    for var_ref in refs {
+    for var_ref in makefile.variable_references() {
         if var_ref.name().is_none() {
             let range = text_range_to_lsp_range(source_text, var_ref.text_range());
             diagnostics.push(make_diagnostic(
@@ -388,19 +343,10 @@ fn check_empty_variable_references(
 }
 
 /// Check for targets that list themselves as prerequisites.
-fn check_self_dependency(
-    source_text: &str,
-    makefile: &Makefile,
-    changed_range: Option<TextRange>,
-) -> Vec<Diagnostic> {
+fn check_self_dependency(source_text: &str, makefile: &Makefile) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
 
-    let rules: Vec<_> = match changed_range {
-        Some(range) => makefile.rules_in_range(range).collect(),
-        None => makefile.rules().collect(),
-    };
-
-    for rule in rules {
+    for rule in makefile.rules() {
         let targets: Vec<String> = rule.targets().collect();
         for prereq in rule.prerequisites() {
             if targets.contains(&prereq) {
@@ -427,7 +373,7 @@ mod tests {
 
     fn get_diags(text: &str) -> Vec<Diagnostic> {
         let parsed = Makefile::parse(text);
-        get_diagnostics(text, &parsed, None)
+        get_diagnostics(text, &parsed)
     }
 
     fn diag_codes(text: &str) -> Vec<String> {
