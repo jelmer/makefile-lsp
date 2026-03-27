@@ -7,6 +7,7 @@ use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::*;
 use tower_lsp_server::{Client, LanguageServer, LspService, Server};
 
+mod code_actions;
 mod completion;
 mod diagnostics;
 mod folding;
@@ -78,6 +79,7 @@ impl LanguageServer for Backend {
                     prepare_provider: Some(true),
                     work_done_progress_options: Default::default(),
                 })),
+                code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
                 references_provider: Some(OneOf::Left(true)),
                 definition_provider: Some(OneOf::Left(true)),
                 folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
@@ -279,6 +281,31 @@ impl LanguageServer for Backend {
         drop(files);
 
         Ok(result)
+    }
+
+    async fn code_action(&self, params: CodeActionParams) -> Result<Option<CodeActionResponse>> {
+        let uri = &params.text_document.uri;
+        let range = params.range;
+
+        let files = self.files.lock().await;
+        let Some(file_info) = files.get(uri) else {
+            return Ok(None);
+        };
+
+        let makefile = file_info.parsed.tree();
+        let actions = code_actions::get_code_actions(&makefile, &file_info.text, range, uri);
+        drop(files);
+
+        if actions.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(
+                actions
+                    .into_iter()
+                    .map(CodeActionOrCommand::CodeAction)
+                    .collect(),
+            ))
+        }
     }
 
     async fn semantic_tokens_full(
