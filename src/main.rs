@@ -41,9 +41,9 @@ impl Backend {
         }
     }
 
-    async fn update_file(&self, uri: Uri, text: String) {
+    async fn update_file(&self, uri: Uri, text: String, changed_range: Option<text_size::TextRange>) {
         let parsed = makefile_lossless::Makefile::parse(&text);
-        let diagnostics = diagnostics::get_diagnostics(&text, &parsed);
+        let diagnostics = diagnostics::get_diagnostics(&text, &parsed, changed_range);
 
         let mut files = self.files.lock().await;
         files.insert(uri.clone(), FileInfo { text, parsed });
@@ -122,7 +122,7 @@ impl LanguageServer for Backend {
     }
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
-        self.update_file(params.text_document.uri, params.text_document.text)
+        self.update_file(params.text_document.uri, params.text_document.text, None)
             .await;
     }
 
@@ -137,19 +137,33 @@ impl LanguageServer for Backend {
         let mut text = files.get(&uri).map(|f| f.text.clone()).unwrap_or_default();
         drop(files);
 
+        let mut changed_range: Option<text_size::TextRange> = None;
+
         for change in &params.content_changes {
             if let Some(range) = &change.range {
                 if let Some(text_range) = try_lsp_range_to_text_range(&text, range) {
                     let start: usize = text_range.start().into();
                     let end: usize = text_range.end().into();
+                    // The changed range in the new text covers the replacement
+                    let new_end = start + change.text.len();
+                    let new_range = text_size::TextRange::new(
+                        text_size::TextSize::from(start as u32),
+                        text_size::TextSize::from(new_end as u32),
+                    );
+                    changed_range = Some(match changed_range {
+                        Some(existing) => existing.cover(new_range),
+                        None => new_range,
+                    });
                     text.replace_range(start..end, &change.text);
                 }
             } else {
+                // Full document replacement — no range optimization
                 text = change.text.clone();
+                changed_range = None;
             }
         }
 
-        self.update_file(uri, text).await;
+        self.update_file(uri, text, changed_range).await;
     }
 
     async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
