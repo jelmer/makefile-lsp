@@ -118,7 +118,10 @@ impl LanguageServer for Backend {
                                     SemanticTokenType::new("makefilePrerequisite"),
                                     SemanticTokenType::new("makefileRecipe"),
                                 ],
-                                token_modifiers: vec![],
+                                token_modifiers: vec![
+                                    SemanticTokenModifier::DEFINITION,
+                                    SemanticTokenModifier::DEFAULT_LIBRARY,
+                                ],
                             },
                             range: Some(false),
                             full: Some(SemanticTokensFullOptions::Bool(true)),
