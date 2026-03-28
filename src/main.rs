@@ -18,6 +18,7 @@ mod hover;
 mod position;
 mod references;
 mod rename;
+mod selection_ranges;
 mod semantic;
 mod symbols;
 
@@ -89,6 +90,7 @@ impl LanguageServer for Backend {
                     resolve_provider: Some(false),
                     work_done_progress_options: Default::default(),
                 }),
+                selection_range_provider: Some(SelectionRangeProviderCapability::Simple(true)),
                 folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
                 document_symbol_provider: Some(OneOf::Left(true)),
                 semantic_tokens_provider: Some(
@@ -409,6 +411,28 @@ impl LanguageServer for Backend {
 
         let makefile = file_info.parsed.tree();
         let ranges = folding::generate_folding_ranges(&makefile, &file_info.text);
+        drop(files);
+
+        Ok(Some(ranges))
+    }
+
+    async fn selection_range(
+        &self,
+        params: SelectionRangeParams,
+    ) -> Result<Option<Vec<SelectionRange>>> {
+        let uri = &params.text_document.uri;
+
+        let files = self.files.lock().await;
+        let Some(file_info) = files.get(uri) else {
+            return Ok(None);
+        };
+
+        let makefile = file_info.parsed.tree();
+        let ranges = selection_ranges::get_selection_ranges(
+            &makefile,
+            &file_info.text,
+            &params.positions,
+        );
         drop(files);
 
         Ok(Some(ranges))
