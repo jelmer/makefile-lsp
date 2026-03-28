@@ -95,6 +95,10 @@ impl LanguageServer for Backend {
                 document_highlight_provider: Some(OneOf::Left(true)),
                 references_provider: Some(OneOf::Left(true)),
                 definition_provider: Some(OneOf::Left(true)),
+                document_on_type_formatting_provider: Some(DocumentOnTypeFormattingOptions {
+                    first_trigger_character: "\n".to_string(),
+                    more_trigger_character: None,
+                }),
                 document_link_provider: Some(DocumentLinkOptions {
                     resolve_provider: Some(false),
                     work_done_progress_options: Default::default(),
@@ -481,6 +485,52 @@ impl LanguageServer for Backend {
         drop(files);
 
         Ok(Some(ranges))
+    }
+
+    async fn on_type_formatting(
+        &self,
+        params: DocumentOnTypeFormattingParams,
+    ) -> Result<Option<Vec<TextEdit>>> {
+        let uri = &params.text_document_position.text_document.uri;
+        let position = params.text_document_position.position;
+
+        // Only handle newline
+        if params.ch != "\n" {
+            return Ok(None);
+        }
+
+        // Check the previous line
+        if position.line == 0 {
+            return Ok(None);
+        }
+
+        let files = self.files.lock().await;
+        let Some(file_info) = files.get(uri) else {
+            return Ok(None);
+        };
+
+        let prev_line_idx = (position.line - 1) as usize;
+        let prev_line = file_info
+            .text
+            .lines()
+            .nth(prev_line_idx)
+            .unwrap_or("");
+
+        // If the previous line is a rule header (has : but not =, and doesn't start with tab),
+        // insert a tab at the cursor position
+        let is_rule_header =
+            !prev_line.starts_with('\t') && prev_line.contains(':') && !prev_line.contains('=');
+
+        drop(files);
+
+        if is_rule_header {
+            Ok(Some(vec![TextEdit {
+                range: Range::new(position, position),
+                new_text: "\t".to_string(),
+            }]))
+        } else {
+            Ok(None)
+        }
     }
 }
 
