@@ -63,6 +63,32 @@
         "superType": "string",
         "description": "Makefile recipe command"
       }
+    ],
+    "semanticTokenModifiers": [
+      {
+        "id": "definition",
+        "description": "Definition site of a symbol"
+      },
+      {
+        "id": "defaultLibrary",
+        "description": "Built-in symbol (not user-defined)"
+      }
+    ],
+    "semanticTokenScopes": [
+      {
+        "language": "make",
+        "scopes": {
+          "makefileTarget": ["entity.name.function.target.makefile"],
+          "makefileTarget.definition": ["entity.name.function.target.definition.makefile"],
+          "makefileTarget.defaultLibrary": ["support.function.target.builtin.makefile"],
+          "makefileVariable": ["variable.other.makefile"],
+          "makefileVariable.definition": ["variable.other.definition.makefile"],
+          "makefileVariable.defaultLibrary": ["support.variable.builtin.makefile"],
+          "makefilePrerequisite": ["entity.name.type.prerequisite.makefile"],
+          "makefileRecipe": ["string.unquoted.recipe.makefile"],
+          "comment": ["comment.line.number-sign.makefile"]
+        }
+      }
     ]
   },
   "scripts": {
