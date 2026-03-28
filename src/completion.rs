@@ -3,29 +3,10 @@
 use makefile_lossless::Makefile;
 use tower_lsp_server::ls_types::{CompletionItem, CompletionItemKind, Position};
 
-/// Well-known GNU Make built-in targets.
-const BUILTIN_TARGETS: &[(&str, &str)] = &[
-    (".PHONY", "Declare targets that are not files"),
-    (".SUFFIXES", "Define suffix rules"),
-    (".DEFAULT", "Rule for targets with no explicit rule"),
-    (".PRECIOUS", "Preserve intermediate files"),
-    (".INTERMEDIATE", "Mark targets as intermediate"),
-    (".SECONDARY", "Mark targets as secondary (not auto-deleted)"),
-    (
-        ".SECONDEXPANSION",
-        "Enable second expansion of prerequisites",
-    ),
-    (".DELETE_ON_ERROR", "Delete target on recipe error"),
-    (".IGNORE", "Ignore errors in recipes"),
-    (".SILENT", "Do not echo recipes"),
-    (".EXPORT_ALL_VARIABLES", "Export all variables to sub-makes"),
-    (".NOTPARALLEL", "Disable parallel execution"),
-    (".ONESHELL", "Run entire recipe in one shell invocation"),
-    (".POSIX", "Enable POSIX-conforming mode"),
-];
+use crate::builtins;
 
-/// Well-known GNU Make automatic variables.
-const AUTOMATIC_VARIABLES: &[(&str, &str)] = &[
+/// Well-known GNU Make automatic variables for completion (with $ prefix for insertion).
+const AUTOMATIC_VARIABLE_COMPLETIONS: &[(&str, &str)] = &[
     ("$@", "The target of the rule"),
     ("$<", "The first prerequisite"),
     ("$^", "All prerequisites (no duplicates)"),
@@ -38,83 +19,6 @@ const AUTOMATIC_VARIABLES: &[(&str, &str)] = &[
     ("$(<F)", "File part of $<"),
 ];
 
-/// Well-known GNU Make built-in functions.
-const BUILTIN_FUNCTIONS: &[(&str, &str)] = &[
-    ("$(subst ", "$(subst from,to,text) - String substitution"),
-    (
-        "$(patsubst ",
-        "$(patsubst pattern,replacement,text) - Pattern substitution",
-    ),
-    (
-        "$(strip ",
-        "$(strip string) - Remove leading/trailing whitespace",
-    ),
-    ("$(findstring ", "$(findstring find,in) - Search for string"),
-    (
-        "$(filter ",
-        "$(filter pattern...,text) - Keep matching words",
-    ),
-    (
-        "$(filter-out ",
-        "$(filter-out pattern...,text) - Remove matching words",
-    ),
-    ("$(sort ", "$(sort list) - Sort and deduplicate words"),
-    ("$(word ", "$(word n,text) - Extract nth word"),
-    (
-        "$(wordlist ",
-        "$(wordlist s,e,text) - Extract range of words",
-    ),
-    ("$(words ", "$(words text) - Count words"),
-    ("$(firstword ", "$(firstword names...) - First word"),
-    ("$(lastword ", "$(lastword names...) - Last word"),
-    ("$(dir ", "$(dir names...) - Directory part of file names"),
-    (
-        "$(notdir ",
-        "$(notdir names...) - Non-directory part of file names",
-    ),
-    ("$(suffix ", "$(suffix names...) - Suffix of file names"),
-    (
-        "$(basename ",
-        "$(basename names...) - Basename of file names",
-    ),
-    (
-        "$(addsuffix ",
-        "$(addsuffix suffix,names...) - Add suffix to names",
-    ),
-    (
-        "$(addprefix ",
-        "$(addprefix prefix,names...) - Add prefix to names",
-    ),
-    ("$(join ", "$(join list1,list2) - Join two lists pairwise"),
-    (
-        "$(wildcard ",
-        "$(wildcard pattern) - Expand file name wildcards",
-    ),
-    (
-        "$(realpath ",
-        "$(realpath names...) - Canonical absolute names",
-    ),
-    ("$(abspath ", "$(abspath names...) - Absolute names"),
-    (
-        "$(if ",
-        "$(if condition,then-part[,else-part]) - Conditional",
-    ),
-    ("$(or ", "$(or condition1[,condition2...]) - Logical OR"),
-    ("$(and ", "$(and condition1[,condition2...]) - Logical AND"),
-    ("$(foreach ", "$(foreach var,list,text) - Iterate over list"),
-    (
-        "$(call ",
-        "$(call variable,param...) - Call user-defined function",
-    ),
-    ("$(eval ", "$(eval text) - Evaluate as makefile syntax"),
-    ("$(origin ", "$(origin variable) - Origin of a variable"),
-    ("$(flavor ", "$(flavor variable) - Flavor of a variable"),
-    ("$(value ", "$(value variable) - Value without expansion"),
-    ("$(error ", "$(error text...) - Generate fatal error"),
-    ("$(warning ", "$(warning text...) - Generate warning"),
-    ("$(info ", "$(info text...) - Print informational message"),
-    ("$(shell ", "$(shell command) - Execute shell command"),
-];
 
 /// Get completions for a Makefile at the given position.
 pub fn get_completions(
@@ -167,7 +71,7 @@ fn get_target_completions(makefile: &Makefile) -> Vec<CompletionItem> {
         .flat_map(|r| r.targets().collect::<Vec<_>>())
         .collect();
 
-    let completions: Vec<CompletionItem> = BUILTIN_TARGETS
+    builtins::SPECIAL_TARGETS
         .iter()
         .filter(|(name, _)| !existing_targets.iter().any(|t| t == name))
         .map(|(name, desc)| CompletionItem {
@@ -177,9 +81,7 @@ fn get_target_completions(makefile: &Makefile) -> Vec<CompletionItem> {
             insert_text: Some(format!("{}: ", name)),
             ..Default::default()
         })
-        .collect();
-
-    completions
+        .collect()
 }
 
 /// Generate variable name completions from variables defined in the file.
@@ -201,7 +103,7 @@ fn get_variable_completions(makefile: &Makefile) -> Vec<CompletionItem> {
 
 /// Generate automatic variable completions for use after $.
 fn get_automatic_variable_completions() -> Vec<CompletionItem> {
-    AUTOMATIC_VARIABLES
+    AUTOMATIC_VARIABLE_COMPLETIONS
         .iter()
         .map(|(name, desc)| CompletionItem {
             label: name.to_string(),
@@ -215,15 +117,16 @@ fn get_automatic_variable_completions() -> Vec<CompletionItem> {
 
 /// Generate function completions for use after $(.
 fn get_function_completions() -> Vec<CompletionItem> {
-    BUILTIN_FUNCTIONS
+    builtins::BUILTIN_FUNCTIONS
         .iter()
-        .map(|(insert, desc)| {
-            let label = insert.trim_start_matches("$(").trim_end().to_string();
+        .map(|f| {
+            let insert = format!("{} ", f.name);
+            let sig = format!("$({} {})", f.name, f.params.join(","));
             CompletionItem {
-                label,
+                label: f.name.to_string(),
                 kind: Some(CompletionItemKind::FUNCTION),
-                detail: Some(desc.to_string()),
-                insert_text: Some(insert.to_string()),
+                detail: Some(format!("{} — {}", sig, f.doc)),
+                insert_text: Some(insert),
                 ..Default::default()
             }
         })

@@ -7,6 +7,7 @@ use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::*;
 use tower_lsp_server::{Client, LanguageServer, LspService, Server};
 
+mod builtins;
 mod code_actions;
 mod completion;
 mod diagnostics;
@@ -21,6 +22,7 @@ mod references;
 mod rename;
 mod selection_ranges;
 mod semantic;
+mod signature_help;
 mod symbols;
 
 use position::try_lsp_range_to_text_range;
@@ -77,6 +79,11 @@ impl LanguageServer for Backend {
                     work_done_progress_options: Default::default(),
                     all_commit_characters: None,
                     completion_item: None,
+                }),
+                signature_help_provider: Some(SignatureHelpOptions {
+                    trigger_characters: Some(vec![" ".to_string(), ",".to_string()]),
+                    retrigger_characters: Some(vec![",".to_string()]),
+                    work_done_progress_options: Default::default(),
                 }),
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
                 rename_provider: Some(OneOf::Right(RenameOptions {
@@ -270,6 +277,22 @@ impl LanguageServer for Backend {
 
         let makefile = file_info.parsed.tree();
         let result = hover::get_hover(&makefile, &file_info.text, position);
+        drop(files);
+
+        Ok(result)
+    }
+
+    async fn signature_help(&self, params: SignatureHelpParams) -> Result<Option<SignatureHelp>> {
+        let uri = &params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+
+        let files = self.files.lock().await;
+        let Some(file_info) = files.get(uri) else {
+            return Ok(None);
+        };
+
+        let makefile = file_info.parsed.tree();
+        let result = signature_help::get_signature_help(&makefile, &file_info.text, position);
         drop(files);
 
         Ok(result)

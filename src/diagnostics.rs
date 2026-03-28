@@ -6,131 +6,8 @@ use makefile_lossless::{Makefile, MakefileItem, Parse, VariableReference};
 use rowan::ast::AstNode;
 use tower_lsp_server::ls_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Position, Range};
 
+use crate::builtins;
 use crate::position::text_range_to_lsp_range;
-
-/// GNU Make automatic variables (single-character after $).
-const AUTOMATIC_VARIABLES: &[&str] = &["@", "<", "^", "+", "?", "*", "%"];
-
-/// GNU Make automatic variable variants (e.g. $(@D), $(@F)).
-const AUTOMATIC_VARIABLE_VARIANTS: &[&str] = &[
-    "@D", "@F", "<D", "<F", "^D", "^F", "+D", "+F", "?D", "?F", "*D", "*F",
-];
-
-/// Well-known GNU Make built-in variables.
-const BUILTIN_VARIABLES: &[&str] = &[
-    "MAKE",
-    "MAKECMDGOALS",
-    "MAKEFLAGS",
-    "MAKEFILES",
-    "MAKELEVEL",
-    "MAKEOVERRIDES",
-    "MAKESHELL",
-    "MAKE_RESTARTS",
-    "MAKE_TERMERR",
-    "MAKE_TERMOUT",
-    "MAKE_VERSION",
-    "MFLAGS",
-    "SHELL",
-    "SUFFIXES",
-    "VPATH",
-    ".DEFAULT_GOAL",
-    ".EXTRA_PREREQS",
-    ".FEATURES",
-    ".INCLUDE_DIRS",
-    ".LOADED",
-    ".RECIPEPREFIX",
-    ".SHELLFLAGS",
-    ".VARIABLES",
-    // Implicit rule variables
-    "AR",
-    "ARFLAGS",
-    "AS",
-    "ASFLAGS",
-    "CC",
-    "CFLAGS",
-    "CO",
-    "COFLAGS",
-    "CPP",
-    "CPPFLAGS",
-    "CTANGLE",
-    "CWEAVE",
-    "CXX",
-    "CXXFLAGS",
-    "FC",
-    "FFLAGS",
-    "GET",
-    "GFLAGS",
-    "LDFLAGS",
-    "LDLIBS",
-    "LEX",
-    "LFLAGS",
-    "LINT",
-    "LINTFLAGS",
-    "M2C",
-    "MAKEINFO",
-    "PC",
-    "PFLAGS",
-    "RFLAGS",
-    "RM",
-    "TANGLE",
-    "TEX",
-    "TEXI2DVI",
-    "WEAVE",
-    "YACC",
-    "YFLAGS",
-    // Common environment variables
-    "CURDIR",
-    "HOME",
-    "PATH",
-    "PWD",
-    "TERM",
-    "USER",
-    // Output sync
-    "OUTPUT_OPTION",
-    ".LIBPATTERNS",
-];
-
-/// Built-in GNU Make functions.
-const BUILTIN_FUNCTIONS: &[&str] = &[
-    "subst",
-    "patsubst",
-    "strip",
-    "findstring",
-    "filter",
-    "filter-out",
-    "sort",
-    "word",
-    "wordlist",
-    "words",
-    "firstword",
-    "lastword",
-    "dir",
-    "notdir",
-    "suffix",
-    "basename",
-    "addsuffix",
-    "addprefix",
-    "join",
-    "wildcard",
-    "realpath",
-    "abspath",
-    "if",
-    "or",
-    "and",
-    "foreach",
-    "call",
-    "eval",
-    "origin",
-    "flavor",
-    "value",
-    "error",
-    "warning",
-    "info",
-    "shell",
-    "file",
-    "guile",
-    "let",
-];
 
 fn make_diagnostic(
     range: Range,
@@ -146,14 +23,6 @@ fn make_diagnostic(
         message,
         ..Default::default()
     }
-}
-
-/// Check if a variable name is a well-known built-in, automatic variable, or function.
-fn is_known_variable(name: &str) -> bool {
-    AUTOMATIC_VARIABLES.contains(&name)
-        || AUTOMATIC_VARIABLE_VARIANTS.contains(&name)
-        || BUILTIN_VARIABLES.contains(&name)
-        || BUILTIN_FUNCTIONS.contains(&name)
 }
 
 /// Collect diagnostics from parse errors and semantic analysis.
@@ -202,7 +71,7 @@ fn check_undefined_variables(source_text: &str, makefile: &Makefile) -> Vec<Diag
         let Some(name) = var_ref.name() else {
             continue;
         };
-        if is_known_variable(&name) || defined_vars.contains(&name) {
+        if builtins::is_known_variable(&name) || defined_vars.contains(&name) {
             continue;
         }
         let range = text_range_to_lsp_range(source_text, var_ref.text_range());
