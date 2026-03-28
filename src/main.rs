@@ -10,6 +10,7 @@ use tower_lsp_server::{Client, LanguageServer, LspService, Server};
 mod code_actions;
 mod completion;
 mod diagnostics;
+mod document_links;
 mod folding;
 mod goto;
 mod hover;
@@ -82,6 +83,10 @@ impl LanguageServer for Backend {
                 code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
                 references_provider: Some(OneOf::Left(true)),
                 definition_provider: Some(OneOf::Left(true)),
+                document_link_provider: Some(DocumentLinkOptions {
+                    resolve_provider: Some(false),
+                    work_done_progress_options: Default::default(),
+                }),
                 folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
                 document_symbol_provider: Some(OneOf::Left(true)),
                 semantic_tokens_provider: Some(
@@ -305,6 +310,28 @@ impl LanguageServer for Backend {
                     .map(CodeActionOrCommand::CodeAction)
                     .collect(),
             ))
+        }
+    }
+
+    async fn document_link(
+        &self,
+        params: DocumentLinkParams,
+    ) -> Result<Option<Vec<DocumentLink>>> {
+        let uri = &params.text_document.uri;
+
+        let files = self.files.lock().await;
+        let Some(file_info) = files.get(uri) else {
+            return Ok(None);
+        };
+
+        let makefile = file_info.parsed.tree();
+        let links = document_links::get_document_links(&makefile, &file_info.text, uri);
+        drop(files);
+
+        if links.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(links))
         }
     }
 
