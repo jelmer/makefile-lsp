@@ -13,6 +13,7 @@ mod diagnostics;
 mod document_links;
 mod folding;
 mod goto;
+mod highlights;
 mod hover;
 mod position;
 mod references;
@@ -81,6 +82,7 @@ impl LanguageServer for Backend {
                     work_done_progress_options: Default::default(),
                 })),
                 code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
+                document_highlight_provider: Some(OneOf::Left(true)),
                 references_provider: Some(OneOf::Left(true)),
                 definition_provider: Some(OneOf::Left(true)),
                 document_link_provider: Some(DocumentLinkOptions {
@@ -332,6 +334,29 @@ impl LanguageServer for Backend {
             Ok(None)
         } else {
             Ok(Some(links))
+        }
+    }
+
+    async fn document_highlight(
+        &self,
+        params: DocumentHighlightParams,
+    ) -> Result<Option<Vec<DocumentHighlight>>> {
+        let uri = &params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+
+        let files = self.files.lock().await;
+        let Some(file_info) = files.get(uri) else {
+            return Ok(None);
+        };
+
+        let makefile = file_info.parsed.tree();
+        let hl = highlights::get_highlights(&makefile, &file_info.text, position, uri);
+        drop(files);
+
+        if hl.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(hl))
         }
     }
 
