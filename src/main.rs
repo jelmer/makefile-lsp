@@ -15,6 +15,7 @@ mod folding;
 mod goto;
 mod highlights;
 mod hover;
+mod inlay_hints;
 mod position;
 mod references;
 mod rename;
@@ -83,6 +84,7 @@ impl LanguageServer for Backend {
                     work_done_progress_options: Default::default(),
                 })),
                 code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
+                inlay_hint_provider: Some(OneOf::Left(true)),
                 document_highlight_provider: Some(OneOf::Left(true)),
                 references_provider: Some(OneOf::Left(true)),
                 definition_provider: Some(OneOf::Left(true)),
@@ -359,6 +361,26 @@ impl LanguageServer for Backend {
             Ok(None)
         } else {
             Ok(Some(hl))
+        }
+    }
+
+    async fn inlay_hint(&self, params: InlayHintParams) -> Result<Option<Vec<InlayHint>>> {
+        let uri = &params.text_document.uri;
+        let range = params.range;
+
+        let files = self.files.lock().await;
+        let Some(file_info) = files.get(uri) else {
+            return Ok(None);
+        };
+
+        let makefile = file_info.parsed.tree();
+        let hints = inlay_hints::get_inlay_hints(&makefile, &file_info.text, range);
+        drop(files);
+
+        if hints.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(hints))
         }
     }
 
