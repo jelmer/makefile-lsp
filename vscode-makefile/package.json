@@ -1,0 +1,131 @@
+{
+  "name": "vscode-makefile",
+  "displayName": "Makefile LSP",
+  "description": "Language Server Protocol support for Makefiles",
+  "version": "0.1.0",
+  "publisher": "jelmer",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/jelmer/makefile-lsp"
+  },
+  "bugs": {
+    "url": "https://github.com/jelmer/makefile-lsp/issues"
+  },
+  "homepage": "https://github.com/jelmer/makefile-lsp#readme",
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "keywords": [
+    "makefile",
+    "make",
+    "lsp",
+    "language-server"
+  ],
+  "activationEvents": [
+    "onLanguage:makefile"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "configuration": {
+      "type": "object",
+      "title": "Makefile Language Server",
+      "properties": {
+        "makefile.enable": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable Makefile language server"
+        },
+        "makefile.serverPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to makefile-lsp executable. Leave empty to use the bundled server, or set to a custom path."
+        },
+        "makefile.trace.server": {
+          "type": "string",
+          "enum": [
+            "off",
+            "messages",
+            "verbose"
+          ],
+          "default": "off",
+          "description": "Traces the communication between VS Code and the language server."
+        }
+      }
+    },
+    "configurationDefaults": {
+      "[makefile]": {
+        "editor.formatOnType": true
+      }
+    },
+    "semanticTokenTypes": [
+      {
+        "id": "makefileTarget",
+        "superType": "function",
+        "description": "Makefile target name"
+      },
+      {
+        "id": "makefileVariable",
+        "superType": "variable",
+        "description": "Makefile variable reference"
+      },
+      {
+        "id": "makefilePrerequisite",
+        "superType": "type",
+        "description": "Makefile prerequisite/dependency"
+      },
+      {
+        "id": "makefileRecipe",
+        "superType": "string",
+        "description": "Makefile recipe command"
+      }
+    ],
+    "semanticTokenModifiers": [
+      {
+        "id": "definition",
+        "description": "Definition site of a symbol"
+      },
+      {
+        "id": "defaultLibrary",
+        "description": "Built-in symbol (not user-defined)"
+      }
+    ],
+    "semanticTokenScopes": [
+      {
+        "language": "makefile",
+        "scopes": {
+          "makefileTarget": ["entity.name.function.target.makefile"],
+          "makefileTarget.definition": ["entity.name.function.target.definition.makefile"],
+          "makefileTarget.defaultLibrary": ["support.function.target.builtin.makefile"],
+          "makefileVariable": ["variable.other.makefile"],
+          "makefileVariable.definition": ["variable.other.definition.makefile"],
+          "makefileVariable.defaultLibrary": ["support.variable.builtin.makefile"],
+          "makefilePrerequisite": ["entity.name.type.prerequisite.makefile"],
+          "makefileRecipe": ["string.unquoted.recipe.makefile"],
+          "comment": ["comment.line.number-sign.makefile"]
+        }
+      }
+    ]
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "lint": "eslint src --ext ts",
+    "package": "vsce package"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.x",
+    "@types/vscode": "^1.75.0",
+    "@typescript-eslint/eslint-plugin": "^6.x",
+    "@typescript-eslint/parser": "^6.x",
+    "@vscode/vsce": "^2.x",
+    "eslint": "^8.x",
+    "typescript": "^5.x"
+  }
+}
