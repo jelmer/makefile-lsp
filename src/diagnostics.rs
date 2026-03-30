@@ -47,7 +47,8 @@ pub fn get_diagnostics(
     let makefile = parsed.tree();
     diagnostics.extend(check_undefined_variables(source_text, &makefile));
     diagnostics.extend(check_recursive_variable_self_reference(
-        source_text, &makefile,
+        source_text,
+        &makefile,
     ));
     diagnostics.extend(check_empty_variable_references(source_text, &makefile));
     diagnostics.extend(check_self_dependency(source_text, &makefile));
@@ -222,8 +223,7 @@ fn check_self_dependency(source_text: &str, makefile: &Makefile) -> Vec<Diagnost
         for prereq in rule.prerequisites() {
             if targets.contains(&prereq) {
                 // Find the prerequisite position within the PREREQUISITES node
-                let rule_range =
-                    text_range_to_lsp_range(source_text, rule.syntax().text_range());
+                let rule_range = text_range_to_lsp_range(source_text, rule.syntax().text_range());
                 diagnostics.push(make_diagnostic(
                     rule_range,
                     DiagnosticSeverity::WARNING,
@@ -397,7 +397,10 @@ mod tests {
         let self_ref: Vec<_> = diags
             .iter()
             .filter(|d| {
-                d.code == Some(NumberOrString::String("recursive-variable-reference".to_string()))
+                d.code
+                    == Some(NumberOrString::String(
+                        "recursive-variable-reference".to_string(),
+                    ))
             })
             .collect();
         assert_eq!(self_ref.len(), 1);

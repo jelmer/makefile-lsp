@@ -27,8 +27,10 @@ pub fn prepare_rename(
             .any(|v| v.name().as_deref() == Some(var_name))
         {
             let start = find_var_name_start_in_ref(source_text, byte_offset)?;
-            let start_pos = offset_to_position(source_text, text_size::TextSize::from(start as u32));
-            let end_pos = Position::new(start_pos.line, start_pos.character + var_name.len() as u32);
+            let start_pos =
+                offset_to_position(source_text, text_size::TextSize::from(start as u32));
+            let end_pos =
+                Position::new(start_pos.line, start_pos.character + var_name.len() as u32);
             return Some(PrepareRenameResponse::RangeWithPlaceholder {
                 range: Range::new(start_pos, end_pos),
                 placeholder: var_name.to_string(),
@@ -103,7 +105,13 @@ pub fn rename(
             .variable_definitions()
             .any(|v| v.name().as_deref() == Some(var_name))
         {
-            return Some(rename_variable(makefile, source_text, var_name, new_name, uri));
+            return Some(rename_variable(
+                makefile,
+                source_text,
+                var_name,
+                new_name,
+                uri,
+            ));
         }
         return None;
     }
@@ -234,7 +242,11 @@ fn rename_target(
         for prereq in rule.prerequisites() {
             if prereq == old_name {
                 collect_word_edits_in_prerequisites(
-                    source_text, &rule, old_name, new_name, &mut edits,
+                    source_text,
+                    &rule,
+                    old_name,
+                    new_name,
+                    &mut edits,
                 );
             }
         }
@@ -279,10 +291,8 @@ fn collect_word_edits_in_prerequisites(
                 || !prereq_text.as_bytes()[after_idx].is_ascii_alphanumeric()
                     && prereq_text.as_bytes()[after_idx] != b'_';
             if before_ok && after_ok {
-                let start = offset_to_position(
-                    source_text,
-                    text_size::TextSize::from(abs_offset as u32),
-                );
+                let start =
+                    offset_to_position(source_text, text_size::TextSize::from(abs_offset as u32));
                 let end_pos = Position::new(start.line, start.character + word.len() as u32);
                 edits.push(TextEdit {
                     range: Range::new(start, end_pos),

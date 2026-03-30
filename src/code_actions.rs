@@ -174,9 +174,7 @@ mod tests {
         let text = "CFLAGS = $(UNDEFINED)\n";
         // Position on 'U' in UNDEFINED — col 11
         let actions = parse_and_actions(text, Position::new(0, 11));
-        assert!(actions
-            .iter()
-            .any(|a| a.title.contains("Define variable")));
+        assert!(actions.iter().any(|a| a.title.contains("Define variable")));
     }
 
     #[test]
@@ -184,8 +182,6 @@ mod tests {
         let text = "CC = gcc\nCFLAGS = $(CC)\n";
         // Position on 'C' in $(CC) — col 11
         let actions = parse_and_actions(text, Position::new(1, 11));
-        assert!(!actions
-            .iter()
-            .any(|a| a.title.contains("Define variable")));
+        assert!(!actions.iter().any(|a| a.title.contains("Define variable")));
     }
 }

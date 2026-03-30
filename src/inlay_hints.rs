@@ -10,11 +10,7 @@ use tower_lsp_server::ls_types::{InlayHint, InlayHintKind, InlayHintLabel, Range
 use crate::position::text_range_to_lsp_range;
 
 /// Generate inlay hints for a Makefile within the given range.
-pub fn get_inlay_hints(
-    makefile: &Makefile,
-    source_text: &str,
-    range: Range,
-) -> Vec<InlayHint> {
+pub fn get_inlay_hints(makefile: &Makefile, source_text: &str, range: Range) -> Vec<InlayHint> {
     let mut hints = Vec::new();
 
     for var_ref in makefile.variable_references() {

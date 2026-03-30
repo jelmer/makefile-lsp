@@ -241,27 +241,63 @@ pub const AUTOMATIC_VARIABLE_VARIANTS: &[&str] = &[
 pub const BUILTIN_VARIABLES: &[(&str, &str)] = &[
     ("MAKE", "The name of the make program being run."),
     ("MAKECMDGOALS", "The targets given on the command line."),
-    ("MAKEFLAGS", "Flags given to make, plus flags from MAKEFLAGS in the environment."),
-    ("MAKEFILES", "Makefiles to be read on every invocation of make."),
-    ("MAKELEVEL", "The number of levels of recursion (sub-makes)."),
-    ("MAKEOVERRIDES", "Variable definitions from the command line."),
+    (
+        "MAKEFLAGS",
+        "Flags given to make, plus flags from MAKEFLAGS in the environment.",
+    ),
+    (
+        "MAKEFILES",
+        "Makefiles to be read on every invocation of make.",
+    ),
+    (
+        "MAKELEVEL",
+        "The number of levels of recursion (sub-makes).",
+    ),
+    (
+        "MAKEOVERRIDES",
+        "Variable definitions from the command line.",
+    ),
     ("MAKESHELL", "The shell to use (Windows only)."),
-    ("MAKE_RESTARTS", "The number of times this instance of make has restarted."),
+    (
+        "MAKE_RESTARTS",
+        "The number of times this instance of make has restarted.",
+    ),
     ("MAKE_TERMERR", "Non-empty if stderr is a terminal."),
     ("MAKE_TERMOUT", "Non-empty if stdout is a terminal."),
     ("MAKE_VERSION", "The version of GNU Make."),
     ("MFLAGS", "Same as MAKEFLAGS; for historical compatibility."),
     ("SHELL", "The shell used to run recipes."),
-    ("SUFFIXES", "The default list of suffixes before make reads any makefiles."),
-    ("VPATH", "Search path for prerequisites not found in the current directory."),
-    (".DEFAULT_GOAL", "The default goal target if none is specified."),
-    (".EXTRA_PREREQS", "Extra prerequisites to add to every target."),
+    (
+        "SUFFIXES",
+        "The default list of suffixes before make reads any makefiles.",
+    ),
+    (
+        "VPATH",
+        "Search path for prerequisites not found in the current directory.",
+    ),
+    (
+        ".DEFAULT_GOAL",
+        "The default goal target if none is specified.",
+    ),
+    (
+        ".EXTRA_PREREQS",
+        "Extra prerequisites to add to every target.",
+    ),
     (".FEATURES", "List of supported GNU Make features."),
-    (".INCLUDE_DIRS", "Directories searched for included makefiles."),
+    (
+        ".INCLUDE_DIRS",
+        "Directories searched for included makefiles.",
+    ),
     (".LOADED", "List of loaded dynamic objects."),
-    (".RECIPEPREFIX", "The character used instead of tab to introduce recipes."),
+    (
+        ".RECIPEPREFIX",
+        "The character used instead of tab to introduce recipes.",
+    ),
     (".SHELLFLAGS", "Flags passed to the shell (default: -c)."),
-    (".VARIABLES", "The names of all global variables defined so far."),
+    (
+        ".VARIABLES",
+        "The names of all global variables defined so far.",
+    ),
     // Implicit rule variables
     ("AR", "Archive-maintaining program (default: ar)."),
     ("ARFLAGS", "Flags for the archive program (default: rv)."),
@@ -272,9 +308,18 @@ pub const BUILTIN_VARIABLES: &[(&str, &str)] = &[
     ("CO", "Program for checking out RCS files (default: co)."),
     ("COFLAGS", "Extra flags for the RCS co program."),
     ("CPP", "C preprocessor (default: $(CC) -E)."),
-    ("CPPFLAGS", "Extra flags for the C preprocessor and programs that use it."),
-    ("CTANGLE", "Program for turning CWEB into C (default: ctangle)."),
-    ("CWEAVE", "Program for turning CWEB into TeX (default: cweave)."),
+    (
+        "CPPFLAGS",
+        "Extra flags for the C preprocessor and programs that use it.",
+    ),
+    (
+        "CTANGLE",
+        "Program for turning CWEB into C (default: ctangle).",
+    ),
+    (
+        "CWEAVE",
+        "Program for turning CWEB into TeX (default: cweave).",
+    ),
     ("CXX", "C++ compiler (default: g++)."),
     ("CXXFLAGS", "Extra flags for the C++ compiler."),
     ("FC", "Fortran compiler (default: f77)."),
@@ -288,44 +333,89 @@ pub const BUILTIN_VARIABLES: &[(&str, &str)] = &[
     ("LINT", "Lint program (default: lint)."),
     ("LINTFLAGS", "Extra flags for Lint."),
     ("M2C", "Modula-2 compiler (default: m2c)."),
-    ("MAKEINFO", "Program to convert Texinfo to Info (default: makeinfo)."),
+    (
+        "MAKEINFO",
+        "Program to convert Texinfo to Info (default: makeinfo).",
+    ),
     ("PC", "Pascal compiler (default: pc)."),
     ("PFLAGS", "Extra flags for the Pascal compiler."),
     ("RFLAGS", "Extra flags for the Ratfor compiler."),
     ("RM", "Command to remove a file (default: rm -f)."),
-    ("TANGLE", "Program for turning WEB into Pascal (default: tangle)."),
+    (
+        "TANGLE",
+        "Program for turning WEB into Pascal (default: tangle).",
+    ),
     ("TEX", "TeX program (default: tex)."),
-    ("TEXI2DVI", "Program to make DVI from Texinfo (default: texi2dvi)."),
-    ("WEAVE", "Program for turning WEB into TeX (default: weave)."),
+    (
+        "TEXI2DVI",
+        "Program to make DVI from Texinfo (default: texi2dvi).",
+    ),
+    (
+        "WEAVE",
+        "Program for turning WEB into TeX (default: weave).",
+    ),
     ("YACC", "Parser generator (default: yacc)."),
     ("YFLAGS", "Extra flags for Yacc."),
     // Common environment variables
-    ("CURDIR", "The absolute pathname of the current working directory."),
+    (
+        "CURDIR",
+        "The absolute pathname of the current working directory.",
+    ),
     ("HOME", "The user's home directory."),
     ("PATH", "The executable search path."),
-    ("PWD", "The current working directory (from the environment)."),
+    (
+        "PWD",
+        "The current working directory (from the environment).",
+    ),
     ("TERM", "The terminal type."),
     ("USER", "The current user's login name."),
     // Output sync
-    ("OUTPUT_OPTION", "Option passed to compilers for specifying the output file."),
-    (".LIBPATTERNS", "Patterns for library name lookup (default: lib%.so lib%.a)."),
+    (
+        "OUTPUT_OPTION",
+        "Option passed to compilers for specifying the output file.",
+    ),
+    (
+        ".LIBPATTERNS",
+        "Patterns for library name lookup (default: lib%.so lib%.a).",
+    ),
 ];
 
 /// Well-known GNU Make special targets.
 pub const SPECIAL_TARGETS: &[(&str, &str)] = &[
     (".PHONY", "Declare targets that do not represent files."),
-    (".SUFFIXES", "Define the list of suffixes for old-fashioned suffix rules."),
+    (
+        ".SUFFIXES",
+        "Define the list of suffixes for old-fashioned suffix rules.",
+    ),
     (".DEFAULT", "Recipe for targets with no other rule."),
-    (".PRECIOUS", "Targets that should not be deleted if make is interrupted."),
+    (
+        ".PRECIOUS",
+        "Targets that should not be deleted if make is interrupted.",
+    ),
     (".INTERMEDIATE", "Targets treated as intermediate files."),
-    (".SECONDARY", "Targets treated as secondary (intermediate but never auto-deleted)."),
-    (".SECONDEXPANSION", "Enable second expansion of prerequisites."),
-    (".DELETE_ON_ERROR", "Delete the target file if its recipe exits with a nonzero status."),
+    (
+        ".SECONDARY",
+        "Targets treated as secondary (intermediate but never auto-deleted).",
+    ),
+    (
+        ".SECONDEXPANSION",
+        "Enable second expansion of prerequisites.",
+    ),
+    (
+        ".DELETE_ON_ERROR",
+        "Delete the target file if its recipe exits with a nonzero status.",
+    ),
     (".IGNORE", "Ignore errors in recipes for these targets."),
     (".SILENT", "Do not echo recipes for these targets."),
-    (".EXPORT_ALL_VARIABLES", "Export all variables to child processes."),
+    (
+        ".EXPORT_ALL_VARIABLES",
+        "Export all variables to child processes.",
+    ),
     (".NOTPARALLEL", "Disable parallel execution of recipes."),
-    (".ONESHELL", "Run entire recipe in a single shell invocation."),
+    (
+        ".ONESHELL",
+        "Run entire recipe in a single shell invocation.",
+    ),
     (".POSIX", "Enable POSIX-conforming mode."),
 ];
 

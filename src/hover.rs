@@ -17,18 +17,16 @@ fn markdown_hover(text: String) -> Hover {
 }
 
 /// Get hover information for the symbol at the given position.
-pub fn get_hover(
-    makefile: &Makefile,
-    source_text: &str,
-    position: Position,
-) -> Option<Hover> {
+pub fn get_hover(makefile: &Makefile, source_text: &str, position: Position) -> Option<Hover> {
     let offset = try_position_to_offset(source_text, position)?;
     let byte_offset: usize = offset.into();
 
     // Variable reference: $(VAR) or ${VAR}
     if let Some(var_name) = variable_at_offset(source_text, byte_offset) {
         // Check automatic variables
-        if let Some((_, doc)) = builtins::AUTOMATIC_VARIABLES.iter().find(|(n, _)| *n == var_name)
+        if let Some((_, doc)) = builtins::AUTOMATIC_VARIABLES
+            .iter()
+            .find(|(n, _)| *n == var_name)
         {
             return Some(markdown_hover(format!("**`${}`** — {}", var_name, doc)));
         }
@@ -45,7 +43,9 @@ pub fn get_hover(
             .variable_definitions()
             .find(|v| v.name().as_deref() == Some(var_name))
         {
-            let op = var_def.assignment_operator().unwrap_or_else(|| "=".to_string());
+            let op = var_def
+                .assignment_operator()
+                .unwrap_or_else(|| "=".to_string());
             let value = var_def
                 .raw_value()
                 .map(|v| v.trim().to_string())

@@ -19,7 +19,6 @@ const AUTOMATIC_VARIABLE_COMPLETIONS: &[(&str, &str)] = &[
     ("$(<F)", "File part of $<"),
 ];
 
-
 /// Get completions for a Makefile at the given position.
 pub fn get_completions(
     makefile: &Makefile,

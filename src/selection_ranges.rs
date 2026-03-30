@@ -24,7 +24,11 @@ pub fn get_selection_ranges(
         .collect()
 }
 
-fn selection_range_at(makefile: &Makefile, source_text: &str, position: Position) -> SelectionRange {
+fn selection_range_at(
+    makefile: &Makefile,
+    source_text: &str,
+    position: Position,
+) -> SelectionRange {
     let root_range = text_range_to_lsp_range(source_text, makefile.syntax().text_range());
     let mut result = SelectionRange {
         range: root_range,
@@ -80,7 +84,10 @@ mod tests {
     fn get_sel(text: &str, pos: Position) -> SelectionRange {
         let parsed = Makefile::parse(text);
         let makefile = parsed.tree();
-        get_selection_ranges(&makefile, text, &[pos]).into_iter().next().unwrap()
+        get_selection_ranges(&makefile, text, &[pos])
+            .into_iter()
+            .next()
+            .unwrap()
     }
 
     fn chain_depth(sel: &SelectionRange) -> usize {

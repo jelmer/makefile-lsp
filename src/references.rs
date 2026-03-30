@@ -59,13 +59,7 @@ pub fn find_references(
             byte_offset >= var_start && byte_offset < var_start + word.len()
         });
         if is_var_def {
-            return find_variable_references(
-                makefile,
-                source_text,
-                word,
-                uri,
-                include_declaration,
-            );
+            return find_variable_references(makefile, source_text, word, uri, include_declaration);
         }
     }
 
@@ -87,8 +81,7 @@ fn find_target_references(
         if include_declaration {
             for target in rule.targets() {
                 if target == target_name {
-                    let range =
-                        text_range_to_lsp_range(source_text, rule.syntax().text_range());
+                    let range = text_range_to_lsp_range(source_text, rule.syntax().text_range());
                     // Narrow to just the target name at the start
                     let start = range.start;
                     let end = Position::new(start.line, start.character + target.len() as u32);
@@ -115,7 +108,13 @@ fn find_target_references(
         if targets.iter().any(|t| t.starts_with('.')) && targets.iter().all(|t| t != target_name) {
             for prereq in rule.prerequisites() {
                 if prereq == target_name {
-                    find_word_in_prerequisites(source_text, &rule, target_name, uri, &mut locations);
+                    find_word_in_prerequisites(
+                        source_text,
+                        &rule,
+                        target_name,
+                        uri,
+                        &mut locations,
+                    );
                 }
             }
         }
@@ -185,8 +184,7 @@ fn find_variable_references(
     if include_declaration {
         for var_def in makefile.variable_definitions() {
             if var_def.name().as_deref() == Some(var_name) {
-                let range =
-                    text_range_to_lsp_range(source_text, var_def.syntax().text_range());
+                let range = text_range_to_lsp_range(source_text, var_def.syntax().text_range());
                 let start = range.start;
                 let end = Position::new(start.line, start.character + var_name.len() as u32);
                 locations.push(Location {
@@ -215,8 +213,7 @@ fn find_variable_references(
                         source_text,
                         text_size::TextSize::from(name_start as u32),
                     );
-                    let end =
-                        Position::new(start.line, start.character + var_name.len() as u32);
+                    let end = Position::new(start.line, start.character + var_name.len() as u32);
                     locations.push(Location {
                         uri: uri.clone(),
                         range: Range::new(start, end),

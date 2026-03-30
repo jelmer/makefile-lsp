@@ -240,8 +240,7 @@ impl LanguageServer for Backend {
         };
 
         let makefile = file_info.parsed.tree();
-        let result =
-            rename::rename(&makefile, &file_info.text, position, &params.new_name, uri);
+        let result = rename::rename(&makefile, &file_info.text, position, &params.new_name, uri);
         drop(files);
 
         Ok(result)
@@ -349,10 +348,7 @@ impl LanguageServer for Backend {
         }
     }
 
-    async fn document_link(
-        &self,
-        params: DocumentLinkParams,
-    ) -> Result<Option<Vec<DocumentLink>>> {
+    async fn document_link(&self, params: DocumentLinkParams) -> Result<Option<Vec<DocumentLink>>> {
         let uri = &params.text_document.uri;
 
         let files = self.files.lock().await;
@@ -480,11 +476,8 @@ impl LanguageServer for Backend {
         };
 
         let makefile = file_info.parsed.tree();
-        let ranges = selection_ranges::get_selection_ranges(
-            &makefile,
-            &file_info.text,
-            &params.positions,
-        );
+        let ranges =
+            selection_ranges::get_selection_ranges(&makefile, &file_info.text, &params.positions);
         drop(files);
 
         Ok(Some(ranges))
@@ -513,11 +506,7 @@ impl LanguageServer for Backend {
         };
 
         let prev_line_idx = (position.line - 1) as usize;
-        let prev_line = file_info
-            .text
-            .lines()
-            .nth(prev_line_idx)
-            .unwrap_or("");
+        let prev_line = file_info.text.lines().nth(prev_line_idx).unwrap_or("");
 
         // If the previous line is a rule header (has : but not =, and doesn't start with tab),
         // insert a tab at the cursor position
