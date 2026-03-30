@@ -11,7 +11,7 @@ keywords = ["lsp", "makefile", "language-server"]
 categories = ["development-tools", "text-editors"]
 
 [dependencies]
-makefile-lossless = { version = "0.3.29", path = "../makefile-lossless" }
+makefile-lossless = "0.3.29"
 rowan = "0.16.1"
 text-size = "1.1"
 tower-lsp-server = "0.23"
