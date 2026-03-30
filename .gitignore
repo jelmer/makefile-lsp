@@ -2,3 +2,4 @@ target/
 vscode-makefile/node_modules/
 vscode-makefile/out/
 vscode-makefile/server/
+*.vsix
