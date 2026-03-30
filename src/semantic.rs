@@ -136,7 +136,7 @@ pub fn generate_semantic_tokens(makefile: &Makefile, source_text: &str) -> Vec<S
                             }
                             SyntaxKind::VARIABLE => {
                                 let mut mods = TokenModifier::Definition.bitmask();
-                                if builtins::find_builtin_variable(&text).is_some() {
+                                if builtins::find_builtin_variable(text).is_some() {
                                     mods |= TokenModifier::DefaultLibrary.bitmask();
                                 }
                                 builder.push(
