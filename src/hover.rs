@@ -40,7 +40,7 @@ pub fn get_hover(
             return Some(markdown_hover(format!("`{}` — {}", sig, f.doc)));
         }
 
-        // Check user-defined variables
+        // Check user-defined variables (prioritize over built-ins)
         if let Some(var_def) = makefile
             .variable_definitions()
             .find(|v| v.name().as_deref() == Some(var_name))
@@ -54,6 +54,11 @@ pub fn get_hover(
                 "```makefile\n{} {} {}\n```",
                 var_name, op, value
             )));
+        }
+
+        // Check built-in variables
+        if let Some(doc) = builtins::find_builtin_variable(var_name) {
+            return Some(markdown_hover(format!("**`{}`** — {}", var_name, doc)));
         }
 
         return None;
@@ -160,6 +165,26 @@ mod tests {
         // On whitespace before recipe
         let result = hover_text(text, Position::new(0, 3));
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_hover_builtin_variable() {
+        let text = "all:\n\t$(MAKE) -C subdir\n";
+        let result = hover_text(text, Position::new(1, 3));
+        assert!(result.is_some());
+        let content = result.unwrap();
+        assert!(content.contains("MAKE"));
+        assert!(content.contains("make program"));
+    }
+
+    #[test]
+    fn test_hover_builtin_cc_variable() {
+        let text = "all:\n\t$(CC) -o main main.c\n";
+        let result = hover_text(text, Position::new(1, 3));
+        assert!(result.is_some());
+        let content = result.unwrap();
+        assert!(content.contains("CC"));
+        assert!(content.contains("C compiler"));
     }
 
     #[test]
