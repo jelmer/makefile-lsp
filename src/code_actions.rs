@@ -2,13 +2,13 @@
 
 use std::collections::HashSet;
 
-use makefile_lossless::Makefile;
+use makefile_lossless::{Makefile, SyntaxKind};
 use rowan::ast::AstNode;
 use tower_lsp_server::ls_types::{
     CodeAction, CodeActionKind, Position, Range, TextEdit, Uri, WorkspaceEdit,
 };
 
-use crate::position::{offset_to_position, try_position_to_offset};
+use crate::position::{offset_to_position, text_range_to_lsp_range, try_position_to_offset};
 
 /// Generate code actions for the given range.
 pub fn get_code_actions(
@@ -26,6 +26,12 @@ pub fn get_code_actions(
 
     actions.extend(add_phony_action(makefile, source_text, byte_offset, uri));
     actions.extend(define_variable_action(
+        makefile,
+        source_text,
+        byte_offset,
+        uri,
+    ));
+    actions.extend(replace_spaces_with_tab_action(
         makefile,
         source_text,
         byte_offset,
@@ -136,6 +142,58 @@ fn define_variable_action(
     })
 }
 
+/// Offer "Replace spaces with tab" for a recipe line indented with spaces.
+fn replace_spaces_with_tab_action(
+    makefile: &Makefile,
+    source_text: &str,
+    byte_offset: usize,
+    uri: &Uri,
+) -> Option<CodeAction> {
+    let offset = text_size::TextSize::from(byte_offset as u32);
+
+    for rule in makefile.rules() {
+        for recipe in rule.recipe_nodes() {
+            if !recipe.syntax().text_range().contains(offset) {
+                continue;
+            }
+            // Find the INDENT token
+            let indent_token = recipe.syntax().children_with_tokens().find_map(|it| {
+                if let Some(token) = it.as_token() {
+                    if token.kind() == SyntaxKind::INDENT {
+                        return Some(token.clone());
+                    }
+                }
+                None
+            })?;
+
+            // Only offer if the indent is spaces, not a tab
+            if indent_token.text().starts_with('\t') {
+                return None;
+            }
+
+            let range = text_range_to_lsp_range(source_text, indent_token.text_range());
+            let edit = TextEdit {
+                range,
+                new_text: "\t".to_string(),
+            };
+
+            let mut changes = std::collections::HashMap::new();
+            changes.insert(uri.clone(), vec![edit]);
+
+            return Some(CodeAction {
+                title: "Replace spaces with tab".to_string(),
+                kind: Some(CodeActionKind::QUICKFIX),
+                edit: Some(WorkspaceEdit {
+                    changes: Some(changes),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -183,5 +241,32 @@ mod tests {
         // Position on 'C' in $(CC) — col 11
         let actions = parse_and_actions(text, Position::new(1, 11));
         assert!(!actions.iter().any(|a| a.title.contains("Define variable")));
+    }
+
+    #[test]
+    fn test_replace_spaces_with_tab_action() {
+        let text = "all:\n    echo done\n";
+        // Position on the space-indented recipe line
+        let actions = parse_and_actions(text, Position::new(1, 2));
+        let tab_actions: Vec<_> = actions
+            .iter()
+            .filter(|a| a.title.contains("Replace spaces with tab"))
+            .collect();
+        assert_eq!(tab_actions.len(), 1);
+
+        // Verify the edit replaces spaces with a tab
+        let edit = tab_actions[0].edit.as_ref().unwrap();
+        let changes = edit.changes.as_ref().unwrap();
+        let edits = changes.values().next().unwrap();
+        assert_eq!(edits[0].new_text, "\t");
+    }
+
+    #[test]
+    fn test_no_replace_spaces_for_tab_indented_recipe() {
+        let text = "all:\n\techo done\n";
+        let actions = parse_and_actions(text, Position::new(1, 2));
+        assert!(!actions
+            .iter()
+            .any(|a| a.title.contains("Replace spaces with tab")));
     }
 }
