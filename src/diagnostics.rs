@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use makefile_lossless::{Makefile, MakefileItem, Parse, VariableReference};
+use makefile_lossless::{Makefile, MakefileItem, Parse, SyntaxKind, VariableReference};
 use rowan::ast::AstNode;
 use tower_lsp_server::ls_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Position, Range};
 
@@ -55,6 +55,7 @@ pub fn get_diagnostics(
     diagnostics.extend(check_duplicate_targets(source_text, &makefile));
     diagnostics.extend(check_missing_phony_targets(source_text, &makefile));
     diagnostics.extend(check_include_missing_path(source_text, &makefile));
+    diagnostics.extend(check_spaces_in_recipes(source_text, &makefile));
 
     diagnostics
 }
@@ -281,6 +282,47 @@ fn check_include_missing_path(source_text: &str, makefile: &Makefile) -> Vec<Dia
                     "include-missing-path",
                     "include directive has no file path".to_string(),
                 ));
+            }
+        }
+    }
+
+    diagnostics
+}
+
+/// Check for recipe lines that use spaces instead of a tab for indentation.
+///
+/// GNU Make requires recipe lines to start with a tab character. When spaces
+/// are used instead, make rejects the file with a confusing error message.
+fn check_spaces_in_recipes(source_text: &str, makefile: &Makefile) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+
+    for rule in makefile.rules() {
+        for recipe in rule.recipe_nodes() {
+            let indent = recipe.indent();
+            if let Some(ref indent_text) = indent {
+                if !indent_text.starts_with('\t') {
+                    // Find the INDENT token's text range for precise positioning
+                    let indent_range = recipe
+                        .syntax()
+                        .children_with_tokens()
+                        .find_map(|it| {
+                            if let Some(token) = it.as_token() {
+                                if token.kind() == SyntaxKind::INDENT {
+                                    return Some(token.text_range());
+                                }
+                            }
+                            None
+                        })
+                        .unwrap_or_else(|| recipe.syntax().text_range());
+
+                    let range = text_range_to_lsp_range(source_text, indent_range);
+                    diagnostics.push(make_diagnostic(
+                        range,
+                        DiagnosticSeverity::ERROR,
+                        "spaces-instead-of-tab",
+                        "recipe lines must start with a tab, not spaces".to_string(),
+                    ));
+                }
             }
         }
     }
@@ -540,5 +582,48 @@ mod tests {
         let text = "include config.mk\n";
         let codes = diag_codes(text);
         assert!(!codes.contains(&"include-missing-path".to_string()));
+    }
+
+    // Spaces instead of tab tests
+
+    #[test]
+    fn test_tab_indented_recipe_ok() {
+        let text = "all:\n\techo done\n";
+        let codes = diag_codes(text);
+        assert!(!codes.contains(&"spaces-instead-of-tab".to_string()));
+    }
+
+    #[test]
+    fn test_spaces_instead_of_tab() {
+        let text = "all:\n    echo done\n";
+        let codes = diag_codes(text);
+        assert!(codes.contains(&"spaces-instead-of-tab".to_string()));
+    }
+
+    #[test]
+    fn test_spaces_instead_of_tab_message() {
+        let text = "all:\n    echo done\n";
+        let diags = get_diags(text);
+        let space_diags: Vec<_> = diags
+            .iter()
+            .filter(|d| d.code == Some(NumberOrString::String("spaces-instead-of-tab".to_string())))
+            .collect();
+        assert_eq!(space_diags.len(), 1);
+        assert_eq!(
+            space_diags[0].message,
+            "recipe lines must start with a tab, not spaces"
+        );
+        assert_eq!(space_diags[0].severity, Some(DiagnosticSeverity::ERROR));
+    }
+
+    #[test]
+    fn test_multiple_space_indented_recipes() {
+        let text = "all:\n    echo first\n    echo second\n";
+        let diags = get_diags(text);
+        let space_diags: Vec<_> = diags
+            .iter()
+            .filter(|d| d.code == Some(NumberOrString::String("spaces-instead-of-tab".to_string())))
+            .collect();
+        assert_eq!(space_diags.len(), 2);
     }
 }
