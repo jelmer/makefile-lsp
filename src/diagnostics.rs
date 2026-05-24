@@ -58,6 +58,7 @@ pub fn get_diagnostics(
     diagnostics.extend(check_spaces_in_recipes(source_text, &makefile));
     diagnostics.extend(check_trailing_whitespace_in_value(source_text, &makefile));
     diagnostics.extend(check_duplicate_prerequisites(source_text, &makefile));
+    diagnostics.extend(check_shell_in_recursive_assignment(source_text, &makefile));
 
     diagnostics
 }
@@ -326,6 +327,47 @@ fn check_spaces_in_recipes(source_text: &str, makefile: &Makefile) -> Vec<Diagno
                     ));
                 }
             }
+        }
+    }
+
+    diagnostics
+}
+
+/// Check for `$(shell ...)` inside a recursively-expanded (`=`) assignment.
+///
+/// With `=`, the shell command is re-executed every time the variable is
+/// expanded — once per recipe line that mentions it, often many times. Using
+/// `:=` (or `::=`) runs it once at parse time. This is both a performance trap
+/// and a correctness trap when the shell command has side effects or its
+/// output changes between invocations.
+fn check_shell_in_recursive_assignment(source_text: &str, makefile: &Makefile) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+
+    for var_def in makefile.variable_definitions() {
+        let op = var_def.assignment_operator().unwrap_or_default();
+        if op != "=" {
+            continue;
+        }
+
+        for child in var_def.syntax().descendants() {
+            let Some(var_ref) = VariableReference::cast(child) else {
+                continue;
+            };
+            if !var_ref.is_function_call() {
+                continue;
+            }
+            if var_ref.name().as_deref() != Some("shell") {
+                continue;
+            }
+            let range = text_range_to_lsp_range(source_text, var_ref.text_range());
+            diagnostics.push(make_diagnostic(
+                range,
+                DiagnosticSeverity::WARNING,
+                "shell-in-recursive-assignment",
+                "$(shell ...) in a recursively-expanded (=) variable is re-run \
+                 on every expansion; use := to run it once"
+                    .to_string(),
+            ));
         }
     }
 
@@ -822,6 +864,71 @@ mod tests {
         let text = "foo: shared\n\techo foo\n\nbar: shared\n\techo bar\n";
         let codes = diag_codes(text);
         assert!(!codes.contains(&"duplicate-prerequisite".to_string()));
+    }
+
+    // Shell in recursive assignment tests
+
+    #[test]
+    fn test_shell_in_recursive_assignment() {
+        let text = "FILES = $(shell ls)\n";
+        let codes = diag_codes(text);
+        assert!(codes.contains(&"shell-in-recursive-assignment".to_string()));
+    }
+
+    #[test]
+    fn test_shell_in_simply_expanded_assignment_ok() {
+        let text = "FILES := $(shell ls)\n";
+        let codes = diag_codes(text);
+        assert!(!codes.contains(&"shell-in-recursive-assignment".to_string()));
+    }
+
+    #[test]
+    fn test_shell_in_immediate_expand_assignment_ok() {
+        let text = "FILES ::= $(shell ls)\n";
+        let codes = diag_codes(text);
+        assert!(!codes.contains(&"shell-in-recursive-assignment".to_string()));
+    }
+
+    #[test]
+    fn test_no_shell_in_recursive_ok() {
+        let text = "FOO = $(BAR)\nBAR = baz\n";
+        let codes = diag_codes(text);
+        assert!(!codes.contains(&"shell-in-recursive-assignment".to_string()));
+    }
+
+    #[test]
+    fn test_shell_variable_reference_not_function_call_ok() {
+        // `$(shell)` (no args) is a variable reference to a variable named
+        // "shell", not a function call. The bug only applies to the function form.
+        let text = "shell = bash\nFOO = $(shell)\n";
+        let codes = diag_codes(text);
+        assert!(!codes.contains(&"shell-in-recursive-assignment".to_string()));
+    }
+
+    #[test]
+    fn test_shell_in_recursive_message() {
+        let text = "FILES = $(shell ls)\n";
+        let diags = get_diags(text);
+        let shell_diags: Vec<_> = diags
+            .iter()
+            .filter(|d| {
+                d.code
+                    == Some(NumberOrString::String(
+                        "shell-in-recursive-assignment".to_string(),
+                    ))
+            })
+            .collect();
+        assert_eq!(shell_diags.len(), 1);
+        assert!(shell_diags[0].message.contains("re-run on every expansion"));
+        assert_eq!(shell_diags[0].severity, Some(DiagnosticSeverity::WARNING));
+    }
+
+    #[test]
+    fn test_shell_nested_in_recursive_assignment() {
+        // $(shell ...) wrapped in another function call still counts.
+        let text = "FILES = $(strip $(shell ls))\n";
+        let codes = diag_codes(text);
+        assert!(codes.contains(&"shell-in-recursive-assignment".to_string()));
     }
 
     #[test]
