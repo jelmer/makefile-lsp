@@ -177,7 +177,7 @@ fn get_prerequisite_completions(
             }
             items.push(CompletionItem {
                 label: target.clone(),
-                kind: Some(CompletionItemKind::FUNCTION),
+                kind: Some(CompletionItemKind::REFERENCE),
                 detail: Some("target".to_string()),
                 insert_text: Some(target),
                 ..Default::default()
