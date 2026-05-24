@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 
-use makefile_lossless::{Makefile, SyntaxKind};
+use makefile_lossless::{Makefile, Parse, SyntaxKind};
 use rowan::ast::AstNode;
 use tower_lsp_server::ls_types::{
     CodeAction, CodeActionKind, Position, Range, TextEdit, Uri, WorkspaceEdit,
@@ -12,7 +12,7 @@ use crate::position::{offset_to_position, text_range_to_lsp_range, try_position_
 
 /// Generate code actions for the given range.
 pub fn get_code_actions(
-    makefile: &Makefile,
+    parsed: &Parse<Makefile>,
     source_text: &str,
     range: Range,
     uri: &Uri,
@@ -24,21 +24,45 @@ pub fn get_code_actions(
     };
     let byte_offset: usize = offset.into();
 
-    actions.extend(add_phony_action(makefile, source_text, byte_offset, uri));
+    let makefile = parsed.tree();
+    actions.extend(add_phony_action(&makefile, source_text, byte_offset, uri));
     actions.extend(define_variable_action(
-        makefile,
+        &makefile,
         source_text,
         byte_offset,
         uri,
     ));
     actions.extend(replace_spaces_with_tab_action(
-        makefile,
+        &makefile,
+        source_text,
+        byte_offset,
+        uri,
+    ));
+    actions.extend(remove_trailing_whitespace_action(
+        parsed,
         source_text,
         byte_offset,
         uri,
     ));
 
     actions
+}
+
+/// Build a TextEdit that replaces `original_range` (offsets in `source_text`)
+/// with the current text of the given mutated node.
+///
+/// Used by code actions that mutate the AST: capture the node's text_range
+/// before mutation, then call this with the (now-modified) node to compute
+/// the edit.
+fn edit_for_node_change(
+    source_text: &str,
+    original_range: text_size::TextRange,
+    mutated_node: &rowan::SyntaxNode<makefile_lossless::Lang>,
+) -> TextEdit {
+    TextEdit {
+        range: text_range_to_lsp_range(source_text, original_range),
+        new_text: mutated_node.text().to_string(),
+    }
 }
 
 /// Offer "Add to .PHONY" for a target name.
@@ -194,16 +218,54 @@ fn replace_spaces_with_tab_action(
     None
 }
 
+/// Offer "Remove trailing whitespace" when the cursor is on a variable
+/// definition whose value ends in whitespace.
+///
+/// Drives the change through `VariableDefinition::trim_trailing_value_whitespace`
+/// on a fresh mutable tree, then emits a TextEdit replacing the VARIABLE
+/// node's original range with the mutated text.
+fn remove_trailing_whitespace_action(
+    parsed: &Parse<Makefile>,
+    source_text: &str,
+    byte_offset: usize,
+    uri: &Uri,
+) -> Option<CodeAction> {
+    let offset = text_size::TextSize::from(byte_offset as u32);
+
+    let makefile = parsed.tree();
+    let mut var_def = makefile
+        .variable_definitions()
+        .find(|v| v.syntax().text_range().contains(offset))?;
+
+    let original_range = var_def.syntax().text_range();
+    if !var_def.trim_trailing_value_whitespace() {
+        return None;
+    }
+    let edit = edit_for_node_change(source_text, original_range, var_def.syntax());
+
+    let mut changes = std::collections::HashMap::new();
+    changes.insert(uri.clone(), vec![edit]);
+
+    Some(CodeAction {
+        title: "Remove trailing whitespace".to_string(),
+        kind: Some(CodeActionKind::QUICKFIX),
+        edit: Some(WorkspaceEdit {
+            changes: Some(changes),
+            ..Default::default()
+        }),
+        ..Default::default()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn parse_and_actions(text: &str, pos: Position) -> Vec<CodeAction> {
         let parsed = Makefile::parse(text);
-        let makefile = parsed.tree();
         let uri: Uri = "file:///test/Makefile".parse().unwrap();
         let range = Range::new(pos, pos);
-        get_code_actions(&makefile, text, range, &uri)
+        get_code_actions(&parsed, text, range, &uri)
     }
 
     #[test]
@@ -268,5 +330,102 @@ mod tests {
         assert!(!actions
             .iter()
             .any(|a| a.title.contains("Replace spaces with tab")));
+    }
+
+    fn only_edit(action: &CodeAction) -> &TextEdit {
+        let edits = action
+            .edit
+            .as_ref()
+            .unwrap()
+            .changes
+            .as_ref()
+            .unwrap()
+            .values()
+            .next()
+            .unwrap();
+        assert_eq!(edits.len(), 1);
+        &edits[0]
+    }
+
+    /// Apply a single TextEdit to a source string.
+    fn apply_edit(source: &str, edit: &TextEdit) -> String {
+        let to_byte = |p: Position| {
+            let mut byte = 0usize;
+            let mut line = 0u32;
+            for ch in source.chars() {
+                if line == p.line {
+                    break;
+                }
+                if ch == '\n' {
+                    line += 1;
+                }
+                byte += ch.len_utf8();
+            }
+            // byte now points at the start of the requested line (UTF-8 in this
+            // codepath since we only test ASCII).
+            byte + p.character as usize
+        };
+        let start = to_byte(edit.range.start);
+        let end = to_byte(edit.range.end);
+        let mut result = String::new();
+        result.push_str(&source[..start]);
+        result.push_str(&edit.new_text);
+        result.push_str(&source[end..]);
+        result
+    }
+
+    #[test]
+    fn test_remove_trailing_whitespace_action() {
+        let text = "FOO = bar \n";
+        let actions = parse_and_actions(text, Position::new(0, 8));
+        let action = actions
+            .iter()
+            .find(|a| a.title == "Remove trailing whitespace")
+            .expect("expected quickfix");
+        let edit = only_edit(action);
+        // The edit replaces the entire VARIABLE node's range with its trimmed text.
+        assert_eq!(apply_edit(text, edit), "FOO = bar\n");
+    }
+
+    #[test]
+    fn test_remove_trailing_whitespace_multiple_spaces() {
+        let text = "FOO = bar   \n";
+        let actions = parse_and_actions(text, Position::new(0, 8));
+        let action = actions
+            .iter()
+            .find(|a| a.title == "Remove trailing whitespace")
+            .unwrap();
+        let edit = only_edit(action);
+        assert_eq!(apply_edit(text, edit), "FOO = bar\n");
+    }
+
+    #[test]
+    fn test_no_remove_trailing_whitespace_when_clean() {
+        let text = "FOO = bar\n";
+        let actions = parse_and_actions(text, Position::new(0, 8));
+        assert!(!actions
+            .iter()
+            .any(|a| a.title == "Remove trailing whitespace"));
+    }
+
+    #[test]
+    fn test_no_remove_trailing_whitespace_for_empty_value() {
+        let text = "FOO = \n";
+        let actions = parse_and_actions(text, Position::new(0, 4));
+        assert!(!actions
+            .iter()
+            .any(|a| a.title == "Remove trailing whitespace"));
+    }
+
+    #[test]
+    fn test_remove_trailing_whitespace_preserves_var_ref() {
+        let text = "FOO = $(BAR)  \n";
+        let actions = parse_and_actions(text, Position::new(0, 6));
+        let action = actions
+            .iter()
+            .find(|a| a.title == "Remove trailing whitespace")
+            .unwrap();
+        let edit = only_edit(action);
+        assert_eq!(apply_edit(text, edit), "FOO = $(BAR)\n");
     }
 }

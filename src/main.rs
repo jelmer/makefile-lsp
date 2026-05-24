@@ -332,8 +332,8 @@ impl LanguageServer for Backend {
             return Ok(None);
         };
 
-        let makefile = file_info.parsed.tree();
-        let actions = code_actions::get_code_actions(&makefile, &file_info.text, range, uri);
+        let actions =
+            code_actions::get_code_actions(&file_info.parsed, &file_info.text, range, uri);
         drop(files);
 
         if actions.is_empty() {

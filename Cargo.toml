@@ -22,3 +22,6 @@ tracing-subscriber = "0.3"
 [[bin]]
 name = "makefile-lsp"
 test = true
+
+[patch.crates-io]
+makefile-lossless = { path = "../makefile-lossless" }
