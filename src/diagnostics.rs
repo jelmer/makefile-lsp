@@ -62,6 +62,7 @@ pub fn get_diagnostics(
     diagnostics.extend(check_circular_dependencies(source_text, &makefile));
     diagnostics.extend(check_duplicate_targets(source_text, &makefile));
     diagnostics.extend(check_missing_phony_targets(source_text, &makefile));
+    diagnostics.extend(check_unused_phony_targets(source_text, &makefile));
     diagnostics.extend(check_include_missing_path(source_text, &makefile));
     diagnostics.extend(check_spaces_in_recipes(source_text, &makefile));
     diagnostics.extend(check_trailing_whitespace_in_value(source_text, &makefile));
@@ -317,6 +318,115 @@ fn check_missing_phony_targets(source_text: &str, makefile: &Makefile) -> Vec<Di
                     ),
                 ));
             }
+        }
+    }
+
+    diagnostics
+}
+
+/// Well-known phony entry points that are conventionally invoked from the
+/// command line, so the "nothing depends on this" hint shouldn't fire for them.
+const PHONY_ENTRY_POINTS: &[&str] = &[
+    "all",
+    "build",
+    "check",
+    "clean",
+    "default",
+    "dist",
+    "distclean",
+    "doc",
+    "docs",
+    "help",
+    "install",
+    "lint",
+    "release",
+    "run",
+    "test",
+    "tests",
+    "uninstall",
+];
+
+/// Check for `.PHONY` targets that nothing references.
+///
+/// Two related diagnostics:
+///
+/// * `unused-phony-target` (warning): the target is declared `.PHONY`, has a
+///   rule with no recipe and no prerequisites, AND nothing depends on it.
+///   High-confidence typo or stale declaration — there's nothing the rule
+///   could do and no caller wants it.
+/// * `unreferenced-phony-target` (hint): the target is declared `.PHONY` and
+///   has a real rule, but nothing depends on it AND the name isn't a
+///   conventional entry point (`all`, `install`, …). The author may have
+///   forgotten to wire it into a top-level target like `all`.
+///
+/// Self-references don't count as incoming edges. Targets that don't appear
+/// as the head of any rule are handled by `check_missing_phony_targets`.
+fn check_unused_phony_targets(source_text: &str, makefile: &Makefile) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+
+    let graph = crate::dep_graph::DependencyGraph::from_makefile(makefile);
+
+    // Collect every name declared in any `.PHONY:` rule, keyed to that rule's
+    // range so the diagnostic anchors on the declaration site.
+    let mut phony_decls: HashMap<String, Range> = HashMap::new();
+    for rule in makefile.rules_by_target(".PHONY") {
+        let range = text_range_to_lsp_range(source_text, rule.syntax().text_range());
+        for name in rule.prerequisites() {
+            phony_decls.entry(name).or_insert(range);
+        }
+    }
+
+    // Index target rules so we can ask "does this name have a rule, and is
+    // that rule empty?" without rescanning. A name with multiple rules is
+    // empty only if *every* rule is empty (any non-empty rule means there's
+    // real work attached).
+    let mut has_rule: HashSet<String> = HashSet::new();
+    let mut nonempty_rule: HashSet<String> = HashSet::new();
+    for rule in makefile.rules() {
+        let prereqs: Vec<String> = rule.prerequisites().collect();
+        let has_recipe = rule.recipe_nodes().next().is_some();
+        for target in rule.targets() {
+            has_rule.insert(target.clone());
+            // Self-prerequisites don't count as real work — they can't build
+            // anything and are flagged separately by check_self_dependency.
+            let has_real_prereqs = prereqs.iter().any(|p| p != &target);
+            if has_recipe || has_real_prereqs {
+                nonempty_rule.insert(target);
+            }
+        }
+    }
+
+    let mut names: Vec<&String> = phony_decls.keys().collect();
+    names.sort();
+
+    for name in names {
+        if !has_rule.contains(name) {
+            // No rule at all -> handled by check_missing_phony_targets.
+            continue;
+        }
+        let referenced = graph.referrers(name).any(|r| r != name);
+        if referenced {
+            continue;
+        }
+
+        let range = phony_decls[name];
+        if !nonempty_rule.contains(name) {
+            diagnostics.push(make_diagnostic(
+                range,
+                DiagnosticSeverity::WARNING,
+                "unused-phony-target",
+                format!(
+                    "'.PHONY' target '{}' has no recipe and nothing depends on it",
+                    name
+                ),
+            ));
+        } else if !PHONY_ENTRY_POINTS.contains(&name.as_str()) {
+            diagnostics.push(make_diagnostic(
+                range,
+                DiagnosticSeverity::HINT,
+                "unreferenced-phony-target",
+                format!("nothing depends on '.PHONY' target '{}'", name),
+            ));
         }
     }
 
@@ -1358,6 +1468,98 @@ mod tests {
             .collect();
         assert_eq!(phony_diags.len(), 1);
         assert!(phony_diags[0].message.contains("clean"));
+    }
+
+    // Unused / unreferenced .PHONY target tests
+
+    #[test]
+    fn test_unused_phony_target_empty_rule() {
+        // .PHONY: clena has an empty rule and nothing references it — typo.
+        let text = ".PHONY: clena\nclena:\n";
+        let diags = get_diags(text);
+        let unused: Vec<_> = diags
+            .iter()
+            .filter(|d| d.code == Some(NumberOrString::String("unused-phony-target".to_string())))
+            .collect();
+        assert_eq!(unused.len(), 1);
+        assert!(unused[0].message.contains("clena"));
+        assert_eq!(unused[0].severity, Some(DiagnosticSeverity::WARNING));
+    }
+
+    #[test]
+    fn test_unused_phony_target_silenced_when_referenced() {
+        // 'helper' has an empty rule but `all` depends on it -> ok.
+        let text = ".PHONY: helper\nall: helper\n\t@:\nhelper:\n";
+        let codes = diag_codes(text);
+        assert!(!codes.contains(&"unused-phony-target".to_string()));
+    }
+
+    #[test]
+    fn test_unused_phony_target_silenced_when_recipe_present() {
+        // Has a recipe -> falls through to unreferenced-phony-target instead,
+        // which is a hint not a warning.
+        let text = ".PHONY: foo\nfoo:\n\techo foo\n";
+        let codes = diag_codes(text);
+        assert!(!codes.contains(&"unused-phony-target".to_string()));
+        assert!(codes.contains(&"unreferenced-phony-target".to_string()));
+    }
+
+    #[test]
+    fn test_unreferenced_phony_target_hint() {
+        // 'lint' is not in PHONY_ENTRY_POINTS and nothing depends on it.
+        let text = ".PHONY: format\nformat:\n\tfoo\n";
+        let diags = get_diags(text);
+        let hints: Vec<_> = diags
+            .iter()
+            .filter(|d| {
+                d.code
+                    == Some(NumberOrString::String(
+                        "unreferenced-phony-target".to_string(),
+                    ))
+            })
+            .collect();
+        assert_eq!(hints.len(), 1);
+        assert_eq!(hints[0].severity, Some(DiagnosticSeverity::HINT));
+    }
+
+    #[test]
+    fn test_unreferenced_phony_silenced_for_entry_points() {
+        // 'all', 'install', 'clean' are conventional entry points -> no hint.
+        let text = concat!(
+            ".PHONY: all install clean\n",
+            "all:\n\t@:\n",
+            "install:\n\t@:\n",
+            "clean:\n\t@:\n",
+        );
+        let codes = diag_codes(text);
+        assert!(!codes.contains(&"unreferenced-phony-target".to_string()));
+    }
+
+    #[test]
+    fn test_unreferenced_phony_silenced_when_referenced() {
+        let text = ".PHONY: lint\nall: lint\n\t@:\nlint:\n\tfoo\n";
+        let codes = diag_codes(text);
+        assert!(!codes.contains(&"unreferenced-phony-target".to_string()));
+    }
+
+    #[test]
+    fn test_unused_phony_self_reference_does_not_count() {
+        // A rule listing itself as prerequisite is not a real incoming edge —
+        // and check_self_dependency will flag it separately. The unused-phony
+        // warning should still fire.
+        let text = ".PHONY: foo\nfoo: foo\n";
+        let codes = diag_codes(text);
+        assert!(codes.contains(&"unused-phony-target".to_string()));
+    }
+
+    #[test]
+    fn test_unused_phony_multiple_rules_one_nonempty() {
+        // 'foo' has two rules; one is empty, the other has a recipe. As long
+        // as any rule does real work it's not "unused"; demote to hint only.
+        let text = ".PHONY: foo\nfoo:\nfoo:\n\techo hi\n";
+        let codes = diag_codes(text);
+        assert!(!codes.contains(&"unused-phony-target".to_string()));
+        assert!(codes.contains(&"unreferenced-phony-target".to_string()));
     }
 
     // Include missing path tests

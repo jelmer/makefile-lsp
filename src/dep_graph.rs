@@ -94,6 +94,18 @@ impl DependencyGraph {
         names.into_iter()
     }
 
+    /// Targets that list `target` as a prerequisite, in sorted order. Useful
+    /// for reverse-reachability queries (e.g. "is anything depending on me?").
+    pub fn referrers(&self, target: &str) -> impl Iterator<Item = &str> {
+        let mut names: Vec<&str> = self
+            .edges
+            .iter()
+            .filter_map(|(k, v)| v.contains(target).then_some(k.as_str()))
+            .collect();
+        names.sort();
+        names.into_iter()
+    }
+
     /// Find all simple cycles of length ≥ 2 in the graph.
     ///
     /// Each cycle is returned as the list of target names visited, with the
@@ -208,6 +220,16 @@ mod tests {
         let g = graph(".PHONY: clean\nclean:\n\t@:\n");
         let targets: Vec<&str> = g.targets().collect();
         assert_eq!(targets, vec!["clean"]);
+    }
+
+    #[test]
+    fn referrers_lists_incoming_edges() {
+        let g = graph("all: a b\n\t@:\na: b\n\t@:\nb:\n\t@:\n");
+        let mut r: Vec<&str> = g.referrers("b").collect();
+        r.sort();
+        assert_eq!(r, vec!["a", "all"]);
+        assert_eq!(g.referrers("all").count(), 0);
+        assert_eq!(g.referrers("missing").count(), 0);
     }
 
     #[test]
