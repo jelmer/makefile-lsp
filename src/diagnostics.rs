@@ -64,6 +64,7 @@ pub fn get_diagnostics(
     diagnostics.extend(check_empty_automatic_variables(source_text, &makefile));
     diagnostics.extend(check_unterminated_conditionals(source_text, &makefile));
     diagnostics.extend(check_unused_variables(source_text, &makefile));
+    diagnostics.extend(check_mixed_assignment_operators(source_text, &makefile));
 
     diagnostics
 }
@@ -618,6 +619,72 @@ fn is_valid_var_name(s: &str) -> bool {
     !s.is_empty()
         && s.chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-')
+}
+
+/// Check for the same variable being assigned with both `=` (recursive) and
+/// `:=`/`::=`/`:::=` (immediate) flavours.
+///
+/// These flavours have different evaluation semantics; mixing them means the
+/// later assignment silently wins and changes how earlier-referencing code
+/// behaves. `+=` (append) and `?=` (conditional) are not flagged — they're
+/// normal companions to either flavour.
+fn check_mixed_assignment_operators(source_text: &str, makefile: &Makefile) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+
+    // For each name, collect (flavour, range, line) for each non-`+=`/`?=`
+    // assignment. Compare flavours within each name.
+    enum Flavour {
+        Recursive, // `=`
+        Immediate, // `:=`, `::=`, `:::=`
+    }
+    let classify = |op: &str| match op {
+        "=" => Some(Flavour::Recursive),
+        ":=" | "::=" | ":::=" => Some(Flavour::Immediate),
+        _ => None,
+    };
+
+    let mut by_name: HashMap<String, Vec<(Flavour, Range)>> = HashMap::new();
+    for var_def in makefile.variable_definitions() {
+        let Some(name) = var_def.name() else { continue };
+        let Some(op) = var_def.assignment_operator() else {
+            continue;
+        };
+        let Some(flavour) = classify(&op) else {
+            continue;
+        };
+        let range = text_range_to_lsp_range(source_text, var_def.syntax().text_range());
+        by_name.entry(name).or_default().push((flavour, range));
+    }
+
+    for (name, assignments) in by_name {
+        if assignments.len() < 2 {
+            continue;
+        }
+        let has_recursive = assignments
+            .iter()
+            .any(|(f, _)| matches!(f, Flavour::Recursive));
+        let has_immediate = assignments
+            .iter()
+            .any(|(f, _)| matches!(f, Flavour::Immediate));
+        if !(has_recursive && has_immediate) {
+            continue;
+        }
+        // Flag every assignment that participated in the mix, so the user
+        // sees each problem assignment.
+        for (_, range) in &assignments {
+            diagnostics.push(make_diagnostic(
+                *range,
+                DiagnosticSeverity::WARNING,
+                "mixed-assignment-operators",
+                format!(
+                    "variable '{}' is assigned with both `=` and `:=`; the later assignment silently wins",
+                    name
+                ),
+            ));
+        }
+    }
+
+    diagnostics
 }
 
 /// Check for conditional blocks that are missing their `endif`.
@@ -1487,6 +1554,68 @@ mod tests {
         let codes = diag_codes(text);
         // FOO is unused — `$$FOO` is the shell's FOO, not make's.
         assert!(codes.contains(&"unused-variable".to_string()));
+    }
+
+    // Mixed assignment operator tests
+
+    #[test]
+    fn test_mixed_recursive_and_immediate() {
+        let text = "FOO = a\nFOO := b\n";
+        let codes = diag_codes(text);
+        assert!(codes.contains(&"mixed-assignment-operators".to_string()));
+    }
+
+    #[test]
+    fn test_same_recursive_twice_not_mixed() {
+        let text = "FOO = a\nFOO = b\n";
+        let codes = diag_codes(text);
+        assert!(!codes.contains(&"mixed-assignment-operators".to_string()));
+    }
+
+    #[test]
+    fn test_immediate_and_append_ok() {
+        let text = "FOO := a\nFOO += b\n";
+        let codes = diag_codes(text);
+        assert!(!codes.contains(&"mixed-assignment-operators".to_string()));
+    }
+
+    #[test]
+    fn test_recursive_and_conditional_ok() {
+        let text = "FOO = a\nFOO ?= b\n";
+        let codes = diag_codes(text);
+        assert!(!codes.contains(&"mixed-assignment-operators".to_string()));
+    }
+
+    #[test]
+    fn test_immediate_triple_colon_mix() {
+        let text = "FOO = a\nFOO ::= b\n";
+        let codes = diag_codes(text);
+        assert!(codes.contains(&"mixed-assignment-operators".to_string()));
+    }
+
+    #[test]
+    fn test_different_variables_not_mixed() {
+        let text = "FOO = a\nBAR := b\n";
+        let codes = diag_codes(text);
+        assert!(!codes.contains(&"mixed-assignment-operators".to_string()));
+    }
+
+    #[test]
+    fn test_mixed_assignment_flags_both() {
+        let text = "FOO = a\nFOO := b\n";
+        let diags = get_diags(text);
+        let mixed: Vec<_> = diags
+            .iter()
+            .filter(|d| {
+                d.code
+                    == Some(NumberOrString::String(
+                        "mixed-assignment-operators".to_string(),
+                    ))
+            })
+            .collect();
+        assert_eq!(mixed.len(), 2);
+        assert!(mixed[0].message.contains("FOO"));
+        assert_eq!(mixed[0].severity, Some(DiagnosticSeverity::WARNING));
     }
 
     // Unterminated conditional tests
