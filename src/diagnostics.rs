@@ -63,6 +63,7 @@ pub fn get_diagnostics(
     diagnostics.extend(check_shell_in_recursive_assignment(source_text, &makefile));
     diagnostics.extend(check_empty_automatic_variables(source_text, &makefile));
     diagnostics.extend(check_unterminated_conditionals(source_text, &makefile));
+    diagnostics.extend(check_unused_variables(source_text, &makefile));
 
     diagnostics
 }
@@ -454,6 +455,171 @@ fn scan_automatic_vars(text: &str) -> Vec<(char, usize, usize)> {
     out
 }
 
+/// Check for variables that are defined but never referenced.
+///
+/// Emits a hint (not a warning) to keep the noise low: the check has known
+/// false-positive sources (recipes are byte-scanned because makefile-lossless
+/// tokenizes them flatly; `$(eval)` and `$(call)` can reference variables in
+/// ways we can't see statically) and many makefiles intentionally export
+/// variables for sub-makes or external tooling.
+///
+/// Skipped:
+/// - Variables exported with `export` (consumed outside the makefile).
+/// - Variables overriding a builtin (would change make's behaviour).
+/// - Variables defined inside conditionals (often configuration toggles).
+fn check_unused_variables(source_text: &str, makefile: &Makefile) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+
+    // Collect every name that's referenced anywhere we can see.
+    let mut referenced: HashSet<String> = makefile
+        .variable_references()
+        .filter_map(|v| v.name())
+        .collect();
+
+    // `ifdef NAME` / `ifndef NAME` reference NAME but don't show up in
+    // `variable_references()` because the argument is a bare identifier.
+    for cond in makefile
+        .syntax()
+        .descendants()
+        .filter_map(Conditional::cast)
+    {
+        match cond.conditional_type().as_deref() {
+            Some("ifdef") | Some("ifndef") => {
+                if let Some(name) = cond.condition() {
+                    referenced.insert(name);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Recipe TEXT is a single flat token; byte-scan for $(NAME) / ${NAME}.
+    //
+    // TODO: replace with an AST walk once makefile-lossless tokenizes recipes
+    // structurally.
+    for rule in makefile.rules() {
+        for recipe in rule.recipe_nodes() {
+            for token in recipe
+                .syntax()
+                .descendants_with_tokens()
+                .filter_map(|c| c.into_token())
+            {
+                if token.kind() != SyntaxKind::TEXT {
+                    continue;
+                }
+                for name in scan_variable_ref_names(token.text()) {
+                    referenced.insert(name);
+                }
+            }
+        }
+    }
+
+    for var_def in makefile.variable_definitions() {
+        let Some(name) = var_def.name() else {
+            continue;
+        };
+        if referenced.contains(&name) {
+            continue;
+        }
+        if var_def.is_export() {
+            continue;
+        }
+        if builtins::is_known_variable(&name) {
+            continue;
+        }
+        // Inside a conditional? Skip — likely a configuration toggle.
+        if var_def
+            .syntax()
+            .ancestors()
+            .any(|a| a.kind() == SyntaxKind::CONDITIONAL)
+        {
+            continue;
+        }
+
+        // Point at the IDENTIFIER token (the variable name) for precision.
+        let name_range = var_def
+            .syntax()
+            .children_with_tokens()
+            .filter_map(|c| c.into_token())
+            .find(|t| t.kind() == SyntaxKind::IDENTIFIER && t.text() != "export")
+            .map(|t| t.text_range())
+            .unwrap_or_else(|| var_def.syntax().text_range());
+
+        let range = text_range_to_lsp_range(source_text, name_range);
+        diagnostics.push(make_diagnostic(
+            range,
+            DiagnosticSeverity::HINT,
+            "unused-variable",
+            format!("variable '{}' is defined but never used", name),
+        ));
+    }
+
+    diagnostics
+}
+
+/// Scan a snippet of recipe text for `$(NAME)` and `${NAME}` references and
+/// return the names. `$$` is treated as an escape and skipped.
+///
+/// TODO: drop in favour of structured tokenization in makefile-lossless.
+fn scan_variable_ref_names(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'$' {
+            i += 1;
+            continue;
+        }
+        if i + 1 >= bytes.len() {
+            break;
+        }
+        let next = bytes[i + 1];
+        if next == b'$' {
+            i += 2;
+            continue;
+        }
+        if next == b'(' || next == b'{' {
+            let close = if next == b'(' { b')' } else { b'}' };
+            // Find a matching close on the same line. The name is the
+            // unbroken identifier-character run between `(` and either the
+            // close or a space (since `$(foo bar)` is a function call, not a
+            // variable ref to `foo bar`).
+            let name_start = i + 2;
+            let mut j = name_start;
+            while j < bytes.len() {
+                let b = bytes[j];
+                if b == close || b == b' ' || b == b'\t' || b == b'\n' {
+                    break;
+                }
+                j += 1;
+            }
+            if j > name_start && j < bytes.len() && bytes[j] == close {
+                // `$(NAME)` form — pure variable reference.
+                if let Ok(s) = std::str::from_utf8(&bytes[name_start..j]) {
+                    if is_valid_var_name(s) {
+                        out.push(s.to_string());
+                    }
+                }
+            } else if j > name_start && j < bytes.len() && bytes[j] == b' ' {
+                // `$(func args...)` — function call. The first argument may
+                // contain variable refs; rely on recursion into the rest of
+                // the line below (we'll re-enter on the inner `$`).
+            }
+            i += 1;
+            continue;
+        }
+        // Single-char automatic var like `$<` — not a user variable name.
+        i += 2;
+    }
+    out
+}
+
+fn is_valid_var_name(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-')
+}
+
 /// Check for conditional blocks that are missing their `endif`.
 ///
 /// Bare `else` or `endif` outside a conditional are already reported by the
@@ -644,22 +810,24 @@ mod tests {
     #[test]
     fn test_defined_variable_no_warning() {
         let text = "CC = gcc\nCFLAGS = $(CC) -Wall\n";
-        let diagnostics = get_diags(text);
-        assert!(diagnostics.is_empty());
+        let codes = diag_codes(text);
+        assert!(!codes.contains(&"undefined-variable".to_string()));
     }
 
     #[test]
     fn test_builtin_variable_no_warning() {
+        // `$(MAKE)` is a builtin, so no undefined-variable warning. `CMD`
+        // itself is unused (HINT), which is unrelated to this test.
         let text = "CMD = $(MAKE) -C subdir\n";
-        let diagnostics = get_diags(text);
-        assert!(diagnostics.is_empty());
+        let codes = diag_codes(text);
+        assert!(!codes.contains(&"undefined-variable".to_string()));
     }
 
     #[test]
     fn test_builtin_function_no_warning() {
         let text = "FILES = $(wildcard *.c)\n";
-        let diagnostics = get_diags(text);
-        assert!(diagnostics.is_empty());
+        let codes = diag_codes(text);
+        assert!(!codes.contains(&"undefined-variable".to_string()));
     }
 
     #[test]
@@ -1224,6 +1392,101 @@ mod tests {
         assert_eq!(auto.len(), 1);
         assert!(auto[0].message.contains("$<"));
         assert!(auto[0].message.contains("no prerequisites"));
+    }
+
+    // Unused variable tests
+
+    #[test]
+    fn test_unused_variable() {
+        let text = "FOO = bar\n";
+        let codes = diag_codes(text);
+        assert!(codes.contains(&"unused-variable".to_string()));
+    }
+
+    #[test]
+    fn test_used_in_other_variable_ok() {
+        let text = "FOO = bar\nBAZ = $(FOO)\nused: \n\techo $(BAZ)\n";
+        let codes = diag_codes(text);
+        // BAZ is used in recipe; FOO is used in BAZ.
+        assert!(!codes.contains(&"unused-variable".to_string()));
+    }
+
+    #[test]
+    fn test_used_in_recipe_ok() {
+        let text = "FOO = bar\nall:\n\techo $(FOO)\n";
+        let codes = diag_codes(text);
+        assert!(!codes.contains(&"unused-variable".to_string()));
+    }
+
+    #[test]
+    fn test_used_in_recipe_braces_ok() {
+        let text = "FOO = bar\nall:\n\techo ${FOO}\n";
+        let codes = diag_codes(text);
+        assert!(!codes.contains(&"unused-variable".to_string()));
+    }
+
+    #[test]
+    fn test_used_in_ifdef_ok() {
+        let text = "FOO = bar\nifdef FOO\nVAR = x\nendif\n";
+        let codes = diag_codes(text);
+        // FOO is referenced by `ifdef FOO`. VAR is inside a conditional, so
+        // skipped from the unused check.
+        assert!(!codes.contains(&"unused-variable".to_string()));
+    }
+
+    #[test]
+    fn test_exported_variable_skipped() {
+        let text = "export FOO = bar\n";
+        let codes = diag_codes(text);
+        assert!(!codes.contains(&"unused-variable".to_string()));
+    }
+
+    #[test]
+    fn test_overriding_builtin_skipped() {
+        let text = "CC = my-special-gcc\n";
+        let codes = diag_codes(text);
+        // CC is a builtin; assigning it overrides make's default. Not unused.
+        assert!(!codes.contains(&"unused-variable".to_string()));
+    }
+
+    #[test]
+    fn test_inside_conditional_skipped() {
+        let text = "ifdef DEBUG\nFOO = bar\nendif\n";
+        let codes = diag_codes(text);
+        // FOO is defined inside a conditional — likely a config toggle.
+        assert!(!codes.contains(&"unused-variable".to_string()));
+    }
+
+    #[test]
+    fn test_unused_variable_message() {
+        let text = "FOO = bar\n";
+        let diags = get_diags(text);
+        let unused: Vec<_> = diags
+            .iter()
+            .filter(|d| d.code == Some(NumberOrString::String("unused-variable".to_string())))
+            .collect();
+        assert_eq!(unused.len(), 1);
+        assert_eq!(
+            unused[0].message,
+            "variable 'FOO' is defined but never used"
+        );
+        assert_eq!(unused[0].severity, Some(DiagnosticSeverity::HINT));
+    }
+
+    #[test]
+    fn test_used_in_target_or_prereq_ok() {
+        let text = "SOURCES = a.c\n$(SOURCES):\n\techo $@\n";
+        let codes = diag_codes(text);
+        assert!(!codes.contains(&"unused-variable".to_string()));
+    }
+
+    #[test]
+    fn test_dollar_dollar_in_recipe_does_not_count() {
+        // `$$FOO` is shell variable expansion, not a make variable reference.
+        let text = "FOO = bar\nall:\n\techo $$FOO\n";
+        let codes = diag_codes(text);
+        // FOO is unused — `$$FOO` is the shell's FOO, not make's.
+        assert!(codes.contains(&"unused-variable".to_string()));
     }
 
     // Unterminated conditional tests
