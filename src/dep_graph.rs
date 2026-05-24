@@ -36,6 +36,34 @@ pub fn is_graph_target(name: &str) -> bool {
     !(name.contains('%') || (name.starts_with('.') && ACCUMULATING_TARGETS.contains(&name)))
 }
 
+/// Conventional names for top-level targets that are meant to be invoked from
+/// the command line. Diagnostics and code actions that key off "nothing depends
+/// on this" should leave these alone — they're entry points by intent.
+const CONVENTIONAL_ENTRY_POINTS: &[&str] = &[
+    "all",
+    "build",
+    "check",
+    "clean",
+    "default",
+    "dist",
+    "distclean",
+    "doc",
+    "docs",
+    "help",
+    "install",
+    "lint",
+    "release",
+    "run",
+    "test",
+    "tests",
+    "uninstall",
+];
+
+/// Is `name` a conventional command-line entry-point target?
+pub fn is_conventional_entry_point(name: &str) -> bool {
+    CONVENTIONAL_ENTRY_POINTS.contains(&name)
+}
+
 /// Directed graph of target → prerequisites built from a parsed Makefile.
 #[derive(Debug, Default, Clone)]
 pub struct DependencyGraph {

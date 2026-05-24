@@ -324,28 +324,6 @@ fn check_missing_phony_targets(source_text: &str, makefile: &Makefile) -> Vec<Di
     diagnostics
 }
 
-/// Well-known phony entry points that are conventionally invoked from the
-/// command line, so the "nothing depends on this" hint shouldn't fire for them.
-const PHONY_ENTRY_POINTS: &[&str] = &[
-    "all",
-    "build",
-    "check",
-    "clean",
-    "default",
-    "dist",
-    "distclean",
-    "doc",
-    "docs",
-    "help",
-    "install",
-    "lint",
-    "release",
-    "run",
-    "test",
-    "tests",
-    "uninstall",
-];
-
 /// Check for `.PHONY` targets that nothing references.
 ///
 /// Two related diagnostics:
@@ -420,7 +398,7 @@ fn check_unused_phony_targets(source_text: &str, makefile: &Makefile) -> Vec<Dia
                     name
                 ),
             ));
-        } else if !PHONY_ENTRY_POINTS.contains(&name.as_str()) {
+        } else if !crate::dep_graph::is_conventional_entry_point(name) {
             diagnostics.push(make_diagnostic(
                 range,
                 DiagnosticSeverity::HINT,
