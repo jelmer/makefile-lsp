@@ -124,7 +124,7 @@ fn get_function_completions() -> Vec<CompletionItem> {
             CompletionItem {
                 label: f.name.to_string(),
                 kind: Some(CompletionItemKind::FUNCTION),
-                detail: Some(format!("{} — {}", sig, f.doc)),
+                detail: Some(format!("{}: {}", sig, f.doc)),
                 insert_text: Some(insert),
                 ..Default::default()
             }

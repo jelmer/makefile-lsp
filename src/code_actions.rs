@@ -79,7 +79,7 @@ fn add_phony_action(
             new_text: text,
         }
     } else {
-        // No .PHONY exists — add at the top
+        // No .PHONY exists; add at the top
         let insert_pos = Position::new(0, 0);
         let text = format!(".PHONY: {}\n", target);
         TextEdit {
@@ -230,7 +230,7 @@ mod tests {
     #[test]
     fn test_define_variable_action() {
         let text = "CFLAGS = $(UNDEFINED)\n";
-        // Position on 'U' in UNDEFINED — col 11
+        // Position on 'U' in UNDEFINED, col 11
         let actions = parse_and_actions(text, Position::new(0, 11));
         assert!(actions.iter().any(|a| a.title.contains("Define variable")));
     }
@@ -238,7 +238,7 @@ mod tests {
     #[test]
     fn test_no_define_action_for_defined_variable() {
         let text = "CC = gcc\nCFLAGS = $(CC)\n";
-        // Position on 'C' in $(CC) — col 11
+        // Position on 'C' in $(CC), col 11
         let actions = parse_and_actions(text, Position::new(1, 11));
         assert!(!actions.iter().any(|a| a.title.contains("Define variable")));
     }

@@ -52,7 +52,7 @@ pub fn get_inlay_hints(makefile: &Makefile, source_text: &str, range: Range) -> 
 
         // Truncate long values
         let display_value = if value.len() > 40 {
-            format!("{}…", &value[..39])
+            format!("{}...", &value[..37])
         } else {
             value
         };
@@ -115,7 +115,7 @@ mod tests {
         let hints = get_hints(&text);
         assert_eq!(hints.len(), 1);
         if let InlayHintLabel::String(s) = &hints[0].label {
-            assert!(s.contains('…'));
+            assert!(s.contains("..."));
             assert!(s.len() < 50);
         }
     }

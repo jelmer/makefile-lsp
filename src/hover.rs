@@ -28,14 +28,14 @@ pub fn get_hover(makefile: &Makefile, source_text: &str, position: Position) -> 
             .iter()
             .find(|(n, _)| *n == var_name)
         {
-            return Some(markdown_hover(format!("**`${}`** — {}", var_name, doc)));
+            return Some(markdown_hover(format!("**`${}`**: {}", var_name, doc)));
         }
 
         // Check built-in functions (var_name may be "wildcard *.c", so match the first word)
         let func_name = var_name.split_whitespace().next().unwrap_or(var_name);
         if let Some(f) = builtins::find_builtin_function(func_name) {
             let sig = format!("$({} {})", f.name, f.params.join(","));
-            return Some(markdown_hover(format!("`{}` — {}", sig, f.doc)));
+            return Some(markdown_hover(format!("`{}`: {}", sig, f.doc)));
         }
 
         // Check user-defined variables (prioritize over built-ins)
@@ -58,7 +58,7 @@ pub fn get_hover(makefile: &Makefile, source_text: &str, position: Position) -> 
 
         // Check built-in variables
         if let Some(doc) = builtins::find_builtin_variable(var_name) {
-            return Some(markdown_hover(format!("**`{}`** — {}", var_name, doc)));
+            return Some(markdown_hover(format!("**`{}`**: {}", var_name, doc)));
         }
 
         return None;
@@ -68,7 +68,7 @@ pub fn get_hover(makefile: &Makefile, source_text: &str, position: Position) -> 
     if let Some(word) = word_at_offset(source_text, byte_offset) {
         // Check special targets
         if let Some((_, doc)) = builtins::SPECIAL_TARGETS.iter().find(|(n, _)| *n == word) {
-            return Some(markdown_hover(format!("**`{}`** — {}", word, doc)));
+            return Some(markdown_hover(format!("**`{}`**: {}", word, doc)));
         }
 
         // Show rule info if hovering over a target reference in prerequisites
@@ -121,10 +121,7 @@ mod tests {
     #[test]
     fn test_hover_automatic_variable() {
         let text = "all:\n\techo $(@D)\n";
-        // @ is col 7, but $(@D) — let's test with a simple $(VAR) context
-        // Actually, automatic vars like $@ are single-char after $, not inside $()
-        // But $(@D) is inside $(). Offset for @D: "\techo $(@D)\n"
-        // line 1: "\techo $(@D)", $ at col 6, ( at col 7, @ at col 8
+        // $ at col 6, ( at col 7, @ at col 8
         let result = hover_text(text, Position::new(1, 8));
         assert!(result.is_some());
         assert!(result.unwrap().contains("directory"));
@@ -133,7 +130,7 @@ mod tests {
     #[test]
     fn test_hover_builtin_function() {
         let text = "FILES = $(wildcard *.c)\n";
-        // "$(wildcard" — w at col 10
+        // 'w' of "wildcard" at col 10
         let result = hover_text(text, Position::new(0, 10));
         assert!(result.is_some());
         assert!(result.unwrap().contains("wildcard"));

@@ -7,36 +7,23 @@ use tower_lsp_server::ls_types::SemanticToken;
 use crate::builtins;
 use crate::position::{offset_to_position, utf16_len};
 
-/// Semantic token types used by the makefile LSP.
-///
-/// The discriminant values must match the order in the legend
-/// registered during initialization.
+/// Discriminants must match the order of the legend registered in `initialize`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 pub enum TokenType {
-    /// A target name
     Target = 0,
-    /// A variable name
     Variable = 1,
-    /// A comment
     Comment = 2,
-    /// A prerequisite
     Prerequisite = 3,
-    /// A recipe line (reserved for future use in semantic token legend)
     #[allow(dead_code)]
     Recipe = 4,
 }
 
-/// Semantic token modifiers.
-///
-/// These are bit flags — the discriminant values must match the order
-/// in the legend registered during initialization.
+/// Bit positions must match the order of the legend registered in `initialize`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 pub enum TokenModifier {
-    /// The token is a definition site (not a reference)
     Definition = 0,
-    /// The token is a built-in (not user-defined)
     DefaultLibrary = 1,
 }
 
@@ -46,7 +33,6 @@ impl TokenModifier {
     }
 }
 
-/// Builder that tracks delta positions for semantic tokens.
 pub struct SemanticTokensBuilder {
     tokens: Vec<SemanticToken>,
     prev_line: u32,
@@ -54,7 +40,6 @@ pub struct SemanticTokensBuilder {
 }
 
 impl SemanticTokensBuilder {
-    /// Create a new builder.
     pub fn new() -> Self {
         Self {
             tokens: Vec::new(),
@@ -63,7 +48,7 @@ impl SemanticTokensBuilder {
         }
     }
 
-    /// Push a semantic token, computing deltas automatically.
+    /// Push a token at an absolute (line, start); deltas are computed against the previous push.
     pub fn push(
         &mut self,
         line: u32,
@@ -91,7 +76,6 @@ impl SemanticTokensBuilder {
         self.prev_start = start;
     }
 
-    /// Consume the builder and return the tokens.
     pub fn build(self) -> Vec<SemanticToken> {
         self.tokens
     }

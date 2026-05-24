@@ -4,11 +4,11 @@ A Language Server Protocol (LSP) implementation for Makefiles, built in Rust.
 
 ## Features
 
-- **Diagnostics** — reports parse errors as you type
-- **Completions** — suggests targets, variables, and built-in functions
-- **Document symbols** — outline of targets and variable assignments
-- **Folding ranges** — collapse rules and multi-line definitions
-- **Semantic tokens** — syntax highlighting for targets, variables, prerequisites, recipes, and comments
+- **Diagnostics** - reports parse errors as you type
+- **Completions** - suggests targets, variables, and built-in functions
+- **Document symbols** - outline of targets and variable assignments
+- **Folding ranges** - collapse rules and multi-line definitions
+- **Semantic tokens** - syntax highlighting for targets, variables, prerequisites, recipes, and comments
 
 ## Installation
 

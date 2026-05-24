@@ -38,12 +38,12 @@ pub const BUILTIN_FUNCTIONS: &[BuiltinFunction] = &[
     BuiltinFunction {
         name: "filter",
         doc: "Keep only words in *text* matching any *pattern*.",
-        params: &["pattern…", "text"],
+        params: &["pattern...", "text"],
     },
     BuiltinFunction {
         name: "filter-out",
         doc: "Remove words in *text* matching any *pattern*.",
-        params: &["pattern…", "text"],
+        params: &["pattern...", "text"],
     },
     BuiltinFunction {
         name: "sort",
@@ -68,42 +68,42 @@ pub const BUILTIN_FUNCTIONS: &[BuiltinFunction] = &[
     BuiltinFunction {
         name: "firstword",
         doc: "Return the first word.",
-        params: &["names…"],
+        params: &["names..."],
     },
     BuiltinFunction {
         name: "lastword",
         doc: "Return the last word.",
-        params: &["names…"],
+        params: &["names..."],
     },
     BuiltinFunction {
         name: "dir",
         doc: "Extract the directory part of file names.",
-        params: &["names…"],
+        params: &["names..."],
     },
     BuiltinFunction {
         name: "notdir",
         doc: "Extract the non-directory part of file names.",
-        params: &["names…"],
+        params: &["names..."],
     },
     BuiltinFunction {
         name: "suffix",
         doc: "Extract the suffix of file names.",
-        params: &["names…"],
+        params: &["names..."],
     },
     BuiltinFunction {
         name: "basename",
         doc: "Extract the basename of file names.",
-        params: &["names…"],
+        params: &["names..."],
     },
     BuiltinFunction {
         name: "addsuffix",
         doc: "Append *suffix* to each word in *names*.",
-        params: &["suffix", "names…"],
+        params: &["suffix", "names..."],
     },
     BuiltinFunction {
         name: "addprefix",
         doc: "Prepend *prefix* to each word in *names*.",
-        params: &["prefix", "names…"],
+        params: &["prefix", "names..."],
     },
     BuiltinFunction {
         name: "join",
@@ -118,12 +118,12 @@ pub const BUILTIN_FUNCTIONS: &[BuiltinFunction] = &[
     BuiltinFunction {
         name: "realpath",
         doc: "Canonical absolute path names.",
-        params: &["names…"],
+        params: &["names..."],
     },
     BuiltinFunction {
         name: "abspath",
         doc: "Absolute path names.",
-        params: &["names…"],
+        params: &["names..."],
     },
     BuiltinFunction {
         name: "if",
@@ -133,12 +133,12 @@ pub const BUILTIN_FUNCTIONS: &[BuiltinFunction] = &[
     BuiltinFunction {
         name: "or",
         doc: "Short-circuiting OR: return the first non-empty argument.",
-        params: &["cond1", "cond2…"],
+        params: &["cond1", "cond2..."],
     },
     BuiltinFunction {
         name: "and",
         doc: "Short-circuiting AND: return the last argument if all are non-empty.",
-        params: &["cond1", "cond2…"],
+        params: &["cond1", "cond2..."],
     },
     BuiltinFunction {
         name: "foreach",
@@ -148,7 +148,7 @@ pub const BUILTIN_FUNCTIONS: &[BuiltinFunction] = &[
     BuiltinFunction {
         name: "call",
         doc: "Call a user-defined function stored in *variable* with the given parameters.",
-        params: &["variable", "param…"],
+        params: &["variable", "param..."],
     },
     BuiltinFunction {
         name: "eval",
@@ -173,17 +173,17 @@ pub const BUILTIN_FUNCTIONS: &[BuiltinFunction] = &[
     BuiltinFunction {
         name: "error",
         doc: "Generate a fatal error with *text*.",
-        params: &["text…"],
+        params: &["text..."],
     },
     BuiltinFunction {
         name: "warning",
         doc: "Print a warning message.",
-        params: &["text…"],
+        params: &["text..."],
     },
     BuiltinFunction {
         name: "info",
         doc: "Print an informational message.",
-        params: &["text…"],
+        params: &["text..."],
     },
     BuiltinFunction {
         name: "shell",
@@ -202,8 +202,8 @@ pub const BUILTIN_FUNCTIONS: &[BuiltinFunction] = &[
     },
     BuiltinFunction {
         name: "let",
-        doc: "Bind words from *list* to *var…* and expand *text*.",
-        params: &["var…", "list", "text"],
+        doc: "Bind words from *list* to *var...* and expand *text*.",
+        params: &["var...", "list", "text"],
     },
 ];
 

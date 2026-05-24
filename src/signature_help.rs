@@ -82,7 +82,7 @@ mod tests {
     #[test]
     fn test_subst_first_arg() {
         let text = "X = $(subst a,b,text)\n";
-        // Cursor on 'a' (first arg) — col 12
+        // Cursor on 'a' (first arg), col 12
         let sig = get_sig(text, Position::new(0, 12));
         assert!(sig.is_some());
         let sig = sig.unwrap();
@@ -93,7 +93,7 @@ mod tests {
     #[test]
     fn test_subst_second_arg() {
         let text = "X = $(subst a,b,text)\n";
-        // Cursor on 'b' (second arg) — col 14
+        // Cursor on 'b' (second arg), col 14
         let sig = get_sig(text, Position::new(0, 14));
         assert!(sig.is_some());
         assert_eq!(sig.unwrap().active_parameter, Some(1));
@@ -102,7 +102,7 @@ mod tests {
     #[test]
     fn test_subst_third_arg() {
         let text = "X = $(subst a,b,text)\n";
-        // Cursor on 't' in 'text' (third arg) — col 16
+        // Cursor on 't' in 'text' (third arg), col 16
         let sig = get_sig(text, Position::new(0, 16));
         assert!(sig.is_some());
         assert_eq!(sig.unwrap().active_parameter, Some(2));
