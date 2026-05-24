@@ -73,6 +73,12 @@ pub fn get_code_actions(
         source_text,
         uri,
     ));
+    actions.extend(inline_variable_action(
+        parsed,
+        source_text,
+        byte_offset,
+        uri,
+    ));
 
     actions
 }
@@ -553,6 +559,166 @@ fn replace_all_spaces_with_tabs_action(
     })
 }
 
+/// Offer "Inline variable" when the cursor is on a variable definition with a
+/// simple literal value (no `$` characters in the value).
+///
+/// Replaces every `$(NAME)` / `${NAME}` reference visible to the parser AND
+/// every such reference in recipe TEXT (byte-scanned) with the literal
+/// value, then deletes the variable definition's line.
+///
+/// Only offered for plain assignments (`=`, `:=`, `::=`, `:::=`). `+=`,
+/// `?=`, and `!=` have semantics we don't want to inline silently.
+///
+/// TODO: drop the recipe byte-scan once makefile-lossless tokenizes recipes
+/// structurally.
+fn inline_variable_action(
+    parsed: &Parse<Makefile>,
+    source_text: &str,
+    byte_offset: usize,
+    uri: &Uri,
+) -> Option<CodeAction> {
+    let offset = text_size::TextSize::from(byte_offset as u32);
+
+    let makefile = parsed.tree();
+    let var_def = makefile
+        .variable_definitions()
+        .find(|v| v.syntax().text_range().contains(offset))?;
+    let name = var_def.name()?;
+    let op = var_def.assignment_operator()?;
+    if !matches!(op.as_str(), "=" | ":=" | "::=" | ":::=") {
+        return None;
+    }
+    if var_def.is_export() || var_def.is_override() {
+        return None;
+    }
+    let value = var_def.raw_value()?;
+    // Only inline values that are plain literals: no variable references,
+    // function calls, or `$$` escapes. We'd otherwise be reasoning about
+    // expansion order.
+    if value.contains('$') {
+        return None;
+    }
+
+    // Collect edits for AST-visible references.
+    let mut edits: Vec<TextEdit> = Vec::new();
+    for var_ref in makefile.variable_references() {
+        if var_ref.name().as_deref() != Some(name.as_str()) {
+            continue;
+        }
+        // Skip references inside the variable's own value EXPR (shouldn't
+        // happen since we required no `$` in value, but defensive).
+        if var_def
+            .syntax()
+            .text_range()
+            .contains_range(var_ref.text_range())
+        {
+            continue;
+        }
+        let range = text_range_to_lsp_range(source_text, var_ref.text_range());
+        edits.push(TextEdit {
+            range,
+            new_text: value.clone(),
+        });
+    }
+
+    // Collect edits for references inside recipe TEXT (byte-scanned).
+    for rule in makefile.rules() {
+        for recipe in rule.recipe_nodes() {
+            for token in recipe
+                .syntax()
+                .descendants_with_tokens()
+                .filter_map(|c| c.into_token())
+            {
+                if token.kind() != SyntaxKind::TEXT {
+                    continue;
+                }
+                let base: u32 = token.text_range().start().into();
+                for (start, end) in scan_named_var_ref_offsets(token.text(), &name) {
+                    let range = text_size::TextRange::new(
+                        text_size::TextSize::from(base + start as u32),
+                        text_size::TextSize::from(base + end as u32),
+                    );
+                    edits.push(TextEdit {
+                        range: text_range_to_lsp_range(source_text, range),
+                        new_text: value.clone(),
+                    });
+                }
+            }
+        }
+    }
+
+    if edits.is_empty() {
+        return None;
+    }
+
+    // Remove the variable definition's line — its full text range plus any
+    // trailing newline already covered by the definition node.
+    let def_range = var_def.syntax().text_range();
+    edits.push(TextEdit {
+        range: text_range_to_lsp_range(source_text, def_range),
+        new_text: String::new(),
+    });
+
+    let mut changes = std::collections::HashMap::new();
+    changes.insert(uri.clone(), edits);
+
+    Some(CodeAction {
+        title: format!("Inline variable '{}'", name),
+        kind: Some(CodeActionKind::REFACTOR_INLINE),
+        edit: Some(WorkspaceEdit {
+            changes: Some(changes),
+            ..Default::default()
+        }),
+        ..Default::default()
+    })
+}
+
+/// Scan recipe text for `$(NAME)` and `${NAME}` references to a specific
+/// variable, returning byte offsets covering the whole reference. `$$` is
+/// treated as an escape and skipped.
+fn scan_named_var_ref_offsets(text: &str, name: &str) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'$' {
+            i += 1;
+            continue;
+        }
+        if i + 1 >= bytes.len() {
+            break;
+        }
+        let next = bytes[i + 1];
+        if next == b'$' {
+            i += 2;
+            continue;
+        }
+        if next == b'(' || next == b'{' {
+            let close = if next == b'(' { b')' } else { b'}' };
+            let inner_start = i + 2;
+            let mut j = inner_start;
+            while j < bytes.len() {
+                let b = bytes[j];
+                if b == close || b == b' ' || b == b'\t' || b == b'\n' {
+                    break;
+                }
+                j += 1;
+            }
+            if j > inner_start
+                && j < bytes.len()
+                && bytes[j] == close
+                && &bytes[inner_start..j] == name.as_bytes()
+            {
+                out.push((i, j + 1));
+            }
+            i += 1;
+            continue;
+        }
+        i += 2; // single-char auto var or other special
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -986,5 +1152,138 @@ mod tests {
         assert!(actions
             .iter()
             .any(|a| a.title == "Convert all space-indented recipes to tabs"));
+    }
+
+    #[test]
+    fn test_inline_variable_in_other_value() {
+        let text = "CC = gcc\nCFLAGS = $(CC) -Wall\n";
+        let actions = parse_and_actions(text, Position::new(0, 0));
+        let action = actions
+            .iter()
+            .find(|a| a.title == "Inline variable 'CC'")
+            .expect("expected inline action");
+        let edits = action
+            .edit
+            .as_ref()
+            .unwrap()
+            .changes
+            .as_ref()
+            .unwrap()
+            .values()
+            .next()
+            .unwrap();
+        let result = apply_edits(text, edits);
+        assert_eq!(result, "CFLAGS = gcc -Wall\n");
+    }
+
+    #[test]
+    fn test_inline_variable_in_recipe() {
+        let text = "OUT = build/out\nall:\n\tmkdir -p $(OUT)\n";
+        let actions = parse_and_actions(text, Position::new(0, 0));
+        let action = actions
+            .iter()
+            .find(|a| a.title == "Inline variable 'OUT'")
+            .unwrap();
+        let edits = action
+            .edit
+            .as_ref()
+            .unwrap()
+            .changes
+            .as_ref()
+            .unwrap()
+            .values()
+            .next()
+            .unwrap();
+        let result = apply_edits(text, edits);
+        assert_eq!(result, "all:\n\tmkdir -p build/out\n");
+    }
+
+    #[test]
+    fn test_inline_variable_braced_form() {
+        let text = "OUT = dist\nall:\n\tcp ${OUT}/foo .\n";
+        let actions = parse_and_actions(text, Position::new(0, 0));
+        let action = actions
+            .iter()
+            .find(|a| a.title == "Inline variable 'OUT'")
+            .unwrap();
+        let edits = action
+            .edit
+            .as_ref()
+            .unwrap()
+            .changes
+            .as_ref()
+            .unwrap()
+            .values()
+            .next()
+            .unwrap();
+        let result = apply_edits(text, edits);
+        assert_eq!(result, "all:\n\tcp dist/foo .\n");
+    }
+
+    #[test]
+    fn test_no_inline_when_unused() {
+        let text = "FOO = bar\n";
+        let actions = parse_and_actions(text, Position::new(0, 0));
+        assert!(!actions
+            .iter()
+            .any(|a| a.title.starts_with("Inline variable")));
+    }
+
+    #[test]
+    fn test_no_inline_when_value_has_dollar() {
+        let text = "FOO = $(BAR)\nBAZ = $(FOO)\n";
+        let actions = parse_and_actions(text, Position::new(0, 0));
+        assert!(!actions.iter().any(|a| a.title == "Inline variable 'FOO'"));
+    }
+
+    #[test]
+    fn test_no_inline_for_append_assignment() {
+        let text = "FOO += bar\nall:\n\techo $(FOO)\n";
+        let actions = parse_and_actions(text, Position::new(0, 0));
+        assert!(!actions.iter().any(|a| a.title == "Inline variable 'FOO'"));
+    }
+
+    #[test]
+    fn test_no_inline_for_conditional_assignment() {
+        let text = "FOO ?= bar\nall:\n\techo $(FOO)\n";
+        let actions = parse_and_actions(text, Position::new(0, 0));
+        assert!(!actions.iter().any(|a| a.title == "Inline variable 'FOO'"));
+    }
+
+    #[test]
+    fn test_no_inline_for_exported_variable() {
+        let text = "export FOO = bar\nall:\n\techo $(FOO)\n";
+        let actions = parse_and_actions(text, Position::new(0, 0));
+        assert!(!actions.iter().any(|a| a.title == "Inline variable 'FOO'"));
+    }
+
+    #[test]
+    fn test_no_inline_for_override() {
+        let text = "override FOO = bar\nall:\n\techo $(FOO)\n";
+        let actions = parse_and_actions(text, Position::new(0, 0));
+        assert!(!actions.iter().any(|a| a.title == "Inline variable 'FOO'"));
+    }
+
+    #[test]
+    fn test_dollar_dollar_in_recipe_not_inlined() {
+        // `$$FOO` is shell expansion; `$(FOO)` is the make ref.
+        let text = "FOO = bar\nall:\n\techo $$FOO $(FOO)\n";
+        let actions = parse_and_actions(text, Position::new(0, 0));
+        let action = actions
+            .iter()
+            .find(|a| a.title == "Inline variable 'FOO'")
+            .unwrap();
+        let edits = action
+            .edit
+            .as_ref()
+            .unwrap()
+            .changes
+            .as_ref()
+            .unwrap()
+            .values()
+            .next()
+            .unwrap();
+        let result = apply_edits(text, edits);
+        assert_eq!(result, "all:\n\techo $$FOO bar\n");
     }
 }
