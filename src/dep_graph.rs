@@ -106,6 +106,44 @@ impl DependencyGraph {
         names.into_iter()
     }
 
+    /// Length of the longest path from `target` down through the dependency
+    /// graph, counting edges. A leaf (or unknown target) returns 0; a target
+    /// with one prerequisite that itself has no prerequisites returns 1.
+    ///
+    /// Cycle-safe: a back-edge into a node already on the DFS stack contributes
+    /// nothing, so the result is well-defined even for malformed graphs.
+    pub fn longest_path_length(&self, target: &str) -> usize {
+        let mut memo: HashMap<&str, usize> = HashMap::new();
+        let mut on_stack: HashSet<&str> = HashSet::new();
+        self.longest_from(target, &mut memo, &mut on_stack)
+    }
+
+    fn longest_from<'a>(
+        &'a self,
+        node: &'a str,
+        memo: &mut HashMap<&'a str, usize>,
+        on_stack: &mut HashSet<&'a str>,
+    ) -> usize {
+        if let Some(&d) = memo.get(node) {
+            return d;
+        }
+        if !on_stack.insert(node) {
+            return 0;
+        }
+        let mut best = 0;
+        if let Some(edges) = self.edges.get(node) {
+            for next in edges {
+                let d = 1 + self.longest_from(next, memo, on_stack);
+                if d > best {
+                    best = d;
+                }
+            }
+        }
+        on_stack.remove(node);
+        memo.insert(node, best);
+        best
+    }
+
     /// Find all simple cycles of length ≥ 2 in the graph.
     ///
     /// Each cycle is returned as the list of target names visited, with the
@@ -230,6 +268,26 @@ mod tests {
         assert_eq!(r, vec!["a", "all"]);
         assert_eq!(g.referrers("all").count(), 0);
         assert_eq!(g.referrers("missing").count(), 0);
+    }
+
+    #[test]
+    fn longest_path_handles_chains_and_diamonds() {
+        // chain a -> b -> c -> d  ==> depth 3 from a
+        let g = graph("a: b\n\t@:\nb: c\n\t@:\nc: d\n\t@:\nd:\n\t@:\n");
+        assert_eq!(g.longest_path_length("a"), 3);
+        assert_eq!(g.longest_path_length("d"), 0);
+        // diamond a -> b,c; b -> d; c -> d -- longest is still 2
+        let g = graph("a: b c\n\t@:\nb: d\n\t@:\nc: d\n\t@:\nd:\n\t@:\n");
+        assert_eq!(g.longest_path_length("a"), 2);
+        // unknown target -> 0
+        assert_eq!(g.longest_path_length("missing"), 0);
+    }
+
+    #[test]
+    fn longest_path_does_not_loop_on_cycles() {
+        let g = graph("a: b\n\t@:\nb: a\n\t@:\n");
+        // Just needs to terminate and return something finite.
+        let _ = g.longest_path_length("a");
     }
 
     #[test]
