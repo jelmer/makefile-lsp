@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 
-use makefile_lossless::{Makefile, Parse, SyntaxKind};
+use makefile_lossless::{Makefile, Parse, SyntaxKind, VariableReference};
 use rowan::ast::AstNode;
 use tower_lsp_server::ls_types::{
     CodeAction, CodeActionKind, Position, Range, TextEdit, Uri, WorkspaceEdit,
@@ -39,6 +39,12 @@ pub fn get_code_actions(
         uri,
     ));
     actions.extend(remove_trailing_whitespace_action(
+        parsed,
+        source_text,
+        byte_offset,
+        uri,
+    ));
+    actions.extend(convert_to_simply_expanded_action(
         parsed,
         source_text,
         byte_offset,
@@ -257,6 +263,55 @@ fn remove_trailing_whitespace_action(
     })
 }
 
+/// Offer "Use := for shell expansion" on a recursive (`=`) assignment whose
+/// value contains a `$(shell ...)` call — under `=`, the shell command would
+/// run on every expansion.
+///
+/// Drives the change through `VariableDefinition::set_assignment_operator`.
+fn convert_to_simply_expanded_action(
+    parsed: &Parse<Makefile>,
+    source_text: &str,
+    byte_offset: usize,
+    uri: &Uri,
+) -> Option<CodeAction> {
+    let offset = text_size::TextSize::from(byte_offset as u32);
+
+    let makefile = parsed.tree();
+    let mut var_def = makefile
+        .variable_definitions()
+        .find(|v| v.syntax().text_range().contains(offset))?;
+
+    if var_def.assignment_operator().as_deref() != Some("=") {
+        return None;
+    }
+
+    let has_shell = var_def.syntax().descendants().any(|d| {
+        VariableReference::cast(d)
+            .filter(|v| v.is_function_call() && v.name().as_deref() == Some("shell"))
+            .is_some()
+    });
+    if !has_shell {
+        return None;
+    }
+
+    let original_range = var_def.syntax().text_range();
+    var_def.set_assignment_operator(":=");
+    let edit = edit_for_node_change(source_text, original_range, var_def.syntax());
+
+    let mut changes = std::collections::HashMap::new();
+    changes.insert(uri.clone(), vec![edit]);
+
+    Some(CodeAction {
+        title: "Use := for shell expansion".to_string(),
+        kind: Some(CodeActionKind::QUICKFIX),
+        edit: Some(WorkspaceEdit {
+            changes: Some(changes),
+            ..Default::default()
+        }),
+        ..Default::default()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -427,5 +482,47 @@ mod tests {
             .unwrap();
         let edit = only_edit(action);
         assert_eq!(apply_edit(text, edit), "FOO = $(BAR)\n");
+    }
+
+    #[test]
+    fn test_convert_to_simply_expanded_action() {
+        let text = "FILES = $(shell ls)\n";
+        let actions = parse_and_actions(text, Position::new(0, 0));
+        let action = actions
+            .iter()
+            .find(|a| a.title == "Use := for shell expansion")
+            .expect("expected quickfix");
+        let edit = only_edit(action);
+        assert_eq!(apply_edit(text, edit), "FILES := $(shell ls)\n");
+    }
+
+    #[test]
+    fn test_no_convert_when_already_simply_expanded() {
+        let text = "FILES := $(shell ls)\n";
+        let actions = parse_and_actions(text, Position::new(0, 0));
+        assert!(!actions
+            .iter()
+            .any(|a| a.title == "Use := for shell expansion"));
+    }
+
+    #[test]
+    fn test_no_convert_when_no_shell() {
+        let text = "FILES = file1 file2\n";
+        let actions = parse_and_actions(text, Position::new(0, 0));
+        assert!(!actions
+            .iter()
+            .any(|a| a.title == "Use := for shell expansion"));
+    }
+
+    #[test]
+    fn test_convert_with_shell_nested() {
+        let text = "FILES = $(strip $(shell ls))\n";
+        let actions = parse_and_actions(text, Position::new(0, 0));
+        let action = actions
+            .iter()
+            .find(|a| a.title == "Use := for shell expansion")
+            .unwrap();
+        let edit = only_edit(action);
+        assert_eq!(apply_edit(text, edit), "FILES := $(strip $(shell ls))\n");
     }
 }
