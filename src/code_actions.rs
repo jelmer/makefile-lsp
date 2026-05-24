@@ -68,6 +68,11 @@ pub fn get_code_actions(
         byte_offset,
         uri,
     ));
+    actions.extend(replace_all_spaces_with_tabs_action(
+        parsed,
+        source_text,
+        uri,
+    ));
 
     actions
 }
@@ -499,6 +504,55 @@ fn sort_phony_prerequisites_action(
     })
 }
 
+/// Offer "Convert all space-indented recipes to tabs" when there are at
+/// least two space-indented recipe lines in the file. Bulk variant of
+/// `replace_spaces_with_tab_action`.
+fn replace_all_spaces_with_tabs_action(
+    parsed: &Parse<Makefile>,
+    source_text: &str,
+    uri: &Uri,
+) -> Option<CodeAction> {
+    let makefile = parsed.tree();
+
+    let mut edits: Vec<TextEdit> = Vec::new();
+    for rule in makefile.rules() {
+        for recipe in rule.recipe_nodes() {
+            let Some(indent_token) = recipe.syntax().children_with_tokens().find_map(|it| {
+                it.as_token()
+                    .filter(|t| t.kind() == SyntaxKind::INDENT)
+                    .cloned()
+            }) else {
+                continue;
+            };
+            if indent_token.text().starts_with('\t') {
+                continue;
+            }
+            let range = text_range_to_lsp_range(source_text, indent_token.text_range());
+            edits.push(TextEdit {
+                range,
+                new_text: "\t".to_string(),
+            });
+        }
+    }
+
+    if edits.len() < 2 {
+        return None;
+    }
+
+    let mut changes = std::collections::HashMap::new();
+    changes.insert(uri.clone(), edits);
+
+    Some(CodeAction {
+        title: "Convert all space-indented recipes to tabs".to_string(),
+        kind: Some(CodeActionKind::QUICKFIX),
+        edit: Some(WorkspaceEdit {
+            changes: Some(changes),
+            ..Default::default()
+        }),
+        ..Default::default()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -862,5 +916,75 @@ mod tests {
         assert!(!actions
             .iter()
             .any(|a| a.title == "Sort .PHONY prerequisites"));
+    }
+
+    /// Apply multiple TextEdits in reverse-offset order to avoid invalidating later ranges.
+    fn apply_edits(source: &str, edits: &[TextEdit]) -> String {
+        let mut sorted: Vec<&TextEdit> = edits.iter().collect();
+        sorted.sort_by(|a, b| {
+            b.range
+                .start
+                .line
+                .cmp(&a.range.start.line)
+                .then(b.range.start.character.cmp(&a.range.start.character))
+        });
+        let mut result = source.to_string();
+        for edit in sorted {
+            result = apply_edit(&result, edit);
+        }
+        result
+    }
+
+    #[test]
+    fn test_replace_all_spaces_with_tabs_action() {
+        let text = "all:\n    echo one\nfoo:\n  echo two\n";
+        let actions = parse_and_actions(text, Position::new(0, 0));
+        let action = actions
+            .iter()
+            .find(|a| a.title == "Convert all space-indented recipes to tabs")
+            .expect("expected bulk quickfix");
+        let edits = action
+            .edit
+            .as_ref()
+            .unwrap()
+            .changes
+            .as_ref()
+            .unwrap()
+            .values()
+            .next()
+            .unwrap();
+        assert_eq!(edits.len(), 2);
+        let result = apply_edits(text, edits);
+        assert_eq!(result, "all:\n\techo one\nfoo:\n\techo two\n");
+    }
+
+    #[test]
+    fn test_no_bulk_action_when_only_one_space_recipe() {
+        // The per-line action is offered; the bulk one isn't (we want at least two).
+        let text = "all:\n    echo one\n";
+        let actions = parse_and_actions(text, Position::new(0, 0));
+        assert!(!actions
+            .iter()
+            .any(|a| a.title == "Convert all space-indented recipes to tabs"));
+    }
+
+    #[test]
+    fn test_no_bulk_action_when_all_tab_indented() {
+        let text = "all:\n\techo one\nfoo:\n\techo two\n";
+        let actions = parse_and_actions(text, Position::new(0, 0));
+        assert!(!actions
+            .iter()
+            .any(|a| a.title == "Convert all space-indented recipes to tabs"));
+    }
+
+    #[test]
+    fn test_bulk_action_offered_anywhere_in_file() {
+        // Cursor on a completely unrelated line (a variable definition) still
+        // sees the bulk action — it's not cursor-position-dependent.
+        let text = "VAR = 1\nall:\n    echo one\nfoo:\n    echo two\n";
+        let actions = parse_and_actions(text, Position::new(0, 0));
+        assert!(actions
+            .iter()
+            .any(|a| a.title == "Convert all space-indented recipes to tabs"));
     }
 }
