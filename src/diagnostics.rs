@@ -70,6 +70,7 @@ pub fn get_diagnostics(
     diagnostics.extend(check_unterminated_conditionals(source_text, &makefile));
     diagnostics.extend(check_unused_variables(source_text, &makefile));
     diagnostics.extend(check_mixed_assignment_operators(source_text, &makefile));
+    diagnostics.extend(check_orphan_recipe_line(source_text, &makefile));
     if let Some(dir) = base_dir {
         diagnostics.extend(check_missing_include_file(source_text, &makefile, dir));
     }
@@ -673,6 +674,46 @@ fn check_missing_include_file(
             DiagnosticSeverity::WARNING,
             "missing-include-file",
             format!("included file '{}' does not exist", path),
+        ));
+    }
+
+    diagnostics
+}
+
+/// Check for tab-indented recipe lines that aren't attached to any rule.
+///
+/// A line like `\techo something` outside any rule is parsed as a stray
+/// INDENT + TEXT at the root level. This almost always means the author
+/// forgot the target above it, or a copy-paste leftover.
+fn check_orphan_recipe_line(source_text: &str, makefile: &Makefile) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+    let root = makefile.syntax();
+
+    let mut iter = root.children_with_tokens().peekable();
+    while let Some(elem) = iter.next() {
+        let Some(token) = elem.as_token() else {
+            continue;
+        };
+        if token.kind() != SyntaxKind::INDENT {
+            continue;
+        }
+        // Empty indent (no following text) is not a recipe line.
+        let mut end = token.text_range().end();
+        while let Some(next) = iter.peek() {
+            let kind = next.kind();
+            end = next.text_range().end();
+            iter.next();
+            if kind == SyntaxKind::NEWLINE {
+                break;
+            }
+        }
+        let range = text_size::TextRange::new(token.text_range().start(), end);
+        let lsp_range = text_range_to_lsp_range(source_text, range);
+        diagnostics.push(make_diagnostic(
+            lsp_range,
+            DiagnosticSeverity::ERROR,
+            "orphan-recipe-line",
+            "recipe line is not attached to any target".to_string(),
         ));
     }
 
@@ -1684,6 +1725,63 @@ mod tests {
             "included file 'config.mk' does not exist"
         );
         assert_eq!(missing[0].severity, Some(DiagnosticSeverity::WARNING));
+    }
+
+    // Orphan recipe line tests
+
+    #[test]
+    fn test_orphan_recipe_at_top() {
+        let text = "\techo orphan\n";
+        let codes = diag_codes(text);
+        assert!(codes.contains(&"orphan-recipe-line".to_string()));
+    }
+
+    #[test]
+    fn test_orphan_recipe_after_variable() {
+        let text = "VAR = 1\n\techo orphan\n";
+        let codes = diag_codes(text);
+        assert!(codes.contains(&"orphan-recipe-line".to_string()));
+    }
+
+    #[test]
+    fn test_recipe_inside_rule_ok() {
+        let text = "all:\n\techo good\n\techo also-good\n";
+        let codes = diag_codes(text);
+        assert!(!codes.contains(&"orphan-recipe-line".to_string()));
+    }
+
+    #[test]
+    fn test_orphan_recipe_between_rules() {
+        let text = "all:\n\techo good\n\nVAR = 2\n\techo orphan\n";
+        let codes = diag_codes(text);
+        assert!(codes.contains(&"orphan-recipe-line".to_string()));
+    }
+
+    #[test]
+    fn test_orphan_recipe_message() {
+        let text = "\techo orphan\n";
+        let diags = get_diags(text);
+        let orphans: Vec<_> = diags
+            .iter()
+            .filter(|d| d.code == Some(NumberOrString::String("orphan-recipe-line".to_string())))
+            .collect();
+        assert_eq!(orphans.len(), 1);
+        assert_eq!(
+            orphans[0].message,
+            "recipe line is not attached to any target"
+        );
+        assert_eq!(orphans[0].severity, Some(DiagnosticSeverity::ERROR));
+    }
+
+    #[test]
+    fn test_multiple_orphan_recipes() {
+        let text = "\techo a\n\techo b\n";
+        let diags = get_diags(text);
+        let orphans: Vec<_> = diags
+            .iter()
+            .filter(|d| d.code == Some(NumberOrString::String("orphan-recipe-line".to_string())))
+            .collect();
+        assert_eq!(orphans.len(), 2);
     }
 
     // Mixed assignment operator tests
