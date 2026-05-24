@@ -56,6 +56,7 @@ pub fn get_diagnostics(
     diagnostics.extend(check_missing_phony_targets(source_text, &makefile));
     diagnostics.extend(check_include_missing_path(source_text, &makefile));
     diagnostics.extend(check_spaces_in_recipes(source_text, &makefile));
+    diagnostics.extend(check_trailing_whitespace_in_value(source_text, &makefile));
 
     diagnostics
 }
@@ -325,6 +326,49 @@ fn check_spaces_in_recipes(source_text: &str, makefile: &Makefile) -> Vec<Diagno
                 }
             }
         }
+    }
+
+    diagnostics
+}
+
+/// Check for trailing whitespace in variable assignment values.
+///
+/// In GNU Make, trailing whitespace is part of the variable's value (up to the
+/// `#` comment or end of line). This is almost always unintentional and a
+/// classic source of bugs (e.g. comparing `$(FOO)` to `"bar"` silently fails).
+fn check_trailing_whitespace_in_value(source_text: &str, makefile: &Makefile) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+
+    for var_def in makefile.variable_definitions() {
+        let Some(expr) = var_def
+            .syntax()
+            .children()
+            .find(|c| c.kind() == SyntaxKind::EXPR)
+        else {
+            continue;
+        };
+
+        // The EXPR's last child must be a WHITESPACE token (ignoring any trailing
+        // COMMENT tokens). Nested nodes (e.g. variable references) don't count —
+        // we only flag whitespace that's actually at the tail of the value.
+        let last_non_comment = expr
+            .children_with_tokens()
+            .filter(|c| c.kind() != SyntaxKind::COMMENT)
+            .last();
+        let Some(ws) = last_non_comment
+            .and_then(|c| c.into_token())
+            .filter(|t| t.kind() == SyntaxKind::WHITESPACE)
+        else {
+            continue;
+        };
+
+        let range = text_range_to_lsp_range(source_text, ws.text_range());
+        diagnostics.push(make_diagnostic(
+            range,
+            DiagnosticSeverity::WARNING,
+            "trailing-whitespace-in-value",
+            "trailing whitespace is included in the variable value".to_string(),
+        ));
     }
 
     diagnostics
@@ -625,5 +669,83 @@ mod tests {
             .filter(|d| d.code == Some(NumberOrString::String("spaces-instead-of-tab".to_string())))
             .collect();
         assert_eq!(space_diags.len(), 2);
+    }
+
+    // Trailing whitespace in value tests
+
+    #[test]
+    fn test_trailing_whitespace_in_value() {
+        let text = "FOO = bar \n";
+        let codes = diag_codes(text);
+        assert!(codes.contains(&"trailing-whitespace-in-value".to_string()));
+    }
+
+    #[test]
+    fn test_trailing_tab_in_value() {
+        let text = "FOO = bar\t\n";
+        let codes = diag_codes(text);
+        assert!(codes.contains(&"trailing-whitespace-in-value".to_string()));
+    }
+
+    #[test]
+    fn test_no_trailing_whitespace_clean_value() {
+        let text = "FOO = bar\n";
+        let codes = diag_codes(text);
+        assert!(!codes.contains(&"trailing-whitespace-in-value".to_string()));
+    }
+
+    #[test]
+    fn test_internal_whitespace_not_flagged() {
+        let text = "FOO = bar baz\n";
+        let codes = diag_codes(text);
+        assert!(!codes.contains(&"trailing-whitespace-in-value".to_string()));
+    }
+
+    #[test]
+    fn test_empty_value_not_flagged() {
+        // `FOO = ` is an empty assignment; the whitespace is between `=` and EOL,
+        // not part of the value.
+        let text = "FOO = \n";
+        let codes = diag_codes(text);
+        assert!(!codes.contains(&"trailing-whitespace-in-value".to_string()));
+    }
+
+    #[test]
+    fn test_trailing_whitespace_before_comment_flagged() {
+        // `FOO = bar # comment` sets FOO to "bar " (trailing space captured).
+        let text = "FOO = bar # comment\n";
+        let codes = diag_codes(text);
+        assert!(codes.contains(&"trailing-whitespace-in-value".to_string()));
+    }
+
+    #[test]
+    fn test_line_continuation_not_flagged() {
+        // The trailing whitespace before `\` is part of a continued line, not the
+        // end of the value. We only care about the final value's tail.
+        let text = "FOO = bar \\\n\tbaz\n";
+        let codes = diag_codes(text);
+        // The trailing token here is BACKSLASH, not WHITESPACE — so no warning.
+        assert!(!codes.contains(&"trailing-whitespace-in-value".to_string()));
+    }
+
+    #[test]
+    fn test_trailing_whitespace_message() {
+        let text = "FOO = bar   \n";
+        let diags = get_diags(text);
+        let ws_diags: Vec<_> = diags
+            .iter()
+            .filter(|d| {
+                d.code
+                    == Some(NumberOrString::String(
+                        "trailing-whitespace-in-value".to_string(),
+                    ))
+            })
+            .collect();
+        assert_eq!(ws_diags.len(), 1);
+        assert_eq!(
+            ws_diags[0].message,
+            "trailing whitespace is included in the variable value"
+        );
+        assert_eq!(ws_diags[0].severity, Some(DiagnosticSeverity::WARNING));
     }
 }
