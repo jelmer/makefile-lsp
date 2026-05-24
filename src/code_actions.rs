@@ -56,6 +56,12 @@ pub fn get_code_actions(
         byte_offset,
         uri,
     ));
+    actions.extend(remove_from_phony_action(
+        parsed,
+        source_text,
+        byte_offset,
+        uri,
+    ));
 
     actions
 }
@@ -366,6 +372,81 @@ fn add_missing_endif_action(
     })
 }
 
+/// Offer "Remove from .PHONY" when the cursor is on a name listed as a
+/// prerequisite of a `.PHONY` rule and that name has no actual target
+/// definition in the makefile.
+///
+/// Drives the change through `Makefile::remove_phony_target`, which also
+/// removes the `.PHONY` rule entirely if the removed name was its only
+/// prerequisite. The edit is emitted as a whole-document replacement since
+/// the affected node may disappear from the tree.
+fn remove_from_phony_action(
+    parsed: &Parse<Makefile>,
+    source_text: &str,
+    byte_offset: usize,
+    uri: &Uri,
+) -> Option<CodeAction> {
+    let offset = text_size::TextSize::from(byte_offset as u32);
+
+    let makefile = parsed.tree();
+
+    // Find a .PHONY rule whose PREREQUISITE node contains the cursor.
+    let target_name = makefile.rules_by_target(".PHONY").find_map(|rule| {
+        let prereqs = rule
+            .syntax()
+            .children()
+            .find(|c| c.kind() == SyntaxKind::PREREQUISITES)?;
+        let prereq = prereqs
+            .children()
+            .filter(|c| c.kind() == SyntaxKind::PREREQUISITE)
+            .find(|c| c.text_range().contains(offset))?;
+        Some(prereq.text().to_string().trim().to_string())
+    })?;
+
+    // Skip if the name actually has a target definition somewhere.
+    let defined_targets: HashSet<String> = makefile
+        .rules()
+        .flat_map(|r| r.targets().collect::<Vec<_>>())
+        .collect();
+    if defined_targets.contains(&target_name) {
+        return None;
+    }
+
+    // Mutate on a fresh tree and emit a whole-document edit, since the affected
+    // .PHONY rule may be removed entirely (and its node would disappear).
+    let mut mutated = parsed.tree();
+    let removed = mutated.remove_phony_target(&target_name).ok()?;
+    if !removed {
+        return None;
+    }
+    let new_text = mutated.code();
+
+    let doc_range = Range::new(
+        offset_to_position(source_text, text_size::TextSize::from(0)),
+        offset_to_position(
+            source_text,
+            text_size::TextSize::from(source_text.len() as u32),
+        ),
+    );
+    let edit = TextEdit {
+        range: doc_range,
+        new_text,
+    };
+
+    let mut changes = std::collections::HashMap::new();
+    changes.insert(uri.clone(), vec![edit]);
+
+    Some(CodeAction {
+        title: format!("Remove '{}' from .PHONY", target_name),
+        kind: Some(CodeActionKind::QUICKFIX),
+        edit: Some(WorkspaceEdit {
+            changes: Some(changes),
+            ..Default::default()
+        }),
+        ..Default::default()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -629,5 +710,65 @@ mod tests {
         let text = "else\nVAR = 1\n";
         let actions = parse_and_actions(text, Position::new(0, 0));
         assert!(!actions.iter().any(|a| a.title == "Add missing endif"));
+    }
+
+    /// Apply a TextEdit whose range may span the entire document.
+    fn apply_doc_edit(source: &str, edit: &TextEdit) -> String {
+        // For the .PHONY tests the edit covers the whole document.
+        if edit.range.start.line == 0 && edit.range.start.character == 0 {
+            edit.new_text.clone()
+        } else {
+            apply_edit(source, edit)
+        }
+    }
+
+    #[test]
+    fn test_remove_from_phony_action() {
+        // 'clean' is in .PHONY but has no actual target → action should fire.
+        let text = ".PHONY: clean\n";
+        let actions = parse_and_actions(text, Position::new(0, 9));
+        let action = actions
+            .iter()
+            .find(|a| a.title == "Remove 'clean' from .PHONY")
+            .expect("expected quickfix");
+        let edit = only_edit(action);
+        assert_eq!(apply_doc_edit(text, edit), "");
+    }
+
+    #[test]
+    fn test_remove_from_phony_one_of_many() {
+        // 'clean' is undefined; 'build' has a real target. Action fires on
+        // 'clean' but leaves 'build' alone.
+        let text = ".PHONY: clean build\nbuild:\n\techo build\n";
+        let actions = parse_and_actions(text, Position::new(0, 9));
+        let action = actions
+            .iter()
+            .find(|a| a.title == "Remove 'clean' from .PHONY")
+            .unwrap();
+        let edit = only_edit(action);
+        let result = apply_doc_edit(text, edit);
+        // We don't pin the exact whitespace; we just verify 'clean' is gone
+        // and 'build' is still there.
+        assert!(!result.contains("clean"));
+        assert!(result.contains("build"));
+    }
+
+    #[test]
+    fn test_no_remove_from_phony_when_target_defined() {
+        let text = ".PHONY: clean\nclean:\n\trm -f *.o\n";
+        let actions = parse_and_actions(text, Position::new(0, 9));
+        assert!(!actions
+            .iter()
+            .any(|a| a.title.starts_with("Remove '") && a.title.contains("from .PHONY")));
+    }
+
+    #[test]
+    fn test_no_remove_from_phony_when_cursor_elsewhere() {
+        let text = ".PHONY: clean\nbuild:\n\techo done\n";
+        // Cursor on 'build:' line, not on the .PHONY prereq.
+        let actions = parse_and_actions(text, Position::new(1, 0));
+        assert!(!actions
+            .iter()
+            .any(|a| a.title.starts_with("Remove '") && a.title.contains("from .PHONY")));
     }
 }
