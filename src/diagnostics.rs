@@ -61,6 +61,7 @@ pub fn get_diagnostics(
     diagnostics.extend(check_trailing_whitespace_in_value(source_text, &makefile));
     diagnostics.extend(check_duplicate_prerequisites(source_text, &makefile));
     diagnostics.extend(check_shell_in_recursive_assignment(source_text, &makefile));
+    diagnostics.extend(check_empty_automatic_variables(source_text, &makefile));
     diagnostics.extend(check_unterminated_conditionals(source_text, &makefile));
 
     diagnostics
@@ -334,6 +335,123 @@ fn check_spaces_in_recipes(source_text: &str, makefile: &Makefile) -> Vec<Diagno
     }
 
     diagnostics
+}
+
+/// Check for automatic variables that expand to empty in their context.
+///
+/// `$<`, `$^`, `$+`, `$?` all expand to (part of) the prerequisite list, so
+/// they're empty in a rule with no prerequisites. `$*` expands to the stem of
+/// a pattern rule, so it's empty in a non-pattern rule.
+///
+/// TODO: `makefile-lossless` currently tokenizes recipe content as a single
+/// flat TEXT token, so we byte-scan it here for `$X` / `$(X)` / `${X}`. Once
+/// the parser surfaces structured VariableReference nodes inside recipes,
+/// replace this scanner with an AST walk over those nodes.
+fn check_empty_automatic_variables(source_text: &str, makefile: &Makefile) -> Vec<Diagnostic> {
+    use text_size::{TextRange, TextSize};
+
+    let mut diagnostics = Vec::new();
+
+    for rule in makefile.rules() {
+        let has_prereqs = rule.prerequisites().next().is_some();
+        let is_pattern = rule.targets().any(|t| t.contains('%'));
+
+        if has_prereqs && is_pattern {
+            continue;
+        }
+
+        for recipe in rule.recipe_nodes() {
+            for token in recipe
+                .syntax()
+                .descendants_with_tokens()
+                .filter_map(|c| c.into_token())
+            {
+                if token.kind() != SyntaxKind::TEXT {
+                    continue;
+                }
+                let text = token.text();
+                let base: u32 = token.text_range().start().into();
+                for (var, start_off, end_off) in scan_automatic_vars(text) {
+                    let flagged = match var {
+                        '<' | '^' | '+' | '?' => !has_prereqs,
+                        '*' => !is_pattern,
+                        _ => false,
+                    };
+                    if !flagged {
+                        continue;
+                    }
+                    let range = TextRange::new(
+                        TextSize::from(base + start_off as u32),
+                        TextSize::from(base + end_off as u32),
+                    );
+                    let lsp_range = text_range_to_lsp_range(source_text, range);
+                    let reason = match var {
+                        '*' => "non-pattern rule",
+                        _ => "rule has no prerequisites",
+                    };
+                    diagnostics.push(make_diagnostic(
+                        lsp_range,
+                        DiagnosticSeverity::WARNING,
+                        "empty-automatic-variable",
+                        format!("${} expands to empty: {}", var, reason),
+                    ));
+                }
+            }
+        }
+    }
+
+    diagnostics
+}
+
+/// Scan a recipe text snippet for automatic variable references.
+///
+/// Returns `(var_char, start, end)` tuples where `start..end` covers the
+/// whole `$X` (or `$(X)` / `${X}`) sequence within `text`. Only the single-
+/// character automatic variables we care about are reported: `<`, `^`, `+`,
+/// `?`, `*`. `$$` is treated as an escape and skipped.
+///
+/// TODO: see `check_empty_automatic_variables` — drop this when recipe
+/// content is structurally tokenized in makefile-lossless.
+fn scan_automatic_vars(text: &str) -> Vec<(char, usize, usize)> {
+    let mut out = Vec::new();
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'$' {
+            i += 1;
+            continue;
+        }
+        // Past the `$`. What's next?
+        if i + 1 >= bytes.len() {
+            break;
+        }
+        let next = bytes[i + 1];
+        if next == b'$' {
+            // Escaped `$$` — skip both.
+            i += 2;
+            continue;
+        }
+        if next == b'(' || next == b'{' {
+            // `$(X)` or `${X}` — only report if the contents are exactly a
+            // single automatic-variable character.
+            let close = if next == b'(' { b')' } else { b'}' };
+            if i + 3 < bytes.len() && bytes[i + 3] == close {
+                let c = bytes[i + 2];
+                if matches!(c, b'<' | b'^' | b'+' | b'?' | b'*') {
+                    out.push((c as char, i, i + 4));
+                }
+            }
+            i += 1;
+            continue;
+        }
+        if matches!(next, b'<' | b'^' | b'+' | b'?' | b'*') {
+            out.push((next as char, i, i + 2));
+            i += 2;
+            continue;
+        }
+        i += 1;
+    }
+    out
 }
 
 /// Check for conditional blocks that are missing their `endif`.
@@ -1001,6 +1119,111 @@ mod tests {
             "trailing whitespace is included in the variable value"
         );
         assert_eq!(ws_diags[0].severity, Some(DiagnosticSeverity::WARNING));
+    }
+
+    // Empty automatic variable tests
+
+    #[test]
+    fn test_dollar_less_in_rule_with_no_prereqs() {
+        let text = "foo:\n\techo $<\n";
+        let codes = diag_codes(text);
+        assert!(codes.contains(&"empty-automatic-variable".to_string()));
+    }
+
+    #[test]
+    fn test_dollar_less_with_prereqs_ok() {
+        let text = "foo: bar\n\techo $<\n";
+        let codes = diag_codes(text);
+        assert!(!codes.contains(&"empty-automatic-variable".to_string()));
+    }
+
+    #[test]
+    fn test_dollar_caret_in_rule_with_no_prereqs() {
+        let text = "foo:\n\techo $^\n";
+        let codes = diag_codes(text);
+        assert!(codes.contains(&"empty-automatic-variable".to_string()));
+    }
+
+    #[test]
+    fn test_dollar_plus_in_rule_with_no_prereqs() {
+        let text = "foo:\n\techo $+\n";
+        let codes = diag_codes(text);
+        assert!(codes.contains(&"empty-automatic-variable".to_string()));
+    }
+
+    #[test]
+    fn test_dollar_question_in_rule_with_no_prereqs() {
+        let text = "foo:\n\techo $?\n";
+        let codes = diag_codes(text);
+        assert!(codes.contains(&"empty-automatic-variable".to_string()));
+    }
+
+    #[test]
+    fn test_dollar_at_with_no_prereqs_ok() {
+        // $@ is the target — always defined regardless of prereqs.
+        let text = "foo:\n\techo $@\n";
+        let codes = diag_codes(text);
+        assert!(!codes.contains(&"empty-automatic-variable".to_string()));
+    }
+
+    #[test]
+    fn test_dollar_star_in_non_pattern_rule() {
+        let text = "foo: bar\n\techo $*\n";
+        let codes = diag_codes(text);
+        assert!(codes.contains(&"empty-automatic-variable".to_string()));
+    }
+
+    #[test]
+    fn test_dollar_star_in_pattern_rule_ok() {
+        let text = "%.o: %.c\n\techo $*\n";
+        let codes = diag_codes(text);
+        assert!(!codes.contains(&"empty-automatic-variable".to_string()));
+    }
+
+    #[test]
+    fn test_dollar_less_in_pattern_rule_ok() {
+        let text = "%.o: %.c\n\t$(CC) -c $<\n";
+        let codes = diag_codes(text);
+        assert!(!codes.contains(&"empty-automatic-variable".to_string()));
+    }
+
+    #[test]
+    fn test_parenthesized_form_flagged() {
+        let text = "foo:\n\techo $(<)\n";
+        let codes = diag_codes(text);
+        assert!(codes.contains(&"empty-automatic-variable".to_string()));
+    }
+
+    #[test]
+    fn test_braced_form_flagged() {
+        let text = "foo:\n\techo ${<}\n";
+        let codes = diag_codes(text);
+        assert!(codes.contains(&"empty-automatic-variable".to_string()));
+    }
+
+    #[test]
+    fn test_escaped_dollar_not_flagged() {
+        let text = "foo:\n\techo $$<\n";
+        let codes = diag_codes(text);
+        assert!(!codes.contains(&"empty-automatic-variable".to_string()));
+    }
+
+    #[test]
+    fn test_empty_auto_var_message() {
+        let text = "foo:\n\techo $<\n";
+        let diags = get_diags(text);
+        let auto: Vec<_> = diags
+            .iter()
+            .filter(|d| {
+                d.code
+                    == Some(NumberOrString::String(
+                        "empty-automatic-variable".to_string(),
+                    ))
+            })
+            .collect();
+        assert_eq!(auto.len(), 1);
+        assert!(auto[0].message.contains("$<"));
+        assert!(auto[0].message.contains("no prerequisites"));
     }
 
     // Unterminated conditional tests
