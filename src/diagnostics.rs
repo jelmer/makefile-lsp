@@ -57,6 +57,7 @@ pub fn get_diagnostics(
     diagnostics.extend(check_include_missing_path(source_text, &makefile));
     diagnostics.extend(check_spaces_in_recipes(source_text, &makefile));
     diagnostics.extend(check_trailing_whitespace_in_value(source_text, &makefile));
+    diagnostics.extend(check_duplicate_prerequisites(source_text, &makefile));
 
     diagnostics
 }
@@ -324,6 +325,33 @@ fn check_spaces_in_recipes(source_text: &str, makefile: &Makefile) -> Vec<Diagno
                         "recipe lines must start with a tab, not spaces".to_string(),
                     ));
                 }
+            }
+        }
+    }
+
+    diagnostics
+}
+
+/// Check for duplicate prerequisites within a single rule.
+///
+/// `foo: a b a` is harmless but always a mistake — the duplicate adds no
+/// information and usually means the author intended a different name.
+fn check_duplicate_prerequisites(source_text: &str, makefile: &Makefile) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+
+    for rule in makefile.rules() {
+        let prereqs: Vec<String> = rule.prerequisites().collect();
+        let mut seen: HashSet<&str> = HashSet::new();
+        let mut reported: HashSet<&str> = HashSet::new();
+        for prereq in &prereqs {
+            if !seen.insert(prereq.as_str()) && reported.insert(prereq.as_str()) {
+                let rule_range = text_range_to_lsp_range(source_text, rule.syntax().text_range());
+                diagnostics.push(make_diagnostic(
+                    rule_range,
+                    DiagnosticSeverity::WARNING,
+                    "duplicate-prerequisite",
+                    format!("prerequisite '{}' is listed more than once", prereq),
+                ));
             }
         }
     }
@@ -726,6 +754,74 @@ mod tests {
         let codes = diag_codes(text);
         // The trailing token here is BACKSLASH, not WHITESPACE — so no warning.
         assert!(!codes.contains(&"trailing-whitespace-in-value".to_string()));
+    }
+
+    // Duplicate prerequisites tests
+
+    #[test]
+    fn test_duplicate_prerequisite() {
+        let text = "foo: a b a\n\techo $@\n";
+        let codes = diag_codes(text);
+        assert!(codes.contains(&"duplicate-prerequisite".to_string()));
+    }
+
+    #[test]
+    fn test_no_duplicate_prerequisites() {
+        let text = "foo: a b c\n\techo $@\n";
+        let codes = diag_codes(text);
+        assert!(!codes.contains(&"duplicate-prerequisite".to_string()));
+    }
+
+    #[test]
+    fn test_duplicate_prerequisite_message() {
+        let text = "foo: a b a\n\techo $@\n";
+        let diags = get_diags(text);
+        let dup_diags: Vec<_> = diags
+            .iter()
+            .filter(|d| {
+                d.code == Some(NumberOrString::String("duplicate-prerequisite".to_string()))
+            })
+            .collect();
+        assert_eq!(dup_diags.len(), 1);
+        assert_eq!(
+            dup_diags[0].message,
+            "prerequisite 'a' is listed more than once"
+        );
+    }
+
+    #[test]
+    fn test_duplicate_prerequisite_reported_once_per_name() {
+        // `a` appears three times — should report once, not twice.
+        let text = "foo: a b a c a\n\techo $@\n";
+        let diags = get_diags(text);
+        let dup_diags: Vec<_> = diags
+            .iter()
+            .filter(|d| {
+                d.code == Some(NumberOrString::String("duplicate-prerequisite".to_string()))
+            })
+            .collect();
+        assert_eq!(dup_diags.len(), 1);
+    }
+
+    #[test]
+    fn test_duplicate_prerequisites_distinct_names() {
+        let text = "foo: a b a b\n\techo $@\n";
+        let diags = get_diags(text);
+        let dup_diags: Vec<_> = diags
+            .iter()
+            .filter(|d| {
+                d.code == Some(NumberOrString::String("duplicate-prerequisite".to_string()))
+            })
+            .collect();
+        assert_eq!(dup_diags.len(), 2);
+    }
+
+    #[test]
+    fn test_duplicate_prerequisite_across_rules_ok() {
+        // Same prereq in two different rules is fine.
+        let text = "foo: shared\n\techo foo\n\nbar: shared\n\techo bar\n";
+        let codes = diag_codes(text);
+        assert!(!codes.contains(&"duplicate-prerequisite".to_string()));
     }
 
     #[test]
