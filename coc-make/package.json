@@ -1,6 +1,6 @@
 {
   "name": "coc-make",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Makefile language server support for coc.nvim",
   "main": "lib/index.js",
   "engines": {
