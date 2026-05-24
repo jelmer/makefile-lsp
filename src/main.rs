@@ -50,7 +50,8 @@ impl Backend {
 
     async fn update_file(&self, uri: Uri, text: String) {
         let parsed = makefile_lossless::Makefile::parse(&text);
-        let diagnostics = diagnostics::get_diagnostics(&text, &parsed);
+        let base_dir = uri_to_dir(&uri);
+        let diagnostics = diagnostics::get_diagnostics(&text, &parsed, base_dir.as_deref());
 
         let mut files = self.files.lock().await;
         files.insert(uri.clone(), FileInfo { text, parsed });
@@ -60,6 +61,17 @@ impl Backend {
             .publish_diagnostics(uri, diagnostics, None)
             .await;
     }
+}
+
+/// Extract the parent directory from a `file://` URI, for resolving relative
+/// include paths. Returns None for non-file URIs or URIs without a parent.
+fn uri_to_dir(uri: &Uri) -> Option<std::path::PathBuf> {
+    if uri.scheme().as_str() != "file" {
+        return None;
+    }
+    let path = uri.path();
+    let pb = std::path::PathBuf::from(path.as_str());
+    pb.parent().map(|p| p.to_path_buf())
 }
 
 impl LanguageServer for Backend {

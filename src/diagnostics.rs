@@ -28,9 +28,14 @@ fn make_diagnostic(
 }
 
 /// Collect diagnostics from parse errors and semantic analysis.
+///
+/// `base_dir`, when provided, is used to resolve relative include paths for
+/// the missing-include-file check. Pass `None` to skip filesystem-touching
+/// checks (e.g. in tests where the makefile doesn't live on disk).
 pub fn get_diagnostics(
     source_text: &str,
     parsed: &Parse<makefile_lossless::Makefile>,
+    base_dir: Option<&std::path::Path>,
 ) -> Vec<Diagnostic> {
     let mut diagnostics: Vec<Diagnostic> = parsed
         .positioned_errors()
@@ -65,6 +70,9 @@ pub fn get_diagnostics(
     diagnostics.extend(check_unterminated_conditionals(source_text, &makefile));
     diagnostics.extend(check_unused_variables(source_text, &makefile));
     diagnostics.extend(check_mixed_assignment_operators(source_text, &makefile));
+    if let Some(dir) = base_dir {
+        diagnostics.extend(check_missing_include_file(source_text, &makefile, dir));
+    }
 
     diagnostics
 }
@@ -621,6 +629,56 @@ fn is_valid_var_name(s: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-')
 }
 
+/// Check for `include` directives whose path doesn't exist on disk.
+///
+/// Resolves the path relative to `base_dir`. Optional includes (`-include` /
+/// `sinclude`) are skipped — they explicitly tolerate a missing file. Paths
+/// containing variable references (`include $(CONFIG)`) are also skipped
+/// since we can't evaluate them statically.
+fn check_missing_include_file(
+    source_text: &str,
+    makefile: &Makefile,
+    base_dir: &std::path::Path,
+) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+
+    for item in makefile.items() {
+        let MakefileItem::Include(inc) = item else {
+            continue;
+        };
+        if inc.is_optional() {
+            continue;
+        }
+        let Some(path) = inc.path() else { continue };
+        if path.is_empty() {
+            // Covered by check_include_missing_path; skip here.
+            continue;
+        }
+        // Skip if the path contains an unresolved variable reference.
+        if path.contains('$') {
+            continue;
+        }
+
+        let resolved = base_dir.join(&path);
+        if resolved.exists() {
+            continue;
+        }
+
+        let range = inc
+            .path_range()
+            .map(|r| text_range_to_lsp_range(source_text, r))
+            .unwrap_or_else(|| text_range_to_lsp_range(source_text, inc.syntax().text_range()));
+        diagnostics.push(make_diagnostic(
+            range,
+            DiagnosticSeverity::WARNING,
+            "missing-include-file",
+            format!("included file '{}' does not exist", path),
+        ));
+    }
+
+    diagnostics
+}
+
 /// Check for the same variable being assigned with both `=` (recursive) and
 /// `:=`/`::=`/`:::=` (immediate) flavours.
 ///
@@ -853,7 +911,7 @@ mod tests {
 
     fn get_diags(text: &str) -> Vec<Diagnostic> {
         let parsed = Makefile::parse(text);
-        get_diagnostics(text, &parsed)
+        get_diagnostics(text, &parsed, None)
     }
 
     fn diag_codes(text: &str) -> Vec<String> {
@@ -1554,6 +1612,78 @@ mod tests {
         let codes = diag_codes(text);
         // FOO is unused — `$$FOO` is the shell's FOO, not make's.
         assert!(codes.contains(&"unused-variable".to_string()));
+    }
+
+    // Missing include file tests
+
+    fn diags_with_dir(text: &str, dir: &std::path::Path) -> Vec<Diagnostic> {
+        let parsed = Makefile::parse(text);
+        get_diagnostics(text, &parsed, Some(dir))
+    }
+
+    fn codes_with_dir(text: &str, dir: &std::path::Path) -> Vec<String> {
+        diags_with_dir(text, dir)
+            .into_iter()
+            .filter_map(|d| d.code)
+            .map(|c| match c {
+                NumberOrString::String(s) => s,
+                NumberOrString::Number(n) => n.to_string(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_missing_include_file_flagged() {
+        let dir = tempfile::tempdir().unwrap();
+        let codes = codes_with_dir("include config.mk\n", dir.path());
+        assert!(codes.contains(&"missing-include-file".to_string()));
+    }
+
+    #[test]
+    fn test_existing_include_file_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.mk"), "").unwrap();
+        let codes = codes_with_dir("include config.mk\n", dir.path());
+        assert!(!codes.contains(&"missing-include-file".to_string()));
+    }
+
+    #[test]
+    fn test_optional_include_not_flagged() {
+        let dir = tempfile::tempdir().unwrap();
+        let codes = codes_with_dir("-include config.mk\n", dir.path());
+        assert!(!codes.contains(&"missing-include-file".to_string()));
+    }
+
+    #[test]
+    fn test_include_with_variable_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let codes = codes_with_dir("CONFIG = config.mk\ninclude $(CONFIG)\n", dir.path());
+        // Can't resolve $(CONFIG) at lint time, so we don't flag.
+        assert!(!codes.contains(&"missing-include-file".to_string()));
+    }
+
+    #[test]
+    fn test_no_base_dir_skips_check() {
+        // When no base_dir is passed, the check doesn't run. (Used by the
+        // default diag_codes helper.)
+        let codes = diag_codes("include nonexistent.mk\n");
+        assert!(!codes.contains(&"missing-include-file".to_string()));
+    }
+
+    #[test]
+    fn test_missing_include_file_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let diags = diags_with_dir("include config.mk\n", dir.path());
+        let missing: Vec<_> = diags
+            .iter()
+            .filter(|d| d.code == Some(NumberOrString::String("missing-include-file".to_string())))
+            .collect();
+        assert_eq!(missing.len(), 1);
+        assert_eq!(
+            missing[0].message,
+            "included file 'config.mk' does not exist"
+        );
+        assert_eq!(missing[0].severity, Some(DiagnosticSeverity::WARNING));
     }
 
     // Mixed assignment operator tests
