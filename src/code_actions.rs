@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 
-use makefile_lossless::{Makefile, Parse, SyntaxKind, VariableReference};
+use makefile_lossless::{Conditional, Makefile, Parse, SyntaxKind, VariableReference};
 use rowan::ast::AstNode;
 use tower_lsp_server::ls_types::{
     CodeAction, CodeActionKind, Position, Range, TextEdit, Uri, WorkspaceEdit,
@@ -45,6 +45,12 @@ pub fn get_code_actions(
         uri,
     ));
     actions.extend(convert_to_simply_expanded_action(
+        parsed,
+        source_text,
+        byte_offset,
+        uri,
+    ));
+    actions.extend(add_missing_endif_action(
         parsed,
         source_text,
         byte_offset,
@@ -312,6 +318,54 @@ fn convert_to_simply_expanded_action(
     })
 }
 
+/// Offer "Add missing endif" when the cursor is inside a conditional block
+/// that has no matching `endif`.
+///
+/// Drives the change through `Conditional::add_endif`.
+fn add_missing_endif_action(
+    parsed: &Parse<Makefile>,
+    source_text: &str,
+    byte_offset: usize,
+    uri: &Uri,
+) -> Option<CodeAction> {
+    let offset = text_size::TextSize::from(byte_offset as u32);
+
+    let makefile = parsed.tree();
+    // Find the innermost Conditional containing the cursor that is missing an
+    // endif and has a recognized opener.
+    let mut cond = makefile
+        .syntax()
+        .descendants()
+        .filter_map(Conditional::cast)
+        .filter(|c| c.syntax().text_range().contains_inclusive(offset))
+        .filter(|c| c.conditional_type().is_some())
+        .filter(|c| {
+            !c.syntax()
+                .children_with_tokens()
+                .any(|child| child.kind() == SyntaxKind::CONDITIONAL_ENDIF)
+        })
+        .max_by_key(|c| c.syntax().text_range().start())?;
+
+    let original_range = cond.syntax().text_range();
+    if !cond.add_endif().ok()? {
+        return None;
+    }
+    let edit = edit_for_node_change(source_text, original_range, cond.syntax());
+
+    let mut changes = std::collections::HashMap::new();
+    changes.insert(uri.clone(), vec![edit]);
+
+    Some(CodeAction {
+        title: "Add missing endif".to_string(),
+        kind: Some(CodeActionKind::QUICKFIX),
+        edit: Some(WorkspaceEdit {
+            changes: Some(changes),
+            ..Default::default()
+        }),
+        ..Default::default()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -524,5 +578,56 @@ mod tests {
             .unwrap();
         let edit = only_edit(action);
         assert_eq!(apply_edit(text, edit), "FILES := $(strip $(shell ls))\n");
+    }
+
+    #[test]
+    fn test_add_missing_endif_action() {
+        let text = "ifdef DEBUG\nVAR = 1\n";
+        let actions = parse_and_actions(text, Position::new(1, 0));
+        let action = actions
+            .iter()
+            .find(|a| a.title == "Add missing endif")
+            .expect("expected quickfix");
+        let edit = only_edit(action);
+        assert_eq!(apply_edit(text, edit), "ifdef DEBUG\nVAR = 1\nendif\n");
+    }
+
+    #[test]
+    fn test_no_add_endif_when_already_terminated() {
+        let text = "ifdef DEBUG\nVAR = 1\nendif\n";
+        let actions = parse_and_actions(text, Position::new(1, 0));
+        assert!(!actions.iter().any(|a| a.title == "Add missing endif"));
+    }
+
+    #[test]
+    fn test_no_add_endif_outside_conditional() {
+        let text = "VAR = 1\n";
+        let actions = parse_and_actions(text, Position::new(0, 0));
+        assert!(!actions.iter().any(|a| a.title == "Add missing endif"));
+    }
+
+    #[test]
+    fn test_add_endif_picks_innermost() {
+        // Nested: outer is unterminated, inner is terminated. Cursor inside
+        // inner should still offer the action for the outer (since the inner
+        // is fine).
+        let text = "ifdef OUTER\nifdef INNER\nVAR = 1\nendif\n";
+        let actions = parse_and_actions(text, Position::new(2, 0));
+        let action = actions
+            .iter()
+            .find(|a| a.title == "Add missing endif")
+            .unwrap();
+        let edit = only_edit(action);
+        assert_eq!(
+            apply_edit(text, edit),
+            "ifdef OUTER\nifdef INNER\nVAR = 1\nendif\nendif\n"
+        );
+    }
+
+    #[test]
+    fn test_no_add_endif_for_bare_else() {
+        let text = "else\nVAR = 1\n";
+        let actions = parse_and_actions(text, Position::new(0, 0));
+        assert!(!actions.iter().any(|a| a.title == "Add missing endif"));
     }
 }
