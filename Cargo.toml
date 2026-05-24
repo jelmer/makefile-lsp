@@ -1,6 +1,6 @@
 [package]
 name = "makefile-lsp"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 authors = ["Jelmer Vernooij <jelmer@jelmer.uk>"]
 description = "Language Server Protocol implementation for Makefiles"

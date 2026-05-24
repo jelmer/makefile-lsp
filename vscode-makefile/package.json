@@ -2,7 +2,7 @@
   "name": "vscode-makefile",
   "displayName": "Makefile LSP",
   "description": "Language Server Protocol support for Makefiles",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "publisher": "jelmer",
   "license": "Apache-2.0",
   "repository": {
