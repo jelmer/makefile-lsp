@@ -71,6 +71,7 @@ pub fn get_diagnostics(
     diagnostics.extend(check_unused_variables(source_text, &makefile));
     diagnostics.extend(check_mixed_assignment_operators(source_text, &makefile));
     diagnostics.extend(check_orphan_recipe_line(source_text, &makefile));
+    diagnostics.extend(check_empty_rule_probably_phony(source_text, &makefile));
     if let Some(dir) = base_dir {
         diagnostics.extend(check_missing_include_file(source_text, &makefile, dir));
     }
@@ -675,6 +676,54 @@ fn check_missing_include_file(
             "missing-include-file",
             format!("included file '{}' does not exist", path),
         ));
+    }
+
+    diagnostics
+}
+
+/// Check for rules with no prerequisites and no recipe lines — these are
+/// often phony declarations the author forgot to mark with `.PHONY`.
+///
+/// Hint-level: a regular target that already exists as a file is fine to
+/// declare empty (it relies on the file's existence). The hint nudges the
+/// common case where the author meant to make it phony.
+fn check_empty_rule_probably_phony(source_text: &str, makefile: &Makefile) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+
+    for rule in makefile.rules() {
+        // Skip rules with prerequisites — they're meta-targets, not phony candidates.
+        if rule.prerequisites().next().is_some() {
+            continue;
+        }
+        // Skip rules with any recipe lines.
+        if rule.recipe_nodes().next().is_some() {
+            continue;
+        }
+        let targets: Vec<String> = rule.targets().collect();
+        if targets.is_empty() {
+            continue;
+        }
+        for target in &targets {
+            // Special targets, pattern rules, and already-phony targets are fine empty.
+            if target.starts_with('.') || target.contains('%') {
+                continue;
+            }
+            if makefile.is_phony(target) {
+                continue;
+            }
+
+            let rule_range = text_range_to_lsp_range(source_text, rule.syntax().text_range());
+            diagnostics.push(make_diagnostic(
+                rule_range,
+                DiagnosticSeverity::HINT,
+                "empty-rule-probably-phony",
+                format!(
+                    "target '{}' has no prerequisites and no recipe; \
+                     declare it with .PHONY if it's not a file",
+                    target
+                ),
+            ));
+        }
     }
 
     diagnostics
@@ -1725,6 +1774,70 @@ mod tests {
             "included file 'config.mk' does not exist"
         );
         assert_eq!(missing[0].severity, Some(DiagnosticSeverity::WARNING));
+    }
+
+    // Empty rule probably phony tests
+
+    #[test]
+    fn test_empty_rule_flagged() {
+        let text = "clean:\n";
+        let codes = diag_codes(text);
+        assert!(codes.contains(&"empty-rule-probably-phony".to_string()));
+    }
+
+    #[test]
+    fn test_rule_with_recipe_not_flagged() {
+        let text = "clean:\n\trm -f *.o\n";
+        let codes = diag_codes(text);
+        assert!(!codes.contains(&"empty-rule-probably-phony".to_string()));
+    }
+
+    #[test]
+    fn test_rule_with_prereqs_not_flagged() {
+        // `all: build test` is a meta-target — common and fine.
+        let text = "all: build test\n";
+        let codes = diag_codes(text);
+        assert!(!codes.contains(&"empty-rule-probably-phony".to_string()));
+    }
+
+    #[test]
+    fn test_phony_special_target_not_flagged() {
+        let text = ".PHONY:\n";
+        let codes = diag_codes(text);
+        assert!(!codes.contains(&"empty-rule-probably-phony".to_string()));
+    }
+
+    #[test]
+    fn test_pattern_rule_empty_ok() {
+        let text = "%.o:\n";
+        let codes = diag_codes(text);
+        assert!(!codes.contains(&"empty-rule-probably-phony".to_string()));
+    }
+
+    #[test]
+    fn test_already_phony_not_flagged() {
+        let text = ".PHONY: clean\nclean:\n";
+        let codes = diag_codes(text);
+        assert!(!codes.contains(&"empty-rule-probably-phony".to_string()));
+    }
+
+    #[test]
+    fn test_empty_rule_message() {
+        let text = "clean:\n";
+        let diags = get_diags(text);
+        let hints: Vec<_> = diags
+            .iter()
+            .filter(|d| {
+                d.code
+                    == Some(NumberOrString::String(
+                        "empty-rule-probably-phony".to_string(),
+                    ))
+            })
+            .collect();
+        assert_eq!(hints.len(), 1);
+        assert!(hints[0].message.contains("clean"));
+        assert!(hints[0].message.contains(".PHONY"));
+        assert_eq!(hints[0].severity, Some(DiagnosticSeverity::HINT));
     }
 
     // Orphan recipe line tests
