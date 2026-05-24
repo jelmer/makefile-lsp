@@ -85,6 +85,12 @@ pub fn get_code_actions(
         byte_offset,
         uri,
     ));
+    actions.extend(inline_prerequisite_action(
+        parsed,
+        source_text,
+        byte_offset,
+        uri,
+    ));
 
     actions
 }
@@ -808,6 +814,86 @@ fn pick_default_goal(makefile: &Makefile, target: &str) -> Option<String> {
         .find(|t| t != target && crate::dep_graph::is_graph_target(t))
 }
 
+/// Offer "Inline prerequisite '<p>'" — remove a prereq from the rule's list
+/// when it's already reachable transitively via another prereq.
+///
+/// Pairs with the `redundant-prerequisite` diagnostic. Triggered when the
+/// cursor is on a specific prerequisite identifier so the action targets
+/// that one even if the rule has multiple redundancies.
+fn inline_prerequisite_action(
+    parsed: &Parse<Makefile>,
+    source_text: &str,
+    byte_offset: usize,
+    uri: &Uri,
+) -> Option<CodeAction> {
+    let offset = text_size::TextSize::from(byte_offset as u32);
+    let makefile = parsed.tree();
+
+    let mut rule = makefile
+        .rules()
+        .find(|r| r.syntax().text_range().contains(offset))?;
+
+    // Locate the IDENTIFIER token under the cursor that lives inside a
+    // PREREQUISITES node — that's the prereq we'd remove.
+    let prereqs_node = rule
+        .syntax()
+        .children()
+        .find(|c| c.kind() == SyntaxKind::PREREQUISITES)?;
+    let token = prereqs_node
+        .descendants_with_tokens()
+        .filter_map(|e| e.into_token())
+        .find(|t| t.kind() == SyntaxKind::IDENTIFIER && t.text_range().contains(offset))?;
+    let cursor_prereq = token.text().to_string();
+
+    let prereqs: Vec<String> = rule.prerequisites().collect();
+    if prereqs.len() < 2 || !prereqs.contains(&cursor_prereq) {
+        return None;
+    }
+    let targets: HashSet<String> = rule.targets().collect();
+    if targets.contains(&cursor_prereq) {
+        return None;
+    }
+
+    let graph = crate::dep_graph::DependencyGraph::from_makefile(&makefile);
+    let via = prereqs.iter().find(|other| {
+        other.as_str() != cursor_prereq.as_str()
+            && graph.reachable_from(other).contains(&cursor_prereq)
+    })?;
+    let via = via.clone();
+
+    // Build the new list: drop only the first occurrence at the cursor.
+    let mut new_prereqs: Vec<String> = Vec::with_capacity(prereqs.len() - 1);
+    let mut dropped = false;
+    for p in &prereqs {
+        if !dropped && p == &cursor_prereq {
+            dropped = true;
+            continue;
+        }
+        new_prereqs.push(p.clone());
+    }
+
+    let original_range = rule.syntax().text_range();
+    let refs: Vec<&str> = new_prereqs.iter().map(String::as_str).collect();
+    rule.set_prerequisites(refs).ok()?;
+    let edit = edit_for_node_change(source_text, original_range, rule.syntax());
+
+    let mut changes = std::collections::HashMap::new();
+    changes.insert(uri.clone(), vec![edit]);
+
+    Some(CodeAction {
+        title: format!(
+            "Inline prerequisite '{}' (already via '{}')",
+            cursor_prereq, via
+        ),
+        kind: Some(CodeActionKind::REFACTOR_INLINE),
+        edit: Some(WorkspaceEdit {
+            changes: Some(changes),
+            ..Default::default()
+        }),
+        ..Default::default()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1446,5 +1532,58 @@ mod tests {
         let text = "all: build\n\t@:\nbuild:\n\t@:\n.PHONY: helper\n";
         let actions = parse_and_actions(text, Position::new(4, 0));
         assert!(find_attach_action(&actions).is_none());
+    }
+
+    // Inline prerequisite tests
+
+    fn find_inline_prereq_action(actions: &[CodeAction]) -> Option<&CodeAction> {
+        actions
+            .iter()
+            .find(|a| a.title.starts_with("Inline prerequisite"))
+    }
+
+    #[test]
+    fn test_inline_prereq_removes_redundant() {
+        // `all: lib main` plus `main: lib` -> cursor on `lib` offers removal.
+        let text = "all: lib main\n\t@:\nmain: lib\n\t@:\nlib:\n\t@:\n";
+        // Position on 'l' of the first `lib` in `all: lib main` -> col 5.
+        let actions = parse_and_actions(text, Position::new(0, 5));
+        let action = find_inline_prereq_action(&actions).expect("expected inline action");
+        assert!(action.title.contains("'lib'"));
+        assert!(action.title.contains("via 'main'"));
+        let edits = action
+            .edit
+            .as_ref()
+            .unwrap()
+            .changes
+            .as_ref()
+            .unwrap()
+            .values()
+            .next()
+            .unwrap();
+        let result = apply_edits(text, edits);
+        assert_eq!(result, "all: main\n\t@:\nmain: lib\n\t@:\nlib:\n\t@:\n");
+    }
+
+    #[test]
+    fn test_inline_prereq_silenced_for_non_redundant() {
+        let text = "all: a b\n\t@:\na:\n\t@:\nb:\n\t@:\n";
+        let actions = parse_and_actions(text, Position::new(0, 5));
+        assert!(find_inline_prereq_action(&actions).is_none());
+    }
+
+    #[test]
+    fn test_inline_prereq_only_when_cursor_on_redundant_one() {
+        // Cursor on `main` (col 9) — `main` is NOT redundant. No action.
+        let text = "all: lib main\n\t@:\nmain: lib\n\t@:\nlib:\n\t@:\n";
+        let actions = parse_and_actions(text, Position::new(0, 9));
+        assert!(find_inline_prereq_action(&actions).is_none());
+    }
+
+    #[test]
+    fn test_inline_prereq_silenced_for_single_prereq() {
+        let text = "all: only\n\t@:\nonly:\n\t@:\n";
+        let actions = parse_and_actions(text, Position::new(0, 5));
+        assert!(find_inline_prereq_action(&actions).is_none());
     }
 }

@@ -67,6 +67,10 @@ pub fn get_diagnostics(
     diagnostics.extend(check_spaces_in_recipes(source_text, &makefile));
     diagnostics.extend(check_trailing_whitespace_in_value(source_text, &makefile));
     diagnostics.extend(check_duplicate_prerequisites(source_text, &makefile));
+    diagnostics.extend(check_redundant_transitive_prerequisites(
+        source_text,
+        &makefile,
+    ));
     diagnostics.extend(check_shell_in_recursive_assignment(source_text, &makefile));
     diagnostics.extend(check_empty_automatic_variables(source_text, &makefile));
     diagnostics.extend(check_unterminated_conditionals(source_text, &makefile));
@@ -1076,6 +1080,61 @@ fn check_duplicate_prerequisites(source_text: &str, makefile: &Makefile) -> Vec<
     diagnostics
 }
 
+/// Check for prerequisites that are already reachable transitively via another
+/// prerequisite of the same rule.
+///
+/// `all: lib main` plus `main: lib` makes `lib` redundant in `all`'s list:
+/// requesting `main` already pulls in `lib`. Removing it doesn't change build
+/// order (make resolves the transitive closure anyway) but does eliminate a
+/// confusing coupling. Hint-level: the duplication is sometimes intentional
+/// when the author wants the explicit documentation.
+///
+/// Skips:
+/// * the rule's own targets (handled by `check_self_dependency`)
+/// * exact-duplicate prereqs (handled by `check_duplicate_prerequisites`)
+/// * prereqs that aren't themselves defined targets
+fn check_redundant_transitive_prerequisites(
+    source_text: &str,
+    makefile: &Makefile,
+) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+    let graph = crate::dep_graph::DependencyGraph::from_makefile(makefile);
+
+    for rule in makefile.rules() {
+        let targets: HashSet<String> = rule.targets().collect();
+        let prereqs: Vec<String> = rule.prerequisites().collect();
+        if prereqs.len() < 2 {
+            continue;
+        }
+        let prereq_set: HashSet<&str> = prereqs.iter().map(String::as_str).collect();
+
+        let mut reported: HashSet<&str> = HashSet::new();
+        for prereq in &prereqs {
+            if targets.contains(prereq) || !reported.insert(prereq.as_str()) {
+                continue;
+            }
+            // Reachable via any *other* prereq in this rule?
+            let via = prereq_set.iter().find(|other| {
+                **other != prereq.as_str() && graph.reachable_from(other).contains(prereq)
+            });
+            if let Some(via) = via {
+                let rule_range = text_range_to_lsp_range(source_text, rule.syntax().text_range());
+                diagnostics.push(make_diagnostic(
+                    rule_range,
+                    DiagnosticSeverity::HINT,
+                    "redundant-prerequisite",
+                    format!(
+                        "prerequisite '{}' is already pulled in transitively via '{}'",
+                        prereq, via
+                    ),
+                ));
+            }
+        }
+    }
+
+    diagnostics
+}
+
 /// Check for trailing whitespace in variable assignment values.
 ///
 /// In GNU Make, trailing whitespace is part of the variable's value (up to the
@@ -1590,6 +1649,59 @@ mod tests {
             .filter(|d| d.code == Some(NumberOrString::String("spaces-instead-of-tab".to_string())))
             .collect();
         assert_eq!(space_diags.len(), 2);
+    }
+
+    // Redundant transitive prerequisite tests
+
+    fn redundant_diags(text: &str) -> Vec<Diagnostic> {
+        get_diags(text)
+            .into_iter()
+            .filter(|d| {
+                d.code == Some(NumberOrString::String("redundant-prerequisite".to_string()))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_redundant_prereq_simple() {
+        // `all: lib main`, `main: lib` -> `lib` is redundant in `all`.
+        let text = "all: lib main\n\t@:\nmain: lib\n\t@:\nlib:\n\t@:\n";
+        let diags = redundant_diags(text);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].severity, Some(DiagnosticSeverity::HINT));
+        assert!(diags[0].message.contains("'lib'"));
+        assert!(diags[0].message.contains("'main'"));
+    }
+
+    #[test]
+    fn test_redundant_prereq_silenced_when_independent() {
+        let text = "all: a b\n\t@:\na:\n\t@:\nb:\n\t@:\n";
+        let diags = redundant_diags(text);
+        assert!(diags.is_empty());
+    }
+
+    #[test]
+    fn test_redundant_prereq_transitive_chain() {
+        // `all: a c`, `a: b`, `b: c` -> `c` is redundant in `all`.
+        let text = "all: a c\n\t@:\na: b\n\t@:\nb: c\n\t@:\nc:\n\t@:\n";
+        let diags = redundant_diags(text);
+        assert_eq!(diags.len(), 1);
+        assert!(diags[0].message.contains("'c'"));
+    }
+
+    #[test]
+    fn test_redundant_prereq_skips_undefined() {
+        // `lib` isn't a defined target, so we can't claim it's reachable.
+        let text = "all: lib main\n\t@:\nmain:\n\t@:\n";
+        let diags = redundant_diags(text);
+        assert!(diags.is_empty());
+    }
+
+    #[test]
+    fn test_redundant_prereq_skips_single_prereq_rule() {
+        let text = "all: only\n\t@:\nonly:\n\t@:\n";
+        let diags = redundant_diags(text);
+        assert!(diags.is_empty());
     }
 
     // Trailing whitespace in value tests

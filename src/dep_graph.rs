@@ -134,6 +134,21 @@ impl DependencyGraph {
         names.into_iter()
     }
 
+    /// Targets reachable from `start` by following prerequisite edges, not
+    /// including `start` itself. Returns an empty set if `start` isn't a
+    /// target. Cycle-safe.
+    pub fn reachable_from(&self, start: &str) -> HashSet<String> {
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut stack: Vec<&str> = self.prerequisites(start).collect();
+        while let Some(node) = stack.pop() {
+            if !seen.insert(node.to_string()) {
+                continue;
+            }
+            stack.extend(self.prerequisites(node));
+        }
+        seen
+    }
+
     /// Length of the longest path from `target` down through the dependency
     /// graph, counting edges. A leaf (or unknown target) returns 0; a target
     /// with one prerequisite that itself has no prerequisites returns 1.
@@ -296,6 +311,24 @@ mod tests {
         assert_eq!(r, vec!["a", "all"]);
         assert_eq!(g.referrers("all").count(), 0);
         assert_eq!(g.referrers("missing").count(), 0);
+    }
+
+    #[test]
+    fn reachable_from_returns_transitive_closure() {
+        let g = graph("a: b\n\t@:\nb: c d\n\t@:\nc:\n\t@:\nd:\n\t@:\n");
+        let mut reached: Vec<String> = g.reachable_from("a").into_iter().collect();
+        reached.sort();
+        assert_eq!(reached, vec!["b", "c", "d"]);
+        assert!(g.reachable_from("c").is_empty());
+        assert!(g.reachable_from("missing").is_empty());
+    }
+
+    #[test]
+    fn reachable_from_handles_cycles() {
+        let g = graph("a: b\n\t@:\nb: a\n\t@:\n");
+        let reached = g.reachable_from("a");
+        assert!(reached.contains("a"));
+        assert!(reached.contains("b"));
     }
 
     #[test]
