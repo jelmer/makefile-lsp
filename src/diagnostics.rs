@@ -59,12 +59,18 @@ pub fn get_diagnostics(
     ));
     diagnostics.extend(check_empty_variable_references(source_text, &makefile));
     diagnostics.extend(check_self_dependency(source_text, &makefile));
+    diagnostics.extend(check_circular_dependencies(source_text, &makefile));
     diagnostics.extend(check_duplicate_targets(source_text, &makefile));
     diagnostics.extend(check_missing_phony_targets(source_text, &makefile));
+    diagnostics.extend(check_unused_phony_targets(source_text, &makefile));
     diagnostics.extend(check_include_missing_path(source_text, &makefile));
     diagnostics.extend(check_spaces_in_recipes(source_text, &makefile));
     diagnostics.extend(check_trailing_whitespace_in_value(source_text, &makefile));
     diagnostics.extend(check_duplicate_prerequisites(source_text, &makefile));
+    diagnostics.extend(check_redundant_transitive_prerequisites(
+        source_text,
+        &makefile,
+    ));
     diagnostics.extend(check_shell_in_recursive_assignment(source_text, &makefile));
     diagnostics.extend(check_empty_automatic_variables(source_text, &makefile));
     diagnostics.extend(check_unterminated_conditionals(source_text, &makefile));
@@ -257,6 +263,42 @@ fn check_self_dependency(source_text: &str, makefile: &Makefile) -> Vec<Diagnost
     diagnostics
 }
 
+/// Check for circular dependencies in the target graph.
+///
+/// Each cycle is reported once, anchored on the rule of the first target in
+/// its canonical rotation. Self-loops are left to `check_self_dependency`.
+fn check_circular_dependencies(source_text: &str, makefile: &Makefile) -> Vec<Diagnostic> {
+    let graph = crate::dep_graph::DependencyGraph::from_makefile(makefile);
+    let cycles = graph.find_cycles();
+    if cycles.is_empty() {
+        return Vec::new();
+    }
+
+    // Map each target in a reported cycle to a rule range to anchor on.
+    let mut target_range: HashMap<String, Range> = HashMap::new();
+    for rule in makefile.rules() {
+        let rule_range = text_range_to_lsp_range(source_text, rule.syntax().text_range());
+        for target in rule.targets() {
+            target_range.entry(target).or_insert(rule_range);
+        }
+    }
+
+    cycles
+        .into_iter()
+        .filter_map(|cycle| {
+            let range = *target_range.get(&cycle[0])?;
+            let mut display = cycle.clone();
+            display.push(cycle[0].clone());
+            Some(make_diagnostic(
+                range,
+                DiagnosticSeverity::WARNING,
+                "circular-dependency",
+                format!("circular dependency: {}", display.join(" -> ")),
+            ))
+        })
+        .collect()
+}
+
 /// Check for `.PHONY` prerequisites that are never defined as targets.
 fn check_missing_phony_targets(source_text: &str, makefile: &Makefile) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
@@ -280,6 +322,93 @@ fn check_missing_phony_targets(source_text: &str, makefile: &Makefile) -> Vec<Di
                     ),
                 ));
             }
+        }
+    }
+
+    diagnostics
+}
+
+/// Check for `.PHONY` targets that nothing references.
+///
+/// Two related diagnostics:
+///
+/// * `unused-phony-target` (warning): the target is declared `.PHONY`, has a
+///   rule with no recipe and no prerequisites, AND nothing depends on it.
+///   High-confidence typo or stale declaration — there's nothing the rule
+///   could do and no caller wants it.
+/// * `unreferenced-phony-target` (hint): the target is declared `.PHONY` and
+///   has a real rule, but nothing depends on it AND the name isn't a
+///   conventional entry point (`all`, `install`, …). The author may have
+///   forgotten to wire it into a top-level target like `all`.
+///
+/// Self-references don't count as incoming edges. Targets that don't appear
+/// as the head of any rule are handled by `check_missing_phony_targets`.
+fn check_unused_phony_targets(source_text: &str, makefile: &Makefile) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+
+    let graph = crate::dep_graph::DependencyGraph::from_makefile(makefile);
+
+    // Collect every name declared in any `.PHONY:` rule, keyed to that rule's
+    // range so the diagnostic anchors on the declaration site.
+    let mut phony_decls: HashMap<String, Range> = HashMap::new();
+    for rule in makefile.rules_by_target(".PHONY") {
+        let range = text_range_to_lsp_range(source_text, rule.syntax().text_range());
+        for name in rule.prerequisites() {
+            phony_decls.entry(name).or_insert(range);
+        }
+    }
+
+    // Index target rules so we can ask "does this name have a rule, and is
+    // that rule empty?" without rescanning. A name with multiple rules is
+    // empty only if *every* rule is empty (any non-empty rule means there's
+    // real work attached).
+    let mut has_rule: HashSet<String> = HashSet::new();
+    let mut nonempty_rule: HashSet<String> = HashSet::new();
+    for rule in makefile.rules() {
+        let prereqs: Vec<String> = rule.prerequisites().collect();
+        let has_recipe = rule.recipe_nodes().next().is_some();
+        for target in rule.targets() {
+            has_rule.insert(target.clone());
+            // Self-prerequisites don't count as real work — they can't build
+            // anything and are flagged separately by check_self_dependency.
+            let has_real_prereqs = prereqs.iter().any(|p| p != &target);
+            if has_recipe || has_real_prereqs {
+                nonempty_rule.insert(target);
+            }
+        }
+    }
+
+    let mut names: Vec<&String> = phony_decls.keys().collect();
+    names.sort();
+
+    for name in names {
+        if !has_rule.contains(name) {
+            // No rule at all -> handled by check_missing_phony_targets.
+            continue;
+        }
+        let referenced = graph.referrers(name).any(|r| r != name);
+        if referenced {
+            continue;
+        }
+
+        let range = phony_decls[name];
+        if !nonempty_rule.contains(name) {
+            diagnostics.push(make_diagnostic(
+                range,
+                DiagnosticSeverity::WARNING,
+                "unused-phony-target",
+                format!(
+                    "'.PHONY' target '{}' has no recipe and nothing depends on it",
+                    name
+                ),
+            ));
+        } else if !crate::dep_graph::is_conventional_entry_point(name) {
+            diagnostics.push(make_diagnostic(
+                range,
+                DiagnosticSeverity::HINT,
+                "unreferenced-phony-target",
+                format!("nothing depends on '.PHONY' target '{}'", name),
+            ));
         }
     }
 
@@ -951,6 +1080,61 @@ fn check_duplicate_prerequisites(source_text: &str, makefile: &Makefile) -> Vec<
     diagnostics
 }
 
+/// Check for prerequisites that are already reachable transitively via another
+/// prerequisite of the same rule.
+///
+/// `all: lib main` plus `main: lib` makes `lib` redundant in `all`'s list:
+/// requesting `main` already pulls in `lib`. Removing it doesn't change build
+/// order (make resolves the transitive closure anyway) but does eliminate a
+/// confusing coupling. Hint-level: the duplication is sometimes intentional
+/// when the author wants the explicit documentation.
+///
+/// Skips:
+/// * the rule's own targets (handled by `check_self_dependency`)
+/// * exact-duplicate prereqs (handled by `check_duplicate_prerequisites`)
+/// * prereqs that aren't themselves defined targets
+fn check_redundant_transitive_prerequisites(
+    source_text: &str,
+    makefile: &Makefile,
+) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+    let graph = crate::dep_graph::DependencyGraph::from_makefile(makefile);
+
+    for rule in makefile.rules() {
+        let targets: HashSet<String> = rule.targets().collect();
+        let prereqs: Vec<String> = rule.prerequisites().collect();
+        if prereqs.len() < 2 {
+            continue;
+        }
+        let prereq_set: HashSet<&str> = prereqs.iter().map(String::as_str).collect();
+
+        let mut reported: HashSet<&str> = HashSet::new();
+        for prereq in &prereqs {
+            if targets.contains(prereq) || !reported.insert(prereq.as_str()) {
+                continue;
+            }
+            // Reachable via any *other* prereq in this rule?
+            let via = prereq_set.iter().find(|other| {
+                **other != prereq.as_str() && graph.reachable_from(other).contains(prereq)
+            });
+            if let Some(via) = via {
+                let rule_range = text_range_to_lsp_range(source_text, rule.syntax().text_range());
+                diagnostics.push(make_diagnostic(
+                    rule_range,
+                    DiagnosticSeverity::HINT,
+                    "redundant-prerequisite",
+                    format!(
+                        "prerequisite '{}' is already pulled in transitively via '{}'",
+                        prereq, via
+                    ),
+                ));
+            }
+        }
+    }
+
+    diagnostics
+}
+
 /// Check for trailing whitespace in variable assignment values.
 ///
 /// In GNU Make, trailing whitespace is part of the variable's value (up to the
@@ -1211,6 +1395,88 @@ mod tests {
         assert!(self_deps[0].message.contains("foo"));
     }
 
+    // Circular dependency tests
+
+    fn circular_diags(text: &str) -> Vec<Diagnostic> {
+        get_diags(text)
+            .into_iter()
+            .filter(|d| d.code == Some(NumberOrString::String("circular-dependency".to_string())))
+            .collect()
+    }
+
+    #[test]
+    fn test_circular_dependency_two_targets() {
+        let text = "a: b\n\techo a\nb: a\n\techo b\n";
+        let diags = circular_diags(text);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].message, "circular dependency: a -> b -> a");
+    }
+
+    #[test]
+    fn test_circular_dependency_three_targets() {
+        let text = "a: b\n\t@:\nb: c\n\t@:\nc: a\n\t@:\n";
+        let diags = circular_diags(text);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].message, "circular dependency: a -> b -> c -> a");
+    }
+
+    #[test]
+    fn test_no_circular_dependency_linear() {
+        let text = "a: b\n\t@:\nb: c\n\t@:\nc:\n\t@:\n";
+        let diags = circular_diags(text);
+        assert!(diags.is_empty());
+    }
+
+    #[test]
+    fn test_no_circular_dependency_diamond() {
+        let text = "a: b c\n\t@:\nb: d\n\t@:\nc: d\n\t@:\nd:\n\t@:\n";
+        let diags = circular_diags(text);
+        assert!(diags.is_empty());
+    }
+
+    #[test]
+    fn test_circular_dependency_self_loop_not_double_reported() {
+        // Self-loops are reported by `check_self_dependency`, not here.
+        let text = "a: a\n\t@:\n";
+        let diags = circular_diags(text);
+        assert!(diags.is_empty());
+    }
+
+    #[test]
+    fn test_circular_dependency_via_accumulated_prereqs() {
+        // Make merges prerequisites across multiple rules for the same target,
+        // so this still forms a cycle a -> b -> a.
+        let text = "a: b\n\t@:\nb:\n\t@:\nb: a\n";
+        let diags = circular_diags(text);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].message, "circular dependency: a -> b -> a");
+    }
+
+    #[test]
+    fn test_circular_dependency_ignores_undefined_prereq() {
+        // `missing` is a file on disk (or just an error), not a target —
+        // no cycle possible through it.
+        let text = "a: missing\n\t@:\n";
+        let diags = circular_diags(text);
+        assert!(diags.is_empty());
+    }
+
+    #[test]
+    fn test_circular_dependency_dedupes_rotations() {
+        // The graph has one cycle (a, b, c) which the DFS could discover from
+        // any starting node — make sure we only report it once.
+        let text = "a: b\n\t@:\nb: c\n\t@:\nc: a\n\t@:\nentry: a b c\n\t@:\n";
+        let diags = circular_diags(text);
+        assert_eq!(diags.len(), 1);
+    }
+
+    #[test]
+    fn test_circular_dependency_two_disjoint_cycles() {
+        let text = concat!("a: b\n\t@:\nb: a\n\t@:\n", "x: y\n\t@:\ny: x\n\t@:\n",);
+        let diags = circular_diags(text);
+        assert_eq!(diags.len(), 2);
+    }
+
     // Undefined .PHONY target tests
 
     #[test]
@@ -1239,6 +1505,98 @@ mod tests {
             .collect();
         assert_eq!(phony_diags.len(), 1);
         assert!(phony_diags[0].message.contains("clean"));
+    }
+
+    // Unused / unreferenced .PHONY target tests
+
+    #[test]
+    fn test_unused_phony_target_empty_rule() {
+        // .PHONY: clena has an empty rule and nothing references it — typo.
+        let text = ".PHONY: clena\nclena:\n";
+        let diags = get_diags(text);
+        let unused: Vec<_> = diags
+            .iter()
+            .filter(|d| d.code == Some(NumberOrString::String("unused-phony-target".to_string())))
+            .collect();
+        assert_eq!(unused.len(), 1);
+        assert!(unused[0].message.contains("clena"));
+        assert_eq!(unused[0].severity, Some(DiagnosticSeverity::WARNING));
+    }
+
+    #[test]
+    fn test_unused_phony_target_silenced_when_referenced() {
+        // 'helper' has an empty rule but `all` depends on it -> ok.
+        let text = ".PHONY: helper\nall: helper\n\t@:\nhelper:\n";
+        let codes = diag_codes(text);
+        assert!(!codes.contains(&"unused-phony-target".to_string()));
+    }
+
+    #[test]
+    fn test_unused_phony_target_silenced_when_recipe_present() {
+        // Has a recipe -> falls through to unreferenced-phony-target instead,
+        // which is a hint not a warning.
+        let text = ".PHONY: foo\nfoo:\n\techo foo\n";
+        let codes = diag_codes(text);
+        assert!(!codes.contains(&"unused-phony-target".to_string()));
+        assert!(codes.contains(&"unreferenced-phony-target".to_string()));
+    }
+
+    #[test]
+    fn test_unreferenced_phony_target_hint() {
+        // 'lint' is not in PHONY_ENTRY_POINTS and nothing depends on it.
+        let text = ".PHONY: format\nformat:\n\tfoo\n";
+        let diags = get_diags(text);
+        let hints: Vec<_> = diags
+            .iter()
+            .filter(|d| {
+                d.code
+                    == Some(NumberOrString::String(
+                        "unreferenced-phony-target".to_string(),
+                    ))
+            })
+            .collect();
+        assert_eq!(hints.len(), 1);
+        assert_eq!(hints[0].severity, Some(DiagnosticSeverity::HINT));
+    }
+
+    #[test]
+    fn test_unreferenced_phony_silenced_for_entry_points() {
+        // 'all', 'install', 'clean' are conventional entry points -> no hint.
+        let text = concat!(
+            ".PHONY: all install clean\n",
+            "all:\n\t@:\n",
+            "install:\n\t@:\n",
+            "clean:\n\t@:\n",
+        );
+        let codes = diag_codes(text);
+        assert!(!codes.contains(&"unreferenced-phony-target".to_string()));
+    }
+
+    #[test]
+    fn test_unreferenced_phony_silenced_when_referenced() {
+        let text = ".PHONY: lint\nall: lint\n\t@:\nlint:\n\tfoo\n";
+        let codes = diag_codes(text);
+        assert!(!codes.contains(&"unreferenced-phony-target".to_string()));
+    }
+
+    #[test]
+    fn test_unused_phony_self_reference_does_not_count() {
+        // A rule listing itself as prerequisite is not a real incoming edge —
+        // and check_self_dependency will flag it separately. The unused-phony
+        // warning should still fire.
+        let text = ".PHONY: foo\nfoo: foo\n";
+        let codes = diag_codes(text);
+        assert!(codes.contains(&"unused-phony-target".to_string()));
+    }
+
+    #[test]
+    fn test_unused_phony_multiple_rules_one_nonempty() {
+        // 'foo' has two rules; one is empty, the other has a recipe. As long
+        // as any rule does real work it's not "unused"; demote to hint only.
+        let text = ".PHONY: foo\nfoo:\nfoo:\n\techo hi\n";
+        let codes = diag_codes(text);
+        assert!(!codes.contains(&"unused-phony-target".to_string()));
+        assert!(codes.contains(&"unreferenced-phony-target".to_string()));
     }
 
     // Include missing path tests
@@ -1291,6 +1649,59 @@ mod tests {
             .filter(|d| d.code == Some(NumberOrString::String("spaces-instead-of-tab".to_string())))
             .collect();
         assert_eq!(space_diags.len(), 2);
+    }
+
+    // Redundant transitive prerequisite tests
+
+    fn redundant_diags(text: &str) -> Vec<Diagnostic> {
+        get_diags(text)
+            .into_iter()
+            .filter(|d| {
+                d.code == Some(NumberOrString::String("redundant-prerequisite".to_string()))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_redundant_prereq_simple() {
+        // `all: lib main`, `main: lib` -> `lib` is redundant in `all`.
+        let text = "all: lib main\n\t@:\nmain: lib\n\t@:\nlib:\n\t@:\n";
+        let diags = redundant_diags(text);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].severity, Some(DiagnosticSeverity::HINT));
+        assert!(diags[0].message.contains("'lib'"));
+        assert!(diags[0].message.contains("'main'"));
+    }
+
+    #[test]
+    fn test_redundant_prereq_silenced_when_independent() {
+        let text = "all: a b\n\t@:\na:\n\t@:\nb:\n\t@:\n";
+        let diags = redundant_diags(text);
+        assert!(diags.is_empty());
+    }
+
+    #[test]
+    fn test_redundant_prereq_transitive_chain() {
+        // `all: a c`, `a: b`, `b: c` -> `c` is redundant in `all`.
+        let text = "all: a c\n\t@:\na: b\n\t@:\nb: c\n\t@:\nc:\n\t@:\n";
+        let diags = redundant_diags(text);
+        assert_eq!(diags.len(), 1);
+        assert!(diags[0].message.contains("'c'"));
+    }
+
+    #[test]
+    fn test_redundant_prereq_skips_undefined() {
+        // `lib` isn't a defined target, so we can't claim it's reachable.
+        let text = "all: lib main\n\t@:\nmain:\n\t@:\n";
+        let diags = redundant_diags(text);
+        assert!(diags.is_empty());
+    }
+
+    #[test]
+    fn test_redundant_prereq_skips_single_prereq_rule() {
+        let text = "all: only\n\t@:\nonly:\n\t@:\n";
+        let diags = redundant_diags(text);
+        assert!(diags.is_empty());
     }
 
     // Trailing whitespace in value tests
