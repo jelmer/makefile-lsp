@@ -214,7 +214,9 @@ impl LanguageServer for Backend {
         };
 
         let makefile = file_info.parsed.tree();
-        let completions = completion::get_completions(&makefile, &file_info.text, position);
+        let base_dir = uri_to_dir(uri);
+        let completions =
+            completion::get_completions(&makefile, &file_info.text, position, base_dir.as_deref());
         drop(files);
 
         if completions.is_empty() {
