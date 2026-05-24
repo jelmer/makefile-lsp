@@ -59,6 +59,7 @@ pub fn get_diagnostics(
     ));
     diagnostics.extend(check_empty_variable_references(source_text, &makefile));
     diagnostics.extend(check_self_dependency(source_text, &makefile));
+    diagnostics.extend(check_circular_dependencies(source_text, &makefile));
     diagnostics.extend(check_duplicate_targets(source_text, &makefile));
     diagnostics.extend(check_missing_phony_targets(source_text, &makefile));
     diagnostics.extend(check_include_missing_path(source_text, &makefile));
@@ -255,6 +256,42 @@ fn check_self_dependency(source_text: &str, makefile: &Makefile) -> Vec<Diagnost
     }
 
     diagnostics
+}
+
+/// Check for circular dependencies in the target graph.
+///
+/// Each cycle is reported once, anchored on the rule of the first target in
+/// its canonical rotation. Self-loops are left to `check_self_dependency`.
+fn check_circular_dependencies(source_text: &str, makefile: &Makefile) -> Vec<Diagnostic> {
+    let graph = crate::dep_graph::DependencyGraph::from_makefile(makefile);
+    let cycles = graph.find_cycles();
+    if cycles.is_empty() {
+        return Vec::new();
+    }
+
+    // Map each target in a reported cycle to a rule range to anchor on.
+    let mut target_range: HashMap<String, Range> = HashMap::new();
+    for rule in makefile.rules() {
+        let rule_range = text_range_to_lsp_range(source_text, rule.syntax().text_range());
+        for target in rule.targets() {
+            target_range.entry(target).or_insert(rule_range);
+        }
+    }
+
+    cycles
+        .into_iter()
+        .filter_map(|cycle| {
+            let range = *target_range.get(&cycle[0])?;
+            let mut display = cycle.clone();
+            display.push(cycle[0].clone());
+            Some(make_diagnostic(
+                range,
+                DiagnosticSeverity::WARNING,
+                "circular-dependency",
+                format!("circular dependency: {}", display.join(" -> ")),
+            ))
+        })
+        .collect()
 }
 
 /// Check for `.PHONY` prerequisites that are never defined as targets.
@@ -1209,6 +1246,88 @@ mod tests {
             .collect();
         assert_eq!(self_deps.len(), 1);
         assert!(self_deps[0].message.contains("foo"));
+    }
+
+    // Circular dependency tests
+
+    fn circular_diags(text: &str) -> Vec<Diagnostic> {
+        get_diags(text)
+            .into_iter()
+            .filter(|d| d.code == Some(NumberOrString::String("circular-dependency".to_string())))
+            .collect()
+    }
+
+    #[test]
+    fn test_circular_dependency_two_targets() {
+        let text = "a: b\n\techo a\nb: a\n\techo b\n";
+        let diags = circular_diags(text);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].message, "circular dependency: a -> b -> a");
+    }
+
+    #[test]
+    fn test_circular_dependency_three_targets() {
+        let text = "a: b\n\t@:\nb: c\n\t@:\nc: a\n\t@:\n";
+        let diags = circular_diags(text);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].message, "circular dependency: a -> b -> c -> a");
+    }
+
+    #[test]
+    fn test_no_circular_dependency_linear() {
+        let text = "a: b\n\t@:\nb: c\n\t@:\nc:\n\t@:\n";
+        let diags = circular_diags(text);
+        assert!(diags.is_empty());
+    }
+
+    #[test]
+    fn test_no_circular_dependency_diamond() {
+        let text = "a: b c\n\t@:\nb: d\n\t@:\nc: d\n\t@:\nd:\n\t@:\n";
+        let diags = circular_diags(text);
+        assert!(diags.is_empty());
+    }
+
+    #[test]
+    fn test_circular_dependency_self_loop_not_double_reported() {
+        // Self-loops are reported by `check_self_dependency`, not here.
+        let text = "a: a\n\t@:\n";
+        let diags = circular_diags(text);
+        assert!(diags.is_empty());
+    }
+
+    #[test]
+    fn test_circular_dependency_via_accumulated_prereqs() {
+        // Make merges prerequisites across multiple rules for the same target,
+        // so this still forms a cycle a -> b -> a.
+        let text = "a: b\n\t@:\nb:\n\t@:\nb: a\n";
+        let diags = circular_diags(text);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].message, "circular dependency: a -> b -> a");
+    }
+
+    #[test]
+    fn test_circular_dependency_ignores_undefined_prereq() {
+        // `missing` is a file on disk (or just an error), not a target —
+        // no cycle possible through it.
+        let text = "a: missing\n\t@:\n";
+        let diags = circular_diags(text);
+        assert!(diags.is_empty());
+    }
+
+    #[test]
+    fn test_circular_dependency_dedupes_rotations() {
+        // The graph has one cycle (a, b, c) which the DFS could discover from
+        // any starting node — make sure we only report it once.
+        let text = "a: b\n\t@:\nb: c\n\t@:\nc: a\n\t@:\nentry: a b c\n\t@:\n";
+        let diags = circular_diags(text);
+        assert_eq!(diags.len(), 1);
+    }
+
+    #[test]
+    fn test_circular_dependency_two_disjoint_cycles() {
+        let text = concat!("a: b\n\t@:\nb: a\n\t@:\n", "x: y\n\t@:\ny: x\n\t@:\n",);
+        let diags = circular_diags(text);
+        assert_eq!(diags.len(), 2);
     }
 
     // Undefined .PHONY target tests

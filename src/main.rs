@@ -10,6 +10,7 @@ use tower_lsp_server::{Client, LanguageServer, LspService, Server};
 mod builtins;
 mod code_actions;
 mod completion;
+mod dep_graph;
 mod diagnostics;
 mod document_links;
 mod folding;
