@@ -2,7 +2,9 @@
 
 use std::collections::{HashMap, HashSet};
 
-use makefile_lossless::{Makefile, MakefileItem, Parse, SyntaxKind, VariableReference};
+use makefile_lossless::{
+    Conditional, Makefile, MakefileItem, Parse, SyntaxKind, VariableReference,
+};
 use rowan::ast::AstNode;
 use tower_lsp_server::ls_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Position, Range};
 
@@ -59,6 +61,7 @@ pub fn get_diagnostics(
     diagnostics.extend(check_trailing_whitespace_in_value(source_text, &makefile));
     diagnostics.extend(check_duplicate_prerequisites(source_text, &makefile));
     diagnostics.extend(check_shell_in_recursive_assignment(source_text, &makefile));
+    diagnostics.extend(check_unterminated_conditionals(source_text, &makefile));
 
     diagnostics
 }
@@ -328,6 +331,54 @@ fn check_spaces_in_recipes(source_text: &str, makefile: &Makefile) -> Vec<Diagno
                 }
             }
         }
+    }
+
+    diagnostics
+}
+
+/// Check for conditional blocks that are missing their `endif`.
+///
+/// Bare `else` or `endif` outside a conditional are already reported by the
+/// parser as "unknown conditional directive". The case the parser silently
+/// accepts is an `ifdef`/`ifeq` that runs to end-of-file without a matching
+/// `endif`.
+fn check_unterminated_conditionals(source_text: &str, makefile: &Makefile) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+
+    for cond in makefile
+        .syntax()
+        .descendants()
+        .filter_map(Conditional::cast)
+    {
+        // Skip orphans that don't even have a recognized opener — the parser
+        // already complains about those (e.g. bare `else`/`endif`).
+        if cond.conditional_type().is_none() {
+            continue;
+        }
+        let has_endif = cond
+            .syntax()
+            .children()
+            .any(|c| c.kind() == SyntaxKind::CONDITIONAL_ENDIF);
+        if has_endif {
+            continue;
+        }
+
+        // Point at the opening directive (CONDITIONAL_IF) for clarity.
+        let opener_range = cond
+            .syntax()
+            .children()
+            .find(|c| c.kind() == SyntaxKind::CONDITIONAL_IF)
+            .map(|c| c.text_range())
+            .unwrap_or_else(|| cond.syntax().text_range());
+
+        let range = text_range_to_lsp_range(source_text, opener_range);
+        let kind = cond.conditional_type().unwrap_or_default();
+        diagnostics.push(make_diagnostic(
+            range,
+            DiagnosticSeverity::ERROR,
+            "unterminated-conditional",
+            format!("'{}' is missing a matching 'endif'", kind),
+        ));
     }
 
     diagnostics
@@ -950,5 +1001,74 @@ mod tests {
             "trailing whitespace is included in the variable value"
         );
         assert_eq!(ws_diags[0].severity, Some(DiagnosticSeverity::WARNING));
+    }
+
+    // Unterminated conditional tests
+
+    #[test]
+    fn test_unterminated_ifdef() {
+        let text = "ifdef DEBUG\nFOO = bar\n";
+        let codes = diag_codes(text);
+        assert!(codes.contains(&"unterminated-conditional".to_string()));
+    }
+
+    #[test]
+    fn test_terminated_ifdef_ok() {
+        let text = "ifdef DEBUG\nFOO = bar\nendif\n";
+        let codes = diag_codes(text);
+        assert!(!codes.contains(&"unterminated-conditional".to_string()));
+    }
+
+    #[test]
+    fn test_unterminated_ifeq() {
+        let text = "ifeq ($(CC),gcc)\nFOO = bar\n";
+        let codes = diag_codes(text);
+        assert!(codes.contains(&"unterminated-conditional".to_string()));
+    }
+
+    #[test]
+    fn test_unterminated_with_else() {
+        let text = "ifdef DEBUG\nFOO = bar\nelse\nFOO = baz\n";
+        let codes = diag_codes(text);
+        assert!(codes.contains(&"unterminated-conditional".to_string()));
+    }
+
+    #[test]
+    fn test_unterminated_nested_outer() {
+        // Inner is closed, outer is not.
+        let text = "ifdef OUTER\nifdef INNER\nFOO = bar\nendif\n";
+        let codes = diag_codes(text);
+        let count = codes
+            .iter()
+            .filter(|c| c.as_str() == "unterminated-conditional")
+            .count();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_bare_else_not_double_flagged() {
+        // Bare `else` already produces a parse error; we should not also flag it
+        // as unterminated (it has no conditional_type).
+        let text = "else\nFOO = bar\n";
+        let codes = diag_codes(text);
+        assert!(!codes.contains(&"unterminated-conditional".to_string()));
+    }
+
+    #[test]
+    fn test_unterminated_conditional_message() {
+        let text = "ifdef DEBUG\nFOO = bar\n";
+        let diags = get_diags(text);
+        let unt: Vec<_> = diags
+            .iter()
+            .filter(|d| {
+                d.code
+                    == Some(NumberOrString::String(
+                        "unterminated-conditional".to_string(),
+                    ))
+            })
+            .collect();
+        assert_eq!(unt.len(), 1);
+        assert_eq!(unt[0].message, "'ifdef' is missing a matching 'endif'");
+        assert_eq!(unt[0].severity, Some(DiagnosticSeverity::ERROR));
     }
 }
