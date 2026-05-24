@@ -62,6 +62,12 @@ pub fn get_code_actions(
         byte_offset,
         uri,
     ));
+    actions.extend(sort_phony_prerequisites_action(
+        parsed,
+        source_text,
+        byte_offset,
+        uri,
+    ));
 
     actions
 }
@@ -447,6 +453,52 @@ fn remove_from_phony_action(
     })
 }
 
+/// Offer "Sort .PHONY prerequisites" when the cursor is on a `.PHONY` rule
+/// whose prerequisites aren't already in lexicographic order.
+///
+/// Drives the change through `Rule::set_prerequisites`.
+fn sort_phony_prerequisites_action(
+    parsed: &Parse<Makefile>,
+    source_text: &str,
+    byte_offset: usize,
+    uri: &Uri,
+) -> Option<CodeAction> {
+    let offset = text_size::TextSize::from(byte_offset as u32);
+
+    let makefile = parsed.tree();
+    let mut rule = makefile
+        .rules_by_target(".PHONY")
+        .find(|r| r.syntax().text_range().contains(offset))?;
+
+    let current: Vec<String> = rule.prerequisites().collect();
+    if current.len() < 2 {
+        return None;
+    }
+    let mut sorted = current.clone();
+    sorted.sort();
+    if sorted == current {
+        return None;
+    }
+
+    let original_range = rule.syntax().text_range();
+    let sorted_refs: Vec<&str> = sorted.iter().map(|s| s.as_str()).collect();
+    rule.set_prerequisites(sorted_refs).ok()?;
+    let edit = edit_for_node_change(source_text, original_range, rule.syntax());
+
+    let mut changes = std::collections::HashMap::new();
+    changes.insert(uri.clone(), vec![edit]);
+
+    Some(CodeAction {
+        title: "Sort .PHONY prerequisites".to_string(),
+        kind: Some(CodeActionKind::QUICKFIX),
+        edit: Some(WorkspaceEdit {
+            changes: Some(changes),
+            ..Default::default()
+        }),
+        ..Default::default()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -770,5 +822,45 @@ mod tests {
         assert!(!actions
             .iter()
             .any(|a| a.title.starts_with("Remove '") && a.title.contains("from .PHONY")));
+    }
+
+    #[test]
+    fn test_sort_phony_prerequisites_action() {
+        let text = ".PHONY: test build clean\ntest:\nbuild:\nclean:\n";
+        let actions = parse_and_actions(text, Position::new(0, 0));
+        let action = actions
+            .iter()
+            .find(|a| a.title == "Sort .PHONY prerequisites")
+            .expect("expected sort action");
+        let edit = only_edit(action);
+        let result = apply_edit(text, edit);
+        assert!(result.starts_with(".PHONY: build clean test\n"));
+    }
+
+    #[test]
+    fn test_no_sort_when_already_sorted() {
+        let text = ".PHONY: build clean test\nbuild:\nclean:\ntest:\n";
+        let actions = parse_and_actions(text, Position::new(0, 0));
+        assert!(!actions
+            .iter()
+            .any(|a| a.title == "Sort .PHONY prerequisites"));
+    }
+
+    #[test]
+    fn test_no_sort_with_single_prerequisite() {
+        let text = ".PHONY: clean\nclean:\n";
+        let actions = parse_and_actions(text, Position::new(0, 0));
+        assert!(!actions
+            .iter()
+            .any(|a| a.title == "Sort .PHONY prerequisites"));
+    }
+
+    #[test]
+    fn test_no_sort_when_cursor_not_on_phony() {
+        let text = "build: foo bar baz\n\techo done\n";
+        let actions = parse_and_actions(text, Position::new(0, 0));
+        assert!(!actions
+            .iter()
+            .any(|a| a.title == "Sort .PHONY prerequisites"));
     }
 }
