@@ -61,6 +61,10 @@ makefile-lsp scip Makefile build/Rules.mk -o out.scip
 Use `--project-root` to override the root directory recorded in the index
 (defaults to the current directory).
 
+SCIP support is gated behind the `scip` feature, which is enabled by default.
+Build with `--no-default-features` to drop the `scip` dependency and the
+subcommand.
+
 ## License
 
 Apache-2.0

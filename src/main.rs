@@ -21,6 +21,7 @@ mod inlay_hints;
 mod position;
 mod references;
 mod rename;
+#[cfg(feature = "scip")]
 mod scip;
 mod selection_ranges;
 mod semantic;
@@ -558,11 +559,17 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
 
     match args.get(1).map(String::as_str) {
+        #[cfg(feature = "scip")]
         Some("scip") => {
             if let Err(e) = scip_command::run(&args[2..]) {
                 eprintln!("makefile-lsp scip: {e}");
                 std::process::exit(1);
             }
+        }
+        #[cfg(not(feature = "scip"))]
+        Some("scip") => {
+            eprintln!("makefile-lsp: built without SCIP support (enable the 'scip' feature)");
+            std::process::exit(2);
         }
         Some("--help" | "-h") => print_usage(),
         Some(other) if !other.starts_with('-') => {
@@ -578,6 +585,7 @@ fn main() {
     }
 }
 
+#[cfg(feature = "scip")]
 fn print_usage() {
     eprintln!(
         "makefile-lsp {}\n\n\
@@ -589,7 +597,18 @@ fn print_usage() {
     );
 }
 
+#[cfg(not(feature = "scip"))]
+fn print_usage() {
+    eprintln!(
+        "makefile-lsp {}\n\n\
+         Usage:\n  \
+         makefile-lsp                  Run the language server over stdin/stdout",
+        env!("CARGO_PKG_VERSION")
+    );
+}
+
 /// Implementation of the `scip` subcommand.
+#[cfg(feature = "scip")]
 mod scip_command {
     use std::path::{Path, PathBuf};
 
