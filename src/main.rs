@@ -658,7 +658,16 @@ mod scip_command {
             let text =
                 std::fs::read_to_string(input).map_err(|e| format!("{}: {e}", input.display()))?;
             let relative = relative_path(&root, input);
-            files.push((relative, text));
+            let base_dir = input
+                .canonicalize()
+                .unwrap_or_else(|_| root.join(input))
+                .parent()
+                .map(Path::to_path_buf);
+            files.push(crate::scip::SourceFile {
+                relative_path: relative,
+                text,
+                base_dir,
+            });
         }
 
         let project_root_uri = path_to_file_uri(&root);
