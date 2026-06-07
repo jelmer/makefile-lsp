@@ -2,29 +2,46 @@
 //!
 //! Produces a [SCIP](https://github.com/sourcegraph/scip) index covering rule
 //! targets (definitions and prerequisite references) and variables (definitions
-//! and `$(VAR)`/`${VAR}` references). Symbol positions are emitted as UTF-8 byte
-//! offsets from the start of the line, matching `PositionEncoding::UTF8`.
+//! and `$(VAR)`/`${VAR}` references). Lint and parse diagnostics are carried
+//! into the index as symbol-less occurrences. Symbol positions are emitted as
+//! UTF-8 byte offsets from the start of the line, matching
+//! `PositionEncoding::UTF8`.
 
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
 use makefile_lossless::Makefile;
 use rowan::ast::AstNode;
 use scip::types::{
-    descriptor, symbol_information, Descriptor, Document, Index, Metadata, Occurrence, Package,
-    PositionEncoding, ProtocolVersion, Symbol, SymbolInformation, SymbolRole, TextEncoding,
-    ToolInfo,
+    descriptor, symbol_information, Descriptor, Diagnostic, Document, Index, Metadata, Occurrence,
+    Package, PositionEncoding, ProtocolVersion, Severity, Symbol, SymbolInformation, SymbolRole,
+    TextEncoding, ToolInfo,
 };
+use tower_lsp_server::ls_types::{DiagnosticSeverity, NumberOrString};
+
+use crate::position::try_lsp_range_to_text_range;
 
 const SCHEME: &str = "scip-makefile";
 
+/// A source file to index, identified by its path relative to the project root.
+pub struct SourceFile {
+    /// Path relative to the project root, used as the document's identifier.
+    pub relative_path: String,
+    /// The file's contents.
+    pub text: String,
+    /// Directory used to resolve relative `include` paths for diagnostics.
+    /// `None` skips filesystem-touching checks.
+    pub base_dir: Option<PathBuf>,
+}
+
 /// Build a SCIP index for a set of Makefiles.
 ///
-/// `project_root` is a URI-encoded absolute path; each `(relative_path, text)`
-/// pair is a source file relative to that root.
-pub fn build_index(project_root: &str, files: &[(String, String)]) -> Index {
+/// `project_root` is a URI-encoded absolute path; each [`SourceFile`] is a
+/// source file relative to that root.
+pub fn build_index(project_root: &str, files: &[SourceFile]) -> Index {
     let documents = files
         .iter()
-        .map(|(path, text)| build_document(path, text))
+        .map(|f| build_document(&f.relative_path, &f.text, f.base_dir.as_deref()))
         .collect();
 
     Index {
@@ -58,7 +75,7 @@ struct RawOccurrence {
     is_definition: bool,
 }
 
-fn build_document(relative_path: &str, text: &str) -> Document {
+fn build_document(relative_path: &str, text: &str, base_dir: Option<&Path>) -> Document {
     let parsed = Makefile::parse(text);
     let makefile = parsed.tree();
 
@@ -102,6 +119,10 @@ fn build_document(relative_path: &str, text: &str) -> Document {
             ..Default::default()
         })
         .collect();
+
+    // Carry lint/parse diagnostics into the index as symbol-less occurrences,
+    // so consumers like Sourcegraph can render them inline.
+    occurrences.extend(diagnostic_occurrences(text, &parsed, base_dir));
 
     Document {
         language: "makefile".to_string(),
@@ -297,6 +318,58 @@ fn is_word_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 
+/// Build symbol-less occurrences carrying the file's diagnostics.
+///
+/// The diagnostics come from the LSP analysis, whose ranges are in UTF-16 code
+/// units; we convert each back to a byte range and re-encode it in SCIP's
+/// UTF-8-byte-from-line-start scheme so it matches the symbol occurrences.
+fn diagnostic_occurrences(
+    text: &str,
+    parsed: &makefile_lossless::Parse<Makefile>,
+    base_dir: Option<&Path>,
+) -> Vec<Occurrence> {
+    crate::diagnostics::get_diagnostics(text, parsed, base_dir)
+        .into_iter()
+        .map(|diag| {
+            let range = match try_lsp_range_to_text_range(text, &diag.range) {
+                Some(r) => byte_span_to_scip(text, r.start().into(), r.end().into()),
+                None => vec![0, 0, 0, 0],
+            };
+            Occurrence {
+                range,
+                diagnostics: vec![Diagnostic {
+                    severity: severity_to_scip(diag.severity).into(),
+                    code: diagnostic_code(&diag.code),
+                    message: diag.message,
+                    source: diag.source.unwrap_or_default(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }
+        })
+        .collect()
+}
+
+/// Map an LSP diagnostic severity to its SCIP equivalent.
+fn severity_to_scip(severity: Option<DiagnosticSeverity>) -> Severity {
+    match severity {
+        Some(DiagnosticSeverity::ERROR) => Severity::Error,
+        Some(DiagnosticSeverity::WARNING) => Severity::Warning,
+        Some(DiagnosticSeverity::INFORMATION) => Severity::Information,
+        Some(DiagnosticSeverity::HINT) => Severity::Hint,
+        _ => Severity::UnspecifiedSeverity,
+    }
+}
+
+/// Render an LSP diagnostic code as the string SCIP expects.
+fn diagnostic_code(code: &Option<NumberOrString>) -> String {
+    match code {
+        Some(NumberOrString::String(s)) => s.clone(),
+        Some(NumberOrString::Number(n)) => n.to_string(),
+        None => String::new(),
+    }
+}
+
 /// Convert a byte range to a SCIP occurrence range
 /// `[startLine, startChar, endLine, endChar]`, with characters as UTF-8 byte
 /// offsets from the start of the line. The range stays on a single line since
@@ -304,6 +377,14 @@ fn is_word_byte(b: u8) -> bool {
 fn byte_range_to_scip(text: &str, start: usize, len: usize) -> Vec<i32> {
     let (line, col) = byte_offset_to_line_col(text, start);
     vec![line, col, line, col + len as i32]
+}
+
+/// Convert a byte span `start..end` to a SCIP occurrence range, allowing the
+/// span to cross line boundaries (diagnostics can cover whole rules).
+fn byte_span_to_scip(text: &str, start: usize, end: usize) -> Vec<i32> {
+    let (start_line, start_col) = byte_offset_to_line_col(text, start);
+    let (end_line, end_col) = byte_offset_to_line_col(text, end);
+    vec![start_line, start_col, end_line, end_col]
 }
 
 /// Convert a byte offset to (line, byte-column), both 0-based.
@@ -326,6 +407,14 @@ fn byte_offset_to_line_col(text: &str, offset: usize) -> (i32, i32) {
 mod tests {
     use super::*;
 
+    fn src_file(relative_path: &str, text: &str) -> SourceFile {
+        SourceFile {
+            relative_path: relative_path.to_string(),
+            text: text.to_string(),
+            base_dir: None,
+        }
+    }
+
     fn occ_symbols(doc: &Document) -> Vec<(&str, &Vec<i32>, bool)> {
         doc.occurrences
             .iter()
@@ -342,7 +431,7 @@ mod tests {
     #[test]
     fn test_target_definition_and_reference() {
         let text = "all: build\n\nbuild:\n\techo ok\n";
-        let doc = build_document("Makefile", text);
+        let doc = build_document("Makefile", text, None);
 
         let all = target_symbol("all");
         let build = target_symbol("build");
@@ -366,7 +455,7 @@ mod tests {
     #[test]
     fn test_variable_definition_and_reference() {
         let text = "CC = gcc\nall:\n\t$(CC) main.c\n";
-        let doc = build_document("Makefile", text);
+        let doc = build_document("Makefile", text, None);
 
         let cc = variable_symbol("CC");
 
@@ -384,7 +473,7 @@ mod tests {
     #[test]
     fn test_symbol_table_lists_definitions() {
         let text = "CC = gcc\n\nall: build\n\techo ok\n";
-        let doc = build_document("Makefile", text);
+        let doc = build_document("Makefile", text, None);
 
         let names: Vec<&str> = doc
             .symbols
@@ -411,7 +500,7 @@ mod tests {
     #[test]
     fn test_brace_variable_reference() {
         let text = "CC = gcc\nall:\n\t${CC} main.c\n";
-        let doc = build_document("Makefile", text);
+        let doc = build_document("Makefile", text, None);
         let cc = variable_symbol("CC");
         assert!(doc.occurrences.iter().any(|o| o.symbol == cc
             && o.range == vec![2, 3, 2, 5]
@@ -421,7 +510,7 @@ mod tests {
     #[test]
     fn test_multiple_variable_uses() {
         let text = "CC = gcc\nall:\n\t$(CC) a.c\nclean:\n\t$(CC) --version\n";
-        let doc = build_document("Makefile", text);
+        let doc = build_document("Makefile", text, None);
         let cc = variable_symbol("CC");
         let uses = occ_symbols(&doc)
             .into_iter()
@@ -432,7 +521,7 @@ mod tests {
 
     #[test]
     fn test_index_metadata() {
-        let files = vec![("Makefile".to_string(), "all:\n\techo hi\n".to_string())];
+        let files = vec![src_file("Makefile", "all:\n\techo hi\n")];
         let index = build_index("file:///project", &files);
         let metadata = index.metadata.as_ref().unwrap();
         assert_eq!(metadata.project_root, "file:///project");
@@ -453,7 +542,7 @@ mod tests {
 
     #[test]
     fn test_no_symbols_empty_makefile() {
-        let doc = build_document("Makefile", "");
+        let doc = build_document("Makefile", "", None);
         assert!(doc.occurrences.is_empty());
         assert!(doc.symbols.is_empty());
     }
@@ -462,9 +551,9 @@ mod tests {
     fn test_index_protobuf_roundtrip() {
         use protobuf::Message;
 
-        let files = vec![(
-            "Makefile".to_string(),
-            "CC = gcc\nall: build\n\t$(CC) x.c\nbuild:\n\techo hi\n".to_string(),
+        let files = vec![src_file(
+            "Makefile",
+            "CC = gcc\nall: build\n\t$(CC) x.c\nbuild:\n\techo hi\n",
         )];
         let index = build_index("file:///project", &files);
 
@@ -479,5 +568,51 @@ mod tests {
             index.documents[0].occurrences
         );
         assert_eq!(parsed.documents[0].symbols, index.documents[0].symbols);
+    }
+
+    /// Diagnostics ride on symbol-less occurrences.
+    fn diags(doc: &Document) -> Vec<(&Vec<i32>, &Diagnostic)> {
+        doc.occurrences
+            .iter()
+            .filter(|o| o.symbol.is_empty())
+            .flat_map(|o| o.diagnostics.iter().map(move |d| (&o.range, d)))
+            .collect()
+    }
+
+    #[test]
+    fn test_diagnostic_in_occurrence() {
+        let doc = build_document("Makefile", "CFLAGS = $(MISSING) -Wall\n", None);
+        let found = diags(&doc);
+        assert_eq!(found.len(), 1);
+        let (range, diag) = found[0];
+        assert_eq!(*range, vec![0, 9, 0, 19]);
+        assert_eq!(diag.code, "undefined-variable");
+        assert_eq!(diag.severity.enum_value(), Ok(Severity::Warning));
+        assert_eq!(diag.source, "makefile-lsp");
+        assert_eq!(diag.message, "variable 'MISSING' is not defined");
+    }
+
+    #[test]
+    fn test_multiline_diagnostic_range() {
+        // A circular dependency is anchored on the whole rule, so the range
+        // crosses line boundaries.
+        let doc = build_document("Makefile", "a: b\n\techo a\nb: a\n\techo b\n", None);
+        let circular: Vec<_> = diags(&doc)
+            .into_iter()
+            .filter(|(_, d)| d.code == "circular-dependency")
+            .collect();
+        assert_eq!(circular.len(), 1);
+        let (range, _) = circular[0];
+        assert_eq!(*range, vec![0, 0, 2, 0]);
+    }
+
+    #[test]
+    fn test_no_diagnostics_for_clean_makefile() {
+        let doc = build_document(
+            "Makefile",
+            "all: build\n\techo done\nbuild:\n\techo b\n",
+            None,
+        );
+        assert!(diags(&doc).is_empty());
     }
 }
