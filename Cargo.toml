@@ -18,10 +18,12 @@ tower-lsp-server = "0.23"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = "0.3"
+scip = "0.8"
 
 [[bin]]
 name = "makefile-lsp"
 test = true
 
 [dev-dependencies]
+protobuf = "3"
 tempfile = "3"
