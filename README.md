@@ -9,6 +9,7 @@ A Language Server Protocol (LSP) implementation for Makefiles, built in Rust.
 - **Document symbols** - outline of targets and variable assignments
 - **Folding ranges** - collapse rules and multi-line definitions
 - **Semantic tokens** - syntax highlighting for targets, variables, prerequisites, recipes, and comments
+- **SCIP indexing** - generate a [SCIP](https://github.com/sourcegraph/scip) index for code navigation
 
 ## Installation
 
@@ -45,6 +46,24 @@ vim.api.nvim_create_autocmd("FileType", {
 
 Use a generic LSP client extension and configure it to run `makefile-lsp` for
 `Makefile` files.
+
+## SCIP indexing
+
+The `scip` subcommand produces a [SCIP](https://github.com/sourcegraph/scip)
+index covering targets and variables, which tools like Sourcegraph can use for
+code navigation:
+
+```sh
+makefile-lsp scip                       # index ./Makefile into index.scip
+makefile-lsp scip Makefile build/Rules.mk -o out.scip
+```
+
+Use `--project-root` to override the root directory recorded in the index
+(defaults to the current directory).
+
+SCIP support is gated behind the `scip` feature, which is enabled by default.
+Build with `--no-default-features` to drop the `scip` dependency and the
+subcommand.
 
 ## License
 

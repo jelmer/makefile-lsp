@@ -21,6 +21,8 @@ mod inlay_hints;
 mod position;
 mod references;
 mod rename;
+#[cfg(feature = "scip")]
+mod scip;
 mod selection_ranges;
 mod semantic;
 mod signature_help;
@@ -541,8 +543,7 @@ impl LanguageServer for Backend {
     }
 }
 
-#[tokio::main]
-async fn main() {
+async fn run_lsp() {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .init();
@@ -552,4 +553,160 @@ async fn main() {
 
     let (service, socket) = LspService::new(Backend::new);
     Server::new(stdin, stdout, socket).serve(service).await;
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+
+    match args.get(1).map(String::as_str) {
+        #[cfg(feature = "scip")]
+        Some("scip") => {
+            if let Err(e) = scip_command::run(&args[2..]) {
+                eprintln!("makefile-lsp scip: {e}");
+                std::process::exit(1);
+            }
+        }
+        #[cfg(not(feature = "scip"))]
+        Some("scip") => {
+            eprintln!("makefile-lsp: built without SCIP support (enable the 'scip' feature)");
+            std::process::exit(2);
+        }
+        Some("--help" | "-h") => print_usage(),
+        Some(other) if !other.starts_with('-') => {
+            eprintln!("makefile-lsp: unknown subcommand '{other}'");
+            print_usage();
+            std::process::exit(2);
+        }
+        // No subcommand (or only flags): run the language server over stdio.
+        _ => {
+            let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
+            rt.block_on(run_lsp());
+        }
+    }
+}
+
+#[cfg(feature = "scip")]
+fn print_usage() {
+    eprintln!(
+        "makefile-lsp {}\n\n\
+         Usage:\n  \
+         makefile-lsp                  Run the language server over stdin/stdout\n  \
+         makefile-lsp scip [FILE...]   Generate a SCIP index for the given Makefiles\n\n\
+         Run 'makefile-lsp scip --help' for SCIP options.",
+        env!("CARGO_PKG_VERSION")
+    );
+}
+
+#[cfg(not(feature = "scip"))]
+fn print_usage() {
+    eprintln!(
+        "makefile-lsp {}\n\n\
+         Usage:\n  \
+         makefile-lsp                  Run the language server over stdin/stdout",
+        env!("CARGO_PKG_VERSION")
+    );
+}
+
+/// Implementation of the `scip` subcommand.
+#[cfg(feature = "scip")]
+mod scip_command {
+    use std::path::{Path, PathBuf};
+
+    /// Generate a SCIP index for the given Makefiles.
+    ///
+    /// Files default to `Makefile` in the current directory when none are given.
+    /// The index is written to `index.scip` unless `-o`/`--output` is passed.
+    pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+        let mut output = PathBuf::from("index.scip");
+        let mut inputs: Vec<PathBuf> = Vec::new();
+        let mut project_root: Option<PathBuf> = None;
+
+        let mut iter = args.iter();
+        while let Some(arg) = iter.next() {
+            match arg.as_str() {
+                "-o" | "--output" => {
+                    let value = iter.next().ok_or("missing value for --output")?;
+                    output = PathBuf::from(value);
+                }
+                "--project-root" => {
+                    let value = iter.next().ok_or("missing value for --project-root")?;
+                    project_root = Some(PathBuf::from(value));
+                }
+                "-h" | "--help" => {
+                    print_help();
+                    return Ok(());
+                }
+                other if other.starts_with('-') => {
+                    return Err(format!("unknown option '{other}'").into());
+                }
+                other => inputs.push(PathBuf::from(other)),
+            }
+        }
+
+        if inputs.is_empty() {
+            inputs.push(PathBuf::from("Makefile"));
+        }
+
+        let root = match project_root {
+            Some(p) => p,
+            None => std::env::current_dir()?,
+        };
+        let root = root.canonicalize().unwrap_or(root);
+
+        let mut files = Vec::with_capacity(inputs.len());
+        for input in &inputs {
+            let text =
+                std::fs::read_to_string(input).map_err(|e| format!("{}: {e}", input.display()))?;
+            let relative = relative_path(&root, input);
+            files.push((relative, text));
+        }
+
+        let project_root_uri = path_to_file_uri(&root);
+        let index = crate::scip::build_index(&project_root_uri, &files);
+
+        scip::write_message_to_file(&output, index)
+            .map_err(|e| format!("{}: {e}", output.display()))?;
+
+        eprintln!(
+            "Wrote SCIP index for {} file(s) to {}",
+            files.len(),
+            output.display()
+        );
+        Ok(())
+    }
+
+    fn print_help() {
+        eprintln!(
+            "Usage: makefile-lsp scip [OPTIONS] [FILE...]\n\n\
+             Generate a SCIP code-intelligence index for one or more Makefiles.\n\n\
+             Options:\n  \
+             -o, --output FILE        Write the index to FILE (default: index.scip)\n      \
+             --project-root DIR   Root directory recorded in the index (default: cwd)\n  \
+             -h, --help               Show this help\n\n\
+             With no FILE, 'Makefile' in the current directory is used."
+        );
+    }
+
+    /// Compute a path relative to `root`, falling back to the input's file name
+    /// (or the path as given) when it lies outside the root.
+    fn relative_path(root: &Path, input: &Path) -> String {
+        let absolute = input.canonicalize().unwrap_or_else(|_| root.join(input));
+        let rel = absolute.strip_prefix(root).unwrap_or(&absolute);
+        let rel = if rel.as_os_str().is_empty() {
+            input
+        } else {
+            rel
+        };
+        rel.to_string_lossy().replace('\\', "/")
+    }
+
+    /// Render an absolute path as a `file://` URI.
+    fn path_to_file_uri(path: &Path) -> String {
+        let s = path.to_string_lossy().replace('\\', "/");
+        if let Some(stripped) = s.strip_prefix('/') {
+            format!("file:///{stripped}")
+        } else {
+            format!("file:///{s}")
+        }
+    }
 }
