@@ -2,9 +2,10 @@
 //!
 //! Produces a [SCIP](https://github.com/sourcegraph/scip) index covering rule
 //! targets (definitions and prerequisite references) and variables (definitions
-//! and `$(VAR)`/`${VAR}` references). Lint and parse diagnostics are carried
-//! into the index as symbol-less occurrences. Symbol positions are emitted as
-//! UTF-8 byte offsets from the start of the line, matching
+//! and `$(VAR)`/`${VAR}` references). Each occurrence carries a `SyntaxKind` so
+//! consumers can syntax-highlight from the index. Lint and parse diagnostics are
+//! carried into the index as symbol-less occurrences. Symbol positions are
+//! emitted as UTF-8 byte offsets from the start of the line, matching
 //! `PositionEncoding::UTF8`.
 
 use std::collections::BTreeMap;
@@ -15,7 +16,7 @@ use rowan::ast::AstNode;
 use scip::types::{
     descriptor, symbol_information, Descriptor, Diagnostic, Document, Index, Metadata, Occurrence,
     Package, PositionEncoding, ProtocolVersion, Severity, Symbol, SymbolInformation, SymbolRole,
-    TextEncoding, ToolInfo,
+    SyntaxKind, TextEncoding, ToolInfo,
 };
 use tower_lsp_server::ls_types::{DiagnosticSeverity, NumberOrString};
 
@@ -73,6 +74,8 @@ struct RawOccurrence {
     /// Byte length of the name.
     len: usize,
     is_definition: bool,
+    /// Syntax-highlighting classification for the name.
+    syntax_kind: SyntaxKind,
 }
 
 fn build_document(relative_path: &str, text: &str, base_dir: Option<&Path>) -> Document {
@@ -96,6 +99,7 @@ fn build_document(relative_path: &str, text: &str, base_dir: Option<&Path>) -> D
             range: byte_range_to_scip(text, raw.start, raw.len),
             symbol: raw.symbol,
             symbol_roles: roles,
+            syntax_kind: raw.syntax_kind.into(),
             ..Default::default()
         });
     }
@@ -113,6 +117,9 @@ fn build_document(relative_path: &str, text: &str, base_dir: Option<&Path>) -> D
     let symbols = defined
         .into_iter()
         .map(|(symbol, (name, kind))| SymbolInformation {
+            documentation: builtin_documentation(&name, kind)
+                .map(|doc| vec![doc.to_string()])
+                .unwrap_or_default(),
             symbol,
             display_name: name,
             kind: kind.into(),
@@ -131,6 +138,18 @@ fn build_document(relative_path: &str, text: &str, base_dir: Option<&Path>) -> D
         symbols,
         position_encoding: PositionEncoding::UTF8CodeUnitOffsetFromLineStart.into(),
         ..Default::default()
+    }
+}
+
+/// Documentation for a defined symbol that is a GNU Make built-in, if any.
+///
+/// Targets are matched against the special targets (`.PHONY`, `.NOTPARALLEL`,
+/// ...); variables against the built-in variables (`CC`, `MAKE`, ...).
+fn builtin_documentation(name: &str, kind: symbol_information::Kind) -> Option<&'static str> {
+    match kind {
+        symbol_information::Kind::Function => crate::builtins::find_special_target(name),
+        symbol_information::Kind::Variable => crate::builtins::find_builtin_variable(name),
+        _ => None,
     }
 }
 
@@ -179,6 +198,7 @@ fn collect_targets(makefile: &Makefile, text: &str) -> Vec<RawOccurrence> {
                     start: rule_start + idx,
                     len: target.len(),
                     is_definition: true,
+                    syntax_kind: SyntaxKind::IdentifierFunctionDefinition,
                 });
             }
         }
@@ -195,6 +215,7 @@ fn collect_targets(makefile: &Makefile, text: &str) -> Vec<RawOccurrence> {
                     start: prereq_offset + idx,
                     len: prereq.len(),
                     is_definition: false,
+                    syntax_kind: SyntaxKind::IdentifierFunction,
                 });
             }
         }
@@ -220,6 +241,7 @@ fn collect_variables(makefile: &Makefile, text: &str) -> Vec<RawOccurrence> {
                 start: var_start + idx,
                 len: name.len(),
                 is_definition: true,
+                syntax_kind: SyntaxKind::IdentifierMutableGlobal,
             });
         }
     }
@@ -236,6 +258,7 @@ fn collect_variables(makefile: &Makefile, text: &str) -> Vec<RawOccurrence> {
                 start,
                 len,
                 is_definition: false,
+                syntax_kind: SyntaxKind::IdentifierMutableGlobal,
             });
         }
     }
@@ -471,6 +494,34 @@ mod tests {
     }
 
     #[test]
+    fn test_occurrence_syntax_kinds() {
+        let text = "CC = gcc\nall: build\n\t$(CC) x.c\nbuild:\n\techo hi\n";
+        let doc = build_document("Makefile", text, None);
+
+        let cc = variable_symbol("CC");
+        let all = target_symbol("all");
+        let build = target_symbol("build");
+
+        let kind = |sym: &str, def: bool| {
+            doc.occurrences
+                .iter()
+                .find(|o| {
+                    o.symbol == sym && (o.symbol_roles & SymbolRole::Definition as i32 != 0) == def
+                })
+                .unwrap()
+                .syntax_kind
+                .enum_value()
+                .unwrap()
+        };
+
+        assert_eq!(kind(&all, true), SyntaxKind::IdentifierFunctionDefinition);
+        assert_eq!(kind(&build, true), SyntaxKind::IdentifierFunctionDefinition);
+        assert_eq!(kind(&build, false), SyntaxKind::IdentifierFunction);
+        assert_eq!(kind(&cc, true), SyntaxKind::IdentifierMutableGlobal);
+        assert_eq!(kind(&cc, false), SyntaxKind::IdentifierMutableGlobal);
+    }
+
+    #[test]
     fn test_symbol_table_lists_definitions() {
         let text = "CC = gcc\n\nall: build\n\techo ok\n";
         let doc = build_document("Makefile", text, None);
@@ -495,6 +546,45 @@ mod tests {
             all.kind.enum_value(),
             Ok(symbol_information::Kind::Function)
         );
+    }
+
+    #[test]
+    fn test_special_target_documentation() {
+        let text = "all: build\n\techo ok\nbuild:\n\techo b\n.PHONY: all\n";
+        let doc = build_document("Makefile", text, None);
+        let phony = doc
+            .symbols
+            .iter()
+            .find(|s| s.display_name == ".PHONY")
+            .unwrap();
+        assert_eq!(
+            phony.documentation,
+            vec!["Declare targets that do not represent files.".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_builtin_variable_documentation() {
+        let text = "CC = gcc\nall:\n\t$(CC) main.c\n";
+        let doc = build_document("Makefile", text, None);
+        let cc = doc.symbols.iter().find(|s| s.display_name == "CC").unwrap();
+        assert_eq!(
+            cc.documentation,
+            vec!["C compiler (default: cc).".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_user_symbols_have_no_documentation() {
+        let text = "FOO = bar\nall: build\n\techo ok\nbuild:\n\techo b\n";
+        let doc = build_document("Makefile", text, None);
+        for name in ["FOO", "all", "build"] {
+            let sym = doc.symbols.iter().find(|s| s.display_name == name).unwrap();
+            assert!(
+                sym.documentation.is_empty(),
+                "{name} should have no documentation"
+            );
+        }
     }
 
     #[test]
