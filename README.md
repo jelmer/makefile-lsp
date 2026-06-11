@@ -52,9 +52,10 @@ Use a generic LSP client extension and configure it to run `makefile-lsp` for
 
 The `scip` subcommand produces a [SCIP](https://github.com/sourcegraph/scip)
 index covering targets and variables, which tools like Sourcegraph can use for
-code navigation. Built-in variables and special targets carry their
+code navigation. Each occurrence is tagged with a syntax kind so the index can
+drive syntax highlighting, built-in variables and special targets carry their
 documentation, and lint and parse diagnostics are included in the index too, so
-both can be surfaced inline:
+they can be surfaced inline:
 
 ```sh
 makefile-lsp scip                       # index ./Makefile into index.scip
