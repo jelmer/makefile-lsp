@@ -2,11 +2,13 @@
 //!
 //! Produces a [SCIP](https://github.com/sourcegraph/scip) index covering rule
 //! targets (definitions and prerequisite references) and variables (definitions
-//! and `$(VAR)`/`${VAR}` references). Each occurrence carries a `SyntaxKind` so
-//! consumers can syntax-highlight from the index. Lint and parse diagnostics are
-//! carried into the index as symbol-less occurrences. Symbol positions are
-//! emitted as UTF-8 byte offsets from the start of the line, matching
-//! `PositionEncoding::UTF8`.
+//! and `$(VAR)`/`${VAR}` references). References to built-in and automatic
+//! variables (`$@`, `$<`, `$(MAKE)`, ...) carry the same documentation the LSP
+//! hover serves, so SCIP consumers can show it. Each occurrence carries a
+//! `SyntaxKind` so consumers can syntax-highlight from the index. Lint and parse
+//! diagnostics are carried into the index as symbol-less occurrences. Symbol
+//! positions are emitted as UTF-8 byte offsets from the start of the line,
+//! matching `PositionEncoding::UTF8`.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -86,10 +88,24 @@ fn build_document(relative_path: &str, text: &str, base_dir: Option<&Path>) -> D
     // Track which symbols have definitions, with display name and kind, so the
     // document's symbol table only lists symbols defined here.
     let mut defined: BTreeMap<String, (String, symbol_information::Kind)> = BTreeMap::new();
+    // Built-in and automatic variables referenced here but defined by Make
+    // itself. We carry documentation for them even without a definition in this
+    // file, keyed by symbol with (display name, description).
+    let mut builtin_refs: BTreeMap<String, (String, String)> = BTreeMap::new();
+
+    let user_defined: std::collections::HashSet<String> = makefile
+        .variable_definitions()
+        .filter_map(|v| v.name())
+        .collect();
 
     for raw in collect_targets(&makefile, text)
         .into_iter()
-        .chain(collect_variables(&makefile, text))
+        .chain(collect_variable_definitions(&makefile, text))
+        .chain(collect_variable_references(
+            text,
+            &user_defined,
+            &mut builtin_refs,
+        ))
     {
         let mut roles = 0;
         if raw.is_definition {
@@ -114,7 +130,7 @@ fn build_document(relative_path: &str, text: &str, base_dir: Option<&Path>) -> D
         defined.entry(symbol).or_insert((name, kind));
     }
 
-    let symbols = defined
+    let mut symbols: Vec<SymbolInformation> = defined
         .into_iter()
         .map(|(symbol, (name, kind))| SymbolInformation {
             documentation: builtin_documentation(&name, kind)
@@ -126,6 +142,20 @@ fn build_document(relative_path: &str, text: &str, base_dir: Option<&Path>) -> D
             ..Default::default()
         })
         .collect();
+
+    // Document built-in/automatic variables that are referenced but not defined
+    // here, reusing the same descriptions the LSP hover serves.
+    symbols.extend(
+        builtin_refs
+            .into_iter()
+            .map(|(symbol, (name, doc))| SymbolInformation {
+                documentation: vec![doc],
+                symbol,
+                display_name: name,
+                kind: symbol_information::Kind::Variable.into(),
+                ..Default::default()
+            }),
+    );
 
     // Carry lint/parse diagnostics into the index as symbol-less occurrences,
     // so consumers like Sourcegraph can render them inline.
@@ -224,8 +254,8 @@ fn collect_targets(makefile: &Makefile, text: &str) -> Vec<RawOccurrence> {
     out
 }
 
-/// Collect variable definitions and `$(VAR)`/`${VAR}` references.
-fn collect_variables(makefile: &Makefile, text: &str) -> Vec<RawOccurrence> {
+/// Collect variable definitions (the `NAME` in `NAME = value`).
+fn collect_variable_definitions(makefile: &Makefile, text: &str) -> Vec<RawOccurrence> {
     let mut out = Vec::new();
 
     for var in makefile.variable_definitions() {
@@ -246,23 +276,136 @@ fn collect_variables(makefile: &Makefile, text: &str) -> Vec<RawOccurrence> {
         }
     }
 
-    // References: scan the whole text for $(VAR) and ${VAR}.
-    let names: Vec<String> = makefile
-        .variable_definitions()
-        .filter_map(|v| v.name())
-        .collect();
-    for name in &names {
-        for (start, len) in find_variable_uses(text, name) {
-            out.push(RawOccurrence {
-                symbol: variable_symbol(name),
-                start,
-                len,
-                is_definition: false,
-                syntax_kind: SyntaxKind::IdentifierMutableGlobal,
-            });
+    out
+}
+
+/// Collect occurrences for every `$(VAR)`/`${VAR}`/`$X` reference in the text,
+/// classifying each name.
+///
+/// A name defined in this file (in `user_defined`) is emitted as a reference to
+/// the user's own symbol. Otherwise, if it is a built-in or automatic variable
+/// (`$@`, `$<`, `$(MAKE)`, ...), it is emitted and its documentation recorded in
+/// `docs`, reusing the same descriptions the LSP hover serves. Names that are
+/// neither are skipped (they are reported by the undefined-variable lint).
+fn collect_variable_references(
+    text: &str,
+    user_defined: &std::collections::HashSet<String>,
+    docs: &mut BTreeMap<String, (String, String)>,
+) -> Vec<RawOccurrence> {
+    let mut out = Vec::new();
+    for r in scan_variable_references(text) {
+        let symbol = variable_symbol(r.name);
+        if !user_defined.contains(r.name) {
+            // Built-in or automatic variable: attach its documentation. Unknown
+            // names get no symbol so consumers don't see bogus references.
+            let Some(doc) = builtin_variable_doc(r.name) else {
+                continue;
+            };
+            docs.entry(symbol.clone())
+                .or_insert_with(|| (r.name.to_string(), doc));
+        }
+        out.push(RawOccurrence {
+            symbol,
+            start: r.name_start,
+            len: r.name.len(),
+            is_definition: false,
+            syntax_kind: SyntaxKind::IdentifierMutableGlobal,
+        });
+    }
+    out
+}
+
+/// Documentation for a built-in or automatic variable name, if known.
+fn builtin_variable_doc(name: &str) -> Option<String> {
+    crate::builtins::find_automatic_variable(name)
+        .or_else(|| crate::builtins::find_builtin_variable(name).map(str::to_string))
+}
+
+/// A variable reference found by [`scan_variable_references`].
+struct VarRef<'a> {
+    /// The referenced name (`MAKE` for `$(MAKE)`, `@` for `$@`, `wildcard` for
+    /// `$(wildcard ...)`).
+    name: &'a str,
+    /// Byte offset of the name within the text.
+    name_start: usize,
+}
+
+/// Scan the whole text once for variable references, in source order.
+///
+/// Handles `$(NAME)`, `${NAME}`, and single-character automatic forms (`$@`,
+/// `$<`, ...). The scan steps one reference at a time rather than skipping the
+/// body of a `$(...)`, so references nested inside function calls (`$(dir $@)`,
+/// `$(addprefix $(CURDIR)/,...)`) are found too. References inside Make comments
+/// are skipped: outside a recipe, `#` starts a comment that runs to end of line
+/// and whose `$` references Make never expands. Recipe lines (tab-indented) are
+/// not comment-scanned, since Make expands `$` there before the shell sees any
+/// `#`. Escaped `$$` is skipped.
+fn scan_variable_references(text: &str) -> Vec<VarRef<'_>> {
+    let mut out = Vec::new();
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    let mut at_line_start = true;
+    // Whether the current line is a recipe line (begins with a tab).
+    let mut in_recipe = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'\n' {
+            at_line_start = true;
+            in_recipe = false;
+            i += 1;
+            continue;
+        }
+        if at_line_start {
+            in_recipe = b == b'\t';
+            at_line_start = false;
+        }
+        // Outside recipes, `#` begins a comment for the rest of the line.
+        if b == b'#' && !in_recipe {
+            i += text[i..].find('\n').unwrap_or(text.len() - i);
+            continue;
+        }
+        if b != b'$' {
+            i += 1;
+            continue;
+        }
+        let Some(open) = bytes.get(i + 1).copied() else {
+            break;
+        };
+        if open == b'$' {
+            // Escaped `$$`: consume both so the second isn't read as a ref.
+            i += 2;
+            continue;
+        }
+        if open == b'(' || open == b'{' {
+            let close = if open == b'(' { b')' } else { b'}' };
+            let name_start = i + 2;
+            let mut j = name_start;
+            // The name runs until the closing delimiter, a nested `$`, or a
+            // function-argument separator; `$(wildcard ...)` names "wildcard".
+            while j < bytes.len() {
+                let c = bytes[j];
+                if c == close || c == b' ' || c == b'\t' || c == b',' || c == b'$' {
+                    break;
+                }
+                j += 1;
+            }
+            if let Some(name) = text.get(name_start..j).filter(|n| !n.is_empty()) {
+                out.push(VarRef { name, name_start });
+            }
+            // Resume after the `$(`/`${` so nested references are scanned.
+            i = name_start;
+        } else {
+            // Single-character automatic variable: $@, $<, $^, ...
+            let ch_len = text[i + 1..].chars().next().map_or(1, char::len_utf8);
+            if let Some(name) = text.get(i + 1..i + 1 + ch_len) {
+                out.push(VarRef {
+                    name,
+                    name_start: i + 1,
+                });
+            }
+            i += 1 + ch_len;
         }
     }
-
     out
 }
 
@@ -315,26 +458,6 @@ fn find_words(haystack: &str, word: &str) -> Vec<usize> {
         })
         .map(|(idx, _)| idx)
         .collect()
-}
-
-/// Find `$(VAR)` and `${VAR}` uses of `name`, returning (name_start, name_len).
-fn find_variable_uses(text: &str, name: &str) -> Vec<(usize, usize)> {
-    let mut out = Vec::new();
-    let paren = format!("$({}", name);
-    let brace = format!("${{{}", name);
-    for (pattern, close) in [(&paren, b')'), (&brace, b'}')] {
-        for (idx, _) in text.match_indices(pattern.as_str()) {
-            let after = idx + pattern.len();
-            let next = text.as_bytes().get(after).copied();
-            // Only count it if the name is followed by the closing delimiter,
-            // whitespace, or a function-argument separator.
-            let ok = matches!(next, Some(b) if b == close || b == b' ' || b == b')' || b == b'}' || b == b',');
-            if ok {
-                out.push((idx + 2, name.len()));
-            }
-        }
-    }
-    out
 }
 
 fn is_word_byte(b: u8) -> bool {
@@ -571,6 +694,151 @@ mod tests {
         assert_eq!(
             cc.documentation,
             vec!["C compiler (default: cc).".to_string()]
+        );
+    }
+
+    /// The documentation attached to the symbol that `name` resolves to.
+    fn doc_for(doc: &Document, name: &str) -> Option<String> {
+        doc.symbols
+            .iter()
+            .find(|s| s.display_name == name)
+            .map(|s| s.documentation.join(""))
+    }
+
+    #[test]
+    fn test_automatic_variable_documentation() {
+        let text = "all:\n\t$(CC) -o $@ $<\n";
+        let doc = build_document("Makefile", text, None);
+
+        assert_eq!(
+            doc_for(&doc, "@").as_deref(),
+            Some("The file name of the target of the rule.")
+        );
+        assert_eq!(
+            doc_for(&doc, "<").as_deref(),
+            Some("The name of the first prerequisite.")
+        );
+
+        // The occurrences point at the name byte, not the `$`.
+        let at = variable_symbol("@");
+        assert!(doc.occurrences.iter().any(|o| o.symbol == at));
+    }
+
+    #[test]
+    fn test_automatic_variable_variant_documentation() {
+        let text = "all:\n\techo $(@D) $(^F)\n";
+        let doc = build_document("Makefile", text, None);
+        assert_eq!(
+            doc_for(&doc, "@D").as_deref(),
+            Some("The directory part of `$@`.")
+        );
+        assert_eq!(
+            doc_for(&doc, "^F").as_deref(),
+            Some("The file-within-directory part of `$^`.")
+        );
+    }
+
+    #[test]
+    fn test_builtin_variable_reference_documentation() {
+        // MAKE and CURDIR are never defined here, but referenced.
+        let text = "all:\n\tcd $(CURDIR) && $(MAKE) -C sub\n";
+        let doc = build_document("Makefile", text, None);
+        assert_eq!(
+            doc_for(&doc, "CURDIR").as_deref(),
+            Some("The absolute pathname of the current working directory.")
+        );
+        assert_eq!(
+            doc_for(&doc, "MAKE").as_deref(),
+            Some("The name of the make program being run.")
+        );
+    }
+
+    #[test]
+    fn test_user_definition_shadows_builtin_reference() {
+        // CC is built-in, but defined here: it must be documented via the
+        // definition path (which already handles built-in docs), and must not
+        // appear twice in the symbol table.
+        let text = "CC = clang\nall:\n\t$(CC) main.c\n";
+        let doc = build_document("Makefile", text, None);
+        let cc_syms: Vec<_> = doc
+            .symbols
+            .iter()
+            .filter(|s| s.display_name == "CC")
+            .collect();
+        assert_eq!(cc_syms.len(), 1);
+        assert_eq!(
+            cc_syms[0].documentation,
+            vec!["C compiler (default: cc).".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_unknown_single_char_not_documented() {
+        // $$ (escaped dollar) and unknown $x must not produce symbols.
+        let text = "all:\n\techo $$HOME $x\n";
+        let doc = build_document("Makefile", text, None);
+        assert!(doc_for(&doc, "$").is_none());
+        assert!(doc_for(&doc, "x").is_none());
+    }
+
+    #[test]
+    fn test_nested_automatic_variable_documented() {
+        // $@ nested inside $(dir ...) must still be documented.
+        let text = "all:\n\techo $(dir $@)\n";
+        let doc = build_document("Makefile", text, None);
+        assert_eq!(
+            doc_for(&doc, "@").as_deref(),
+            Some("The file name of the target of the rule.")
+        );
+        let at = variable_symbol("@");
+        assert!(doc.occurrences.iter().any(|o| o.symbol == at));
+    }
+
+    #[test]
+    fn test_nested_builtin_variable_documented() {
+        // CURDIR nested inside $(addprefix ...) must still be documented.
+        let text = "all:\n\techo $(addprefix $(CURDIR)/,a b)\n";
+        let doc = build_document("Makefile", text, None);
+        assert_eq!(
+            doc_for(&doc, "CURDIR").as_deref(),
+            Some("The absolute pathname of the current working directory.")
+        );
+    }
+
+    #[test]
+    fn test_nested_user_variable_referenced() {
+        // A user variable nested inside a function call is still referenced.
+        let text = "SRC = a.c\nall:\n\techo $(notdir $(SRC))\n";
+        let doc = build_document("Makefile", text, None);
+        let src = variable_symbol("SRC");
+        let refs = doc
+            .occurrences
+            .iter()
+            .filter(|o| o.symbol == src && o.symbol_roles & SymbolRole::Definition as i32 == 0)
+            .count();
+        assert_eq!(refs, 1);
+    }
+
+    #[test]
+    fn test_comment_variable_not_documented() {
+        // A built-in mentioned in a full-line comment is not a reference: Make
+        // never expands it.
+        let text = "# see $(MAKE) docs\nall:\n\techo done\n";
+        let doc = build_document("Makefile", text, None);
+        assert!(doc_for(&doc, "MAKE").is_none());
+        let make = variable_symbol("MAKE");
+        assert!(!doc.occurrences.iter().any(|o| o.symbol == make));
+    }
+
+    #[test]
+    fn test_recipe_comment_variable_documented() {
+        // In a recipe, Make expands `$` before the shell sees `#`, so a variable
+        // after a recipe-line `#` is a real reference.
+        let text = "all:\n\techo hi # uses $(MAKE)\n";
+        let doc = build_document("Makefile", text, None);
+        assert_eq!(
+            doc_for(&doc, "MAKE").as_deref(),
+            Some("The name of the make program being run.")
         );
     }
 

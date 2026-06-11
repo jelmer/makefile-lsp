@@ -8,20 +8,6 @@ use tower_lsp_server::ls_types::{CompletionItem, CompletionItemKind, Position};
 use crate::builtins;
 use crate::position::try_position_to_offset;
 
-/// Well-known GNU Make automatic variables for completion (with $ prefix for insertion).
-const AUTOMATIC_VARIABLE_COMPLETIONS: &[(&str, &str)] = &[
-    ("$@", "The target of the rule"),
-    ("$<", "The first prerequisite"),
-    ("$^", "All prerequisites (no duplicates)"),
-    ("$+", "All prerequisites (with duplicates)"),
-    ("$?", "Prerequisites newer than the target"),
-    ("$*", "The stem of an implicit rule match"),
-    ("$(@D)", "Directory part of $@"),
-    ("$(@F)", "File part of $@"),
-    ("$(<D)", "Directory part of $<"),
-    ("$(<F)", "File part of $<"),
-];
-
 /// Get completions for a Makefile at the given position.
 ///
 /// `base_dir` is the directory of the source file; used to resolve relative
@@ -126,14 +112,25 @@ fn get_variable_completions(makefile: &Makefile) -> Vec<CompletionItem> {
 }
 
 /// Generate automatic variable completions for use after $.
+///
+/// Single-character variables (`$@`, `$<`, ...) insert bare; the `D`/`F`
+/// variants insert wrapped in `(...)` (e.g. `$(@D)`). Both are derived from the
+/// shared [`builtins`] tables so completion, hover, and the SCIP index agree.
 fn get_automatic_variable_completions() -> Vec<CompletionItem> {
-    AUTOMATIC_VARIABLE_COMPLETIONS
+    let single = builtins::AUTOMATIC_VARIABLES
         .iter()
-        .map(|(name, desc)| CompletionItem {
-            label: name.to_string(),
+        .map(|(name, doc)| (format!("${}", name), name.to_string(), doc.to_string()));
+    let variants = builtins::AUTOMATIC_VARIABLE_VARIANTS.iter().map(|name| {
+        let doc = builtins::find_automatic_variable(name).unwrap_or_default();
+        (format!("$({})", name), format!("({})", name), doc)
+    });
+    single
+        .chain(variants)
+        .map(|(label, insert, detail)| CompletionItem {
+            label,
             kind: Some(CompletionItemKind::VARIABLE),
-            detail: Some(desc.to_string()),
-            insert_text: Some(name.trim_start_matches('$').to_string()),
+            detail: Some(detail),
+            insert_text: Some(insert),
             ..Default::default()
         })
         .collect()
@@ -391,6 +388,27 @@ mod tests {
         assert!(!completions.is_empty());
         assert!(completions.iter().any(|c| c.label == "subst"));
         assert!(completions.iter().any(|c| c.label == "wildcard"));
+    }
+
+    #[test]
+    fn test_automatic_variable_completions_cover_all_variants() {
+        let completions = get_automatic_variable_completions();
+        // Single-character forms insert bare.
+        let at = completions.iter().find(|c| c.label == "$@").unwrap();
+        assert_eq!(at.insert_text.as_deref(), Some("@"));
+        // Every D/F variant is offered, including the ^/+/?/* ones the hover and
+        // SCIP index now document.
+        for variant in builtins::AUTOMATIC_VARIABLE_VARIANTS {
+            let label = format!("$({})", variant);
+            let item = completions
+                .iter()
+                .find(|c| c.label == label)
+                .unwrap_or_else(|| panic!("missing completion for {}", label));
+            assert_eq!(
+                item.insert_text.as_deref(),
+                Some(&*format!("({})", variant))
+            );
+        }
     }
 
     #[test]

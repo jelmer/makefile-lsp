@@ -218,6 +218,10 @@ pub fn find_builtin_function(name: &str) -> Option<&'static BuiltinFunction> {
 }
 
 /// GNU Make automatic variables (single-character after $).
+///
+/// The `D`/`F` variants (`$(@D)`, `$(^F)`, ...) are in
+/// [`AUTOMATIC_VARIABLE_VARIANTS`]; [`find_automatic_variable`] synthesizes
+/// their descriptions from the base variable.
 pub const AUTOMATIC_VARIABLES: &[(&str, &str)] = &[
     ("@", "The file name of the target of the rule."),
     ("<", "The name of the first prerequisite."),
@@ -226,10 +230,6 @@ pub const AUTOMATIC_VARIABLES: &[(&str, &str)] = &[
     ("?", "The names of all the prerequisites that are newer than the target."),
     ("*", "The stem with which an implicit rule matches."),
     ("%", "The stem of a static pattern rule."),
-    ("@D", "The directory part of `$@`."),
-    ("@F", "The file-within-directory part of `$@`."),
-    ("<D", "The directory part of `$<`."),
-    ("<F", "The file-within-directory part of `$<`."),
 ];
 
 /// GNU Make automatic variable variants (e.g. $(@D), $(@F)).
@@ -418,6 +418,27 @@ pub const SPECIAL_TARGETS: &[(&str, &str)] = &[
     ),
     (".POSIX", "Enable POSIX-conforming mode."),
 ];
+
+/// Find an automatic variable by name, returning its description.
+///
+/// Handles both the variables listed in [`AUTOMATIC_VARIABLES`] and the `D`/`F`
+/// variants in [`AUTOMATIC_VARIABLE_VARIANTS`] (e.g. `^D`, `?F`), synthesizing a
+/// description for the latter from the base variable.
+pub fn find_automatic_variable(name: &str) -> Option<String> {
+    if let Some((_, doc)) = AUTOMATIC_VARIABLES.iter().find(|(n, _)| *n == name) {
+        return Some((*doc).to_string());
+    }
+    if AUTOMATIC_VARIABLE_VARIANTS.contains(&name) {
+        let (base, suffix) = name.split_at(1);
+        let part = match suffix {
+            "D" => "directory part",
+            "F" => "file-within-directory part",
+            _ => return None,
+        };
+        return Some(format!("The {} of `${}`.", part, base));
+    }
+    None
+}
 
 /// Find a built-in variable by name, returning its description.
 pub fn find_builtin_variable(name: &str) -> Option<&'static str> {
