@@ -40,7 +40,9 @@ pub fn get_completions(
         let col = position.character as usize;
         let prefix = &line[..col.min(line.len())];
         if prefix.ends_with("$(") {
-            return get_function_completions();
+            let mut items = get_function_completions();
+            items.extend(get_variable_reference_completions(makefile));
+            return items;
         }
         if prefix.ends_with('$') {
             return get_automatic_variable_completions();
@@ -77,11 +79,14 @@ pub fn get_completions(
         return get_variable_completions(makefile);
     }
 
-    // After $( in any context, offer function completions
+    // After $( in any context, offer function and variable completions
+    let col = position.character as usize;
     if col >= 2 {
         let prefix = &line[..col.min(line.len())];
         if prefix.ends_with("$(") {
-            return get_function_completions();
+            let mut items = get_function_completions();
+            items.extend(get_variable_reference_completions(makefile));
+            return items;
         }
     }
 
@@ -155,6 +160,46 @@ fn get_function_completions() -> Vec<CompletionItem> {
             }
         })
         .collect()
+}
+
+/// Generate variable reference completions for use after `$(`: well-known
+/// built-in variables (`$(MAKE)`, `$(CURDIR)`, ...) plus variables defined in
+/// the file. The inserted text closes the parenthesis so accepting `MAKE`
+/// yields `$(MAKE)`.
+fn get_variable_reference_completions(makefile: &Makefile) -> Vec<CompletionItem> {
+    let mut items = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    for (name, desc) in builtins::BUILTIN_VARIABLES {
+        if !seen.insert((*name).to_string()) {
+            continue;
+        }
+        items.push(CompletionItem {
+            label: name.to_string(),
+            kind: Some(CompletionItemKind::VARIABLE),
+            detail: Some(desc.to_string()),
+            insert_text: Some(format!("{})", name)),
+            ..Default::default()
+        });
+    }
+
+    for v in makefile.variable_definitions() {
+        let Some(name) = v.name() else {
+            continue;
+        };
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+        items.push(CompletionItem {
+            label: name.clone(),
+            kind: Some(CompletionItemKind::VARIABLE),
+            detail: v.raw_value().map(|val| format!("= {}", val.trim())),
+            insert_text: Some(format!("{})", name)),
+            ..Default::default()
+        });
+    }
+
+    items
 }
 
 /// If `line` is an `include`/`-include`/`sinclude` directive, return the byte
@@ -383,6 +428,42 @@ mod tests {
         let completions = get_completions(&makefile, text, Position::new(2, 1), None);
         // Should not crash, may offer variable completions
         let _ = completions;
+    }
+
+    #[test]
+    fn test_completions_in_recipe_builtin_variables() {
+        let text = "all:\n\t$(";
+        let parsed = Makefile::parse(text);
+        let makefile = parsed.tree();
+        let completions = get_completions(&makefile, text, Position::new(1, 3), None);
+        let make = completions.iter().find(|c| c.label == "MAKE").unwrap();
+        assert_eq!(make.insert_text.as_deref(), Some("MAKE)"));
+        assert!(completions.iter().any(|c| c.label == "MAKEFLAGS"));
+        assert!(completions.iter().any(|c| c.label == "CURDIR"));
+        // Functions are still offered alongside variables.
+        assert!(completions.iter().any(|c| c.label == "wildcard"));
+    }
+
+    #[test]
+    fn test_completions_in_recipe_user_variables() {
+        let text = "CC = gcc\nall:\n\t$(";
+        let parsed = Makefile::parse(text);
+        let makefile = parsed.tree();
+        let completions = get_completions(&makefile, text, Position::new(2, 3), None);
+        let cc = completions.iter().find(|c| c.label == "CC").unwrap();
+        assert_eq!(cc.insert_text.as_deref(), Some("CC)"));
+    }
+
+    #[test]
+    fn test_variable_reference_completions_dedups() {
+        // A user-defined variable that shares a name with a built-in should
+        // appear once, taking the built-in's slot.
+        let text = "CC = clang\n";
+        let parsed = Makefile::parse(text);
+        let makefile = parsed.tree();
+        let items = get_variable_reference_completions(&makefile);
+        let cc: Vec<_> = items.iter().filter(|c| c.label == "CC").collect();
+        assert_eq!(cc.len(), 1);
     }
 
     #[test]
