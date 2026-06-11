@@ -50,6 +50,16 @@ pub fn get_completions(
         return vec![];
     }
 
+    // On an include directive line, offer filesystem completions for the path,
+    // ranking common Makefile fragment names first.
+    let col = position.character as usize;
+    if let Some(path_start) = include_path_start(line) {
+        if col >= path_start {
+            let partial = &line[path_start..col.min(line.len())];
+            return get_include_completions(partial, base_dir);
+        }
+    }
+
     // If the cursor sits in the prerequisites area, offer target names and
     // filesystem paths matching whatever is being typed.
     if let Some(offset) = try_position_to_offset(source_text, position) {
@@ -190,6 +200,67 @@ fn get_variable_reference_completions(makefile: &Makefile) -> Vec<CompletionItem
     }
 
     items
+}
+
+/// If `line` is an `include`/`-include`/`sinclude` directive, return the byte
+/// offset within the line where the (last) path argument begins. Returns `None`
+/// for non-include lines. Multiple paths may be listed; we complete the one the
+/// cursor is currently within, so we anchor on the start of the final
+/// whitespace-separated word.
+fn include_path_start(line: &str) -> Option<usize> {
+    let trimmed_start = line.len() - line.trim_start().len();
+    let rest = &line[trimmed_start..];
+
+    let keyword = ["include", "-include", "sinclude"]
+        .iter()
+        .find(|kw| rest.strip_prefix(*kw).is_some_and(|r| r.starts_with(' ')))?;
+
+    // Everything after the keyword and its following whitespace is the path
+    // list. Anchor on the start of the final word so that, with several paths
+    // on one line, we complete whichever the cursor sits in.
+    let after_keyword = trimmed_start + keyword.len();
+    let args = &line[after_keyword..];
+    let last_word = args.rfind(char::is_whitespace).map(|i| i + 1).unwrap_or(0);
+    Some(after_keyword + last_word)
+}
+
+/// Common Makefile fragment naming patterns, used to rank include completions.
+fn is_makefile_fragment(name: &str) -> bool {
+    name.ends_with(".mk")
+        || name.ends_with(".make")
+        || name.starts_with("Makefile.")
+        || name.starts_with("makefile.")
+        || name == "Makefile"
+        || name == "makefile"
+        || name == "GNUmakefile"
+}
+
+/// Generate filesystem completions for an include directive path, ranking
+/// common Makefile fragment names (`*.mk`, `Makefile.*`, ...) ahead of other
+/// entries.
+fn get_include_completions(partial: &str, base_dir: Option<&Path>) -> Vec<CompletionItem> {
+    let Some(base) = base_dir else {
+        return Vec::new();
+    };
+
+    // TODO: also offer files from `-I`/`--include-dir` search directories once
+    // those are tracked; for now we only complete paths relative to base_dir.
+    filesystem_completions(base, partial)
+        .into_iter()
+        .map(|mut item| {
+            let is_dir = item.kind == Some(CompletionItemKind::FOLDER);
+            let basename = item.label.rsplit('/').next().unwrap_or(&item.label);
+            // Sort directories and Makefile fragments first; LSP clients order
+            // by sort_text lexically, so prefix with a rank digit.
+            let rank = if is_dir || is_makefile_fragment(basename) {
+                '0'
+            } else {
+                '1'
+            };
+            item.sort_text = Some(format!("{}{}", rank, item.label));
+            item
+        })
+        .collect()
 }
 
 /// Generate completions for the prerequisites part of a rule: existing targets
@@ -497,6 +568,64 @@ mod tests {
         let completions = get_completions(&makefile, text, Position::new(0, 6), Some(dir.path()));
         let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
         assert!(labels.contains(&".hidden"), "got {:?}", labels);
+    }
+
+    #[test]
+    fn test_include_path_start() {
+        assert_eq!(include_path_start("include "), Some(8));
+        assert_eq!(include_path_start("include foo.mk"), Some(8));
+        assert_eq!(include_path_start("-include .env"), Some(9));
+        assert_eq!(include_path_start("sinclude bar"), Some(9));
+        assert_eq!(include_path_start("  include foo"), Some(10));
+        // Multiple paths: anchor on the last word.
+        assert_eq!(include_path_start("include a.mk b.mk"), Some(13));
+        assert_eq!(include_path_start("all: foo"), None);
+        assert_eq!(include_path_start("includex foo"), None);
+    }
+
+    #[test]
+    fn test_include_completions_rank_fragments_first() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.mk"), "").unwrap();
+        std::fs::write(dir.path().join("README.txt"), "").unwrap();
+        std::fs::write(dir.path().join("Makefile.local"), "").unwrap();
+
+        let text = "include \n";
+        let parsed = Makefile::parse(text);
+        let makefile = parsed.tree();
+        let completions = get_completions(&makefile, text, Position::new(0, 8), Some(dir.path()));
+
+        let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+        assert!(labels.contains(&"config.mk"), "got {:?}", labels);
+        assert!(labels.contains(&"Makefile.local"));
+        assert!(labels.contains(&"README.txt"));
+
+        let mk = completions.iter().find(|c| c.label == "config.mk").unwrap();
+        let readme = completions
+            .iter()
+            .find(|c| c.label == "README.txt")
+            .unwrap();
+        assert!(
+            mk.sort_text.as_deref() < readme.sort_text.as_deref(),
+            "fragment {:?} should rank before {:?}",
+            mk.sort_text,
+            readme.sort_text
+        );
+    }
+
+    #[test]
+    fn test_include_completions_partial_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.mk"), "").unwrap();
+        std::fs::create_dir(dir.path().join("rules")).unwrap();
+        std::fs::write(dir.path().join("rules").join("common.mk"), "").unwrap();
+
+        let text = "include rules/\n";
+        let parsed = Makefile::parse(text);
+        let makefile = parsed.tree();
+        let completions = get_completions(&makefile, text, Position::new(0, 14), Some(dir.path()));
+        let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+        assert!(labels.contains(&"rules/common.mk"), "got {:?}", labels);
     }
 
     #[test]

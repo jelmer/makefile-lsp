@@ -5,7 +5,8 @@ A Language Server Protocol (LSP) implementation for Makefiles, built in Rust.
 ## Features
 
 - **Diagnostics** - reports parse errors as you type
-- **Completions** - suggests targets, variables, and built-in functions
+- **Completions** - suggests targets, variables, built-in functions, and include paths
+- **Hover** - documents variables, automatic variables, built-in functions, and special targets such as `.PHONY` and `.NOTPARALLEL`
 - **Document symbols** - outline of targets and variable assignments
 - **Folding ranges** - collapse rules and multi-line definitions
 - **Semantic tokens** - syntax highlighting for targets, variables, prerequisites, recipes, and comments
@@ -51,7 +52,9 @@ Use a generic LSP client extension and configure it to run `makefile-lsp` for
 
 The `scip` subcommand produces a [SCIP](https://github.com/sourcegraph/scip)
 index covering targets and variables, which tools like Sourcegraph can use for
-code navigation. Lint and parse diagnostics are included in the index too, so
+code navigation. Each occurrence is tagged with a syntax kind so the index can
+drive syntax highlighting, built-in variables and special targets carry their
+documentation, and lint and parse diagnostics are included in the index too, so
 they can be surfaced inline:
 
 ```sh

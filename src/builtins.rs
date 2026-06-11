@@ -427,6 +427,14 @@ pub fn find_builtin_variable(name: &str) -> Option<&'static str> {
         .map(|(_, doc)| *doc)
 }
 
+/// Find a special target by name, returning its description.
+pub fn find_special_target(name: &str) -> Option<&'static str> {
+    SPECIAL_TARGETS
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, doc)| *doc)
+}
+
 /// Check if a variable name is a known built-in (variable, automatic, or function).
 pub fn is_known_variable(name: &str) -> bool {
     AUTOMATIC_VARIABLES.iter().any(|(n, _)| *n == name)
