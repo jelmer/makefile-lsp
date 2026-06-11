@@ -117,6 +117,9 @@ fn build_document(relative_path: &str, text: &str, base_dir: Option<&Path>) -> D
     let symbols = defined
         .into_iter()
         .map(|(symbol, (name, kind))| SymbolInformation {
+            documentation: builtin_documentation(&name, kind)
+                .map(|doc| vec![doc.to_string()])
+                .unwrap_or_default(),
             symbol,
             display_name: name,
             kind: kind.into(),
@@ -135,6 +138,18 @@ fn build_document(relative_path: &str, text: &str, base_dir: Option<&Path>) -> D
         symbols,
         position_encoding: PositionEncoding::UTF8CodeUnitOffsetFromLineStart.into(),
         ..Default::default()
+    }
+}
+
+/// Documentation for a defined symbol that is a GNU Make built-in, if any.
+///
+/// Targets are matched against the special targets (`.PHONY`, `.NOTPARALLEL`,
+/// ...); variables against the built-in variables (`CC`, `MAKE`, ...).
+fn builtin_documentation(name: &str, kind: symbol_information::Kind) -> Option<&'static str> {
+    match kind {
+        symbol_information::Kind::Function => crate::builtins::find_special_target(name),
+        symbol_information::Kind::Variable => crate::builtins::find_builtin_variable(name),
+        _ => None,
     }
 }
 
@@ -531,6 +546,45 @@ mod tests {
             all.kind.enum_value(),
             Ok(symbol_information::Kind::Function)
         );
+    }
+
+    #[test]
+    fn test_special_target_documentation() {
+        let text = "all: build\n\techo ok\nbuild:\n\techo b\n.PHONY: all\n";
+        let doc = build_document("Makefile", text, None);
+        let phony = doc
+            .symbols
+            .iter()
+            .find(|s| s.display_name == ".PHONY")
+            .unwrap();
+        assert_eq!(
+            phony.documentation,
+            vec!["Declare targets that do not represent files.".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_builtin_variable_documentation() {
+        let text = "CC = gcc\nall:\n\t$(CC) main.c\n";
+        let doc = build_document("Makefile", text, None);
+        let cc = doc.symbols.iter().find(|s| s.display_name == "CC").unwrap();
+        assert_eq!(
+            cc.documentation,
+            vec!["C compiler (default: cc).".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_user_symbols_have_no_documentation() {
+        let text = "FOO = bar\nall: build\n\techo ok\nbuild:\n\techo b\n";
+        let doc = build_document("Makefile", text, None);
+        for name in ["FOO", "all", "build"] {
+            let sym = doc.symbols.iter().find(|s| s.display_name == name).unwrap();
+            assert!(
+                sym.documentation.is_empty(),
+                "{name} should have no documentation"
+            );
+        }
     }
 
     #[test]

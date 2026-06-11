@@ -67,7 +67,7 @@ pub fn get_hover(makefile: &Makefile, source_text: &str, position: Position) -> 
     // Word in prerequisites area or at start of line (target name)
     if let Some(word) = word_at_offset(source_text, byte_offset) {
         // Check special targets
-        if let Some((_, doc)) = builtins::SPECIAL_TARGETS.iter().find(|(n, _)| *n == word) {
+        if let Some(doc) = builtins::find_special_target(word) {
             return Some(markdown_hover(format!("**`{}`**: {}", word, doc)));
         }
 
@@ -143,6 +143,15 @@ mod tests {
         let result = hover_text(text, Position::new(1, 0));
         assert!(result.is_some());
         assert!(result.unwrap().contains("do not represent files"));
+    }
+
+    #[test]
+    fn test_hover_notparallel_special_target() {
+        let text = "all:\n\techo ok\n.NOTPARALLEL:\n";
+        // ".NOTPARALLEL" on line 2, col 0
+        let result = hover_text(text, Position::new(2, 0));
+        assert!(result.is_some());
+        assert!(result.unwrap().contains("parallel execution"));
     }
 
     #[test]
