@@ -5,7 +5,7 @@ A Language Server Protocol (LSP) implementation for Makefiles, built in Rust.
 ## Features
 
 - **Diagnostics** - reports parse errors as you type
-- **Completions** - suggests targets, variables, and built-in functions
+- **Completions** - suggests targets, variables, built-in functions, and include paths
 - **Hover** - documents variables, automatic variables, built-in functions, and special targets such as `.PHONY` and `.NOTPARALLEL`
 - **Document symbols** - outline of targets and variable assignments
 - **Folding ranges** - collapse rules and multi-line definitions
