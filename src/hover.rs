@@ -24,10 +24,7 @@ pub fn get_hover(makefile: &Makefile, source_text: &str, position: Position) -> 
     // Variable reference: $(VAR) or ${VAR}
     if let Some(var_name) = variable_at_offset(source_text, byte_offset) {
         // Check automatic variables
-        if let Some((_, doc)) = builtins::AUTOMATIC_VARIABLES
-            .iter()
-            .find(|(n, _)| *n == var_name)
-        {
+        if let Some(doc) = builtins::find_automatic_variable(var_name) {
             return Some(markdown_hover(format!("**`${}`**: {}", var_name, doc)));
         }
 
@@ -125,6 +122,17 @@ mod tests {
         let result = hover_text(text, Position::new(1, 8));
         assert!(result.is_some());
         assert!(result.unwrap().contains("directory"));
+    }
+
+    #[test]
+    fn test_hover_automatic_variable_variant() {
+        let text = "all:\n\techo $(^F)\n";
+        // $ at col 6, ( at col 7, ^ at col 8
+        let result = hover_text(text, Position::new(1, 8));
+        assert!(result.is_some());
+        let content = result.unwrap();
+        assert!(content.contains("file-within-directory part"));
+        assert!(content.contains("$^"));
     }
 
     #[test]
