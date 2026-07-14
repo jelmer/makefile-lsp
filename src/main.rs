@@ -573,6 +573,11 @@ fn main() {
             std::process::exit(2);
         }
         Some("--help" | "-h") => print_usage(),
+        // Printed to stdout, unlike the usage message: the version is the
+        // result of this invocation, not a diagnostic. Without it, --version
+        // falls through to the catch-all arm below and silently starts a
+        // language server on stdin.
+        Some("--version" | "-V") => println!("makefile-lsp {}", env!("CARGO_PKG_VERSION")),
         Some(other) if !other.starts_with('-') => {
             eprintln!("makefile-lsp: unknown subcommand '{other}'");
             print_usage();
@@ -592,7 +597,8 @@ fn print_usage() {
         "makefile-lsp {}\n\n\
          Usage:\n  \
          makefile-lsp                  Run the language server over stdin/stdout\n  \
-         makefile-lsp scip [FILE...]   Generate a SCIP index for the given Makefiles\n\n\
+         makefile-lsp scip [FILE...]   Generate a SCIP index for the given Makefiles\n  \
+         makefile-lsp --version        Print the version\n\n\
          Run 'makefile-lsp scip --help' for SCIP options.",
         env!("CARGO_PKG_VERSION")
     );
@@ -603,7 +609,8 @@ fn print_usage() {
     eprintln!(
         "makefile-lsp {}\n\n\
          Usage:\n  \
-         makefile-lsp                  Run the language server over stdin/stdout",
+         makefile-lsp                  Run the language server over stdin/stdout\n  \
+         makefile-lsp --version        Print the version",
         env!("CARGO_PKG_VERSION")
     );
 }
