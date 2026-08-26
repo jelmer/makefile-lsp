@@ -242,6 +242,10 @@ pub const BUILTIN_VARIABLES: &[(&str, &str)] = &[
     ("MAKE", "The name of the make program being run."),
     ("MAKECMDGOALS", "The targets given on the command line."),
     (
+        "MAKEFILE_LIST",
+        "The names of the makefiles parsed by make, in the order they were parsed.",
+    ),
+    (
         "MAKEFLAGS",
         "Flags given to make, plus flags from MAKEFLAGS in the environment.",
     ),
@@ -259,12 +263,20 @@ pub const BUILTIN_VARIABLES: &[(&str, &str)] = &[
     ),
     ("MAKESHELL", "The shell to use (Windows only)."),
     (
+        "MAKE_HOST",
+        "A string describing the host system make was built to run on.",
+    ),
+    (
         "MAKE_RESTARTS",
         "The number of times this instance of make has restarted.",
     ),
     ("MAKE_TERMERR", "Non-empty if stderr is a terminal."),
     ("MAKE_TERMOUT", "Non-empty if stdout is a terminal."),
     ("MAKE_VERSION", "The version of GNU Make."),
+    (
+        "GNUMAKEFLAGS",
+        "GNU Make-specific flags from the environment; merged into MAKEFLAGS.",
+    ),
     ("MFLAGS", "Same as MAKEFLAGS; for historical compatibility."),
     ("SHELL", "The shell used to run recipes."),
     (

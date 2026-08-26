@@ -1230,6 +1230,24 @@ mod tests {
     }
 
     #[test]
+    fn test_makefile_list_no_warning() {
+        let text = "all:\n\techo $(lastword $(MAKEFILE_LIST))\n";
+        assert_eq!(diag_codes(text), Vec::<String>::new());
+    }
+
+    #[test]
+    fn test_make_host_no_warning() {
+        let text = "all:\n\techo $(MAKE_HOST)\n";
+        assert_eq!(diag_codes(text), Vec::<String>::new());
+    }
+
+    #[test]
+    fn test_gnumakeflags_no_warning() {
+        let text = "all:\n\techo $(GNUMAKEFLAGS)\n";
+        assert_eq!(diag_codes(text), Vec::<String>::new());
+    }
+
+    #[test]
     fn test_undefined_variable_in_value() {
         let text = "CFLAGS = $(UNDEFINED_VAR) -Wall\n";
         let codes = diag_codes(text);
