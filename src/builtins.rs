@@ -475,3 +475,115 @@ pub fn is_known_variable(name: &str) -> bool {
         || BUILTIN_VARIABLES.iter().any(|(n, _)| *n == name)
         || is_builtin_function(name)
 }
+
+/// A GNU Make directive (a keyword that starts a line, e.g. `include`).
+pub struct Directive {
+    /// Directive keyword.
+    pub name: &'static str,
+    /// Usage synopsis.
+    pub syntax: &'static str,
+    /// Short description.
+    pub doc: &'static str,
+}
+
+/// All GNU Make directives.
+pub const DIRECTIVES: &[Directive] = &[
+    Directive {
+        name: "include",
+        syntax: "include FILENAMES...",
+        doc: "Read the named makefiles before continuing. It is an error if a file does not exist and cannot be remade.",
+    },
+    Directive {
+        name: "-include",
+        syntax: "-include FILENAMES...",
+        doc: "Like `include`, but ignore files that do not exist and cannot be remade.",
+    },
+    Directive {
+        name: "sinclude",
+        syntax: "sinclude FILENAMES...",
+        doc: "Synonym for `-include`, for compatibility with other make implementations.",
+    },
+    Directive {
+        name: "ifeq",
+        syntax: "ifeq (ARG1,ARG2)",
+        doc: "Process the following lines if *ARG1* and *ARG2* are equal after expansion.",
+    },
+    Directive {
+        name: "ifneq",
+        syntax: "ifneq (ARG1,ARG2)",
+        doc: "Process the following lines if *ARG1* and *ARG2* differ after expansion.",
+    },
+    Directive {
+        name: "ifdef",
+        syntax: "ifdef VARIABLE",
+        doc: "Process the following lines if *VARIABLE* has a non-empty value.",
+    },
+    Directive {
+        name: "ifndef",
+        syntax: "ifndef VARIABLE",
+        doc: "Process the following lines if *VARIABLE* is undefined or empty.",
+    },
+    Directive {
+        name: "else",
+        syntax: "else [CONDITIONAL]",
+        doc: "Start the alternative branch of a conditional, optionally with another test.",
+    },
+    Directive {
+        name: "endif",
+        syntax: "endif",
+        doc: "End a conditional.",
+    },
+    Directive {
+        name: "define",
+        syntax: "define VARIABLE [=|:=|::=|+=|?=]",
+        doc: "Start a multi-line variable definition, terminated by `endef`.",
+    },
+    Directive {
+        name: "endef",
+        syntax: "endef",
+        doc: "End a multi-line variable definition started with `define`.",
+    },
+    Directive {
+        name: "undefine",
+        syntax: "undefine VARIABLE",
+        doc: "Remove a variable definition, as if it had never been set.",
+    },
+    Directive {
+        name: "export",
+        syntax: "export [VARIABLE...]",
+        doc: "Pass variables to the environment of recipes. Without arguments, export all variables by default.",
+    },
+    Directive {
+        name: "unexport",
+        syntax: "unexport [VARIABLE...]",
+        doc: "Do not pass variables to the environment of recipes. Without arguments, stop exporting variables by default.",
+    },
+    Directive {
+        name: "override",
+        syntax: "override VARIABLE = VALUE",
+        doc: "Set a variable even if it was also set on the command line.",
+    },
+    Directive {
+        name: "private",
+        syntax: "private VARIABLE = VALUE",
+        doc: "Do not let prerequisites inherit this (target-specific) variable.",
+    },
+    Directive {
+        name: "load",
+        syntax: "load OBJECT_FILE...",
+        doc: "Load a dynamic object that extends make, e.g. with new functions. It is an error if it cannot be loaded.",
+    },
+    Directive {
+        name: "-load",
+        syntax: "-load OBJECT_FILE...",
+        doc: "Like `load`, but ignore objects that cannot be loaded.",
+    },
+    Directive {
+        name: "vpath",
+        syntax: "vpath [PATTERN [DIRECTORIES]]",
+        doc: "Set the search path for prerequisites matching *PATTERN*. With only a pattern, clear its search path; with no arguments, clear all search paths.",
+    },
+];
+
+/// Directives that open a conditional, valid after `else`.
+pub const CONDITIONAL_DIRECTIVES: &[&str] = &["ifeq", "ifneq", "ifdef", "ifndef"];
