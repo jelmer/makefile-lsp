@@ -33,6 +33,8 @@ Makefile is never executed.
 - **Semantic tokens** - highlighting for targets, variables, prerequisites,
   recipes and comments
 - **On-type formatting** - inserts a tab after pressing enter on a rule line
+- **Command-line checking** - report diagnostics in CI, as text or SARIF
+  (see below)
 - **SCIP indexing** - generate a [SCIP](https://github.com/sourcegraph/scip)
   index for code navigation (see below)
 
@@ -118,6 +120,29 @@ The `vscode-makefile` directory contains a VS Code extension that runs
 
 The `coc-make` directory contains a [coc.nvim](https://github.com/neoclide/coc.nvim)
 extension; see its README for details.
+
+## Checking from the command line
+
+The `check` subcommand reports the same diagnostics the language server
+publishes, which is useful in CI. Directories are searched recursively
+(skipping hidden directories) for `Makefile`, `makefile`, `GNUmakefile`, `*.mk`
+and `*.mak`; with no arguments the current directory is searched:
+
+```sh
+makefile-lsp check                       # check all Makefiles under .
+makefile-lsp check Makefile build/
+makefile-lsp check --format sarif > makefile-lsp.sarif
+```
+
+Diagnostics are printed as `path:line:column: severity: message [code]`. Use
+`--format sarif` to produce SARIF 2.1.0, e.g. for GitHub code scanning.
+
+Only errors and warnings are reported by default, as hints flag stylistic
+issues that are often intentional. Use `--severity hint` to include them, or
+`--severity error` to report errors only.
+
+The exit status is 0 when nothing was reported, 1 when diagnostics were
+reported and 2 on usage or I/O errors.
 
 ## SCIP indexing
 
