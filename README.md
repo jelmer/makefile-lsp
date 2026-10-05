@@ -15,8 +15,9 @@ Makefile is never executed.
   paths after `include`
 - **Hover** - the definition of user-defined variables, documentation for
   automatic variables, built-in variables, built-in functions and special
-  targets such as `.PHONY`, and the prerequisites and recipe of a target
-  referenced as a prerequisite
+  targets such as `.PHONY`, the prerequisites and recipe of a target, where it
+  is defined or referenced as a prerequisite, and the comment lines directly
+  above the definition of a target or variable
 - **Signature help** - parameter information inside built-in function calls
   like `$(subst from,to,text)`
 - **Go to definition** - from a variable reference to its assignment, and from
