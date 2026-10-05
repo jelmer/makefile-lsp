@@ -2,7 +2,9 @@
 
 use std::collections::HashSet;
 
-use makefile_lossless::{Conditional, Makefile, Parse, SyntaxKind, VariableReference};
+use makefile_lossless::{
+    Conditional, Makefile, Parse, ParseErrorKind, SyntaxKind, VariableReference,
+};
 use rowan::ast::AstNode;
 use tower_lsp_server::ls_types::{
     CodeAction, CodeActionKind, Position, Range, TextEdit, Uri, WorkspaceEdit,
@@ -51,6 +53,12 @@ pub fn get_code_actions(
         uri,
     ));
     actions.extend(add_missing_endif_action(
+        parsed,
+        source_text,
+        byte_offset,
+        uri,
+    ));
+    actions.extend(add_missing_endef_action(
         parsed,
         source_text,
         byte_offset,
@@ -394,6 +402,72 @@ fn add_missing_endif_action(
 
     Some(CodeAction {
         title: "Add missing endif".to_string(),
+        kind: Some(CodeActionKind::QUICKFIX),
+        edit: Some(WorkspaceEdit {
+            changes: Some(changes),
+            ..Default::default()
+        }),
+        ..Default::default()
+    })
+}
+
+/// Offer "Insert missing endef" when the cursor is inside a `define` block
+/// that runs to the end of the file without a matching `endef`.
+///
+/// makefile-lossless has no API to add an `endef`, so this appends it as text.
+fn add_missing_endef_action(
+    parsed: &Parse<Makefile>,
+    source_text: &str,
+    byte_offset: usize,
+    uri: &Uri,
+) -> Option<CodeAction> {
+    let offset = text_size::TextSize::from(byte_offset as u32);
+
+    let error = parsed
+        .positioned_errors()
+        .iter()
+        .find(|e| e.kind() == ParseErrorKind::MissingEndef)?;
+    // The error covers the `define` keyword of the unterminated block.
+    let define = parsed
+        .tree()
+        .syntax()
+        .covering_element(error.range)
+        .ancestors()
+        .find(|n| n.kind() == SyntaxKind::VARIABLE)?;
+    if !define.text_range().contains_inclusive(offset) {
+        return None;
+    }
+
+    // Nested defines are part of the body text, so count how many are open.
+    let body = define.text().to_string();
+    let depth = body
+        .lines()
+        .filter_map(|line| line.split_whitespace().next())
+        .fold(0usize, |depth, word| match word {
+            "define" => depth + 1,
+            "endef" => depth.saturating_sub(1),
+            _ => depth,
+        });
+    if depth == 0 {
+        return None;
+    }
+
+    let mut new_text = String::new();
+    if !body.ends_with('\n') {
+        new_text.push('\n');
+    }
+    new_text.push_str(&"endef\n".repeat(depth));
+    let end = offset_to_position(source_text, define.text_range().end());
+    let edit = TextEdit {
+        range: Range::new(end, end),
+        new_text,
+    };
+
+    let mut changes = std::collections::HashMap::new();
+    changes.insert(uri.clone(), vec![edit]);
+
+    Some(CodeAction {
+        title: "Insert missing endef".to_string(),
         kind: Some(CodeActionKind::QUICKFIX),
         edit: Some(WorkspaceEdit {
             changes: Some(changes),
@@ -1123,6 +1197,84 @@ mod tests {
             apply_edit(text, edit),
             "ifdef OUTER\nifdef INNER\nVAR = 1\nendif\nendif\n"
         );
+    }
+
+    #[test]
+    fn test_insert_missing_endef_action() {
+        let text = "define greeting\necho hello\n";
+        let actions = parse_and_actions(text, Position::new(1, 2));
+        let action = actions
+            .iter()
+            .find(|a| a.title == "Insert missing endef")
+            .expect("expected quickfix");
+        assert_eq!(
+            apply_edit(text, only_edit(action)),
+            "define greeting\necho hello\nendef\n"
+        );
+    }
+
+    #[test]
+    fn test_insert_missing_endef_without_trailing_newline() {
+        let text = "all:\n\techo\ndefine greeting\necho hello";
+        let actions = parse_and_actions(text, Position::new(2, 0));
+        let action = actions
+            .iter()
+            .find(|a| a.title == "Insert missing endef")
+            .expect("expected quickfix");
+        assert_eq!(
+            apply_edit(text, only_edit(action)),
+            "all:\n\techo\ndefine greeting\necho hello\nendef\n"
+        );
+    }
+
+    #[test]
+    fn test_insert_missing_endef_nested() {
+        let text = "define outer\ndefine inner\nbody\n";
+        let actions = parse_and_actions(text, Position::new(0, 0));
+        let action = actions
+            .iter()
+            .find(|a| a.title == "Insert missing endef")
+            .expect("expected quickfix");
+        assert_eq!(
+            apply_edit(text, only_edit(action)),
+            "define outer\ndefine inner\nbody\nendef\nendef\n"
+        );
+    }
+
+    #[test]
+    fn test_no_insert_endef_for_override_define_in_body() {
+        // Like make, only a bare `define` nests.
+        let text = "define outer\noverride define inner\nbody\nendef\n";
+        let actions = parse_and_actions(text, Position::new(2, 0));
+        assert!(!actions.iter().any(|a| a.title == "Insert missing endef"));
+    }
+
+    #[test]
+    fn test_insert_missing_endef_in_conditional() {
+        let text = "ifdef X\ndefine g\nbody\n";
+        let actions = parse_and_actions(text, Position::new(2, 0));
+        let action = actions
+            .iter()
+            .find(|a| a.title == "Insert missing endef")
+            .expect("expected quickfix");
+        assert_eq!(
+            apply_edit(text, only_edit(action)),
+            "ifdef X\ndefine g\nbody\nendef\n"
+        );
+    }
+
+    #[test]
+    fn test_no_insert_endef_when_terminated() {
+        let text = "define greeting\necho hello\nendef\n";
+        let actions = parse_and_actions(text, Position::new(1, 0));
+        assert!(!actions.iter().any(|a| a.title == "Insert missing endef"));
+    }
+
+    #[test]
+    fn test_no_insert_endef_outside_define() {
+        let text = "all:\n\techo\ndefine greeting\necho hello\n";
+        let actions = parse_and_actions(text, Position::new(0, 1));
+        assert!(!actions.iter().any(|a| a.title == "Insert missing endef"));
     }
 
     #[test]
