@@ -1,6 +1,7 @@
 //! Makefile Language Server Protocol implementation.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tower_lsp_server::jsonrpc::{Error, Result};
@@ -54,6 +55,8 @@ struct Backend {
     client: Client,
     workspace: Arc<Mutex<Workspace>>,
     diagnostics: Arc<Mutex<HashMap<Uri, PublishedDiagnostics>>>,
+    /// Whether the client can watch files for us.
+    watch_files: AtomicBool,
 }
 
 impl Backend {
@@ -62,6 +65,7 @@ impl Backend {
             client,
             workspace: Arc::new(Mutex::new(Workspace::new())),
             diagnostics: Arc::new(Mutex::new(HashMap::new())),
+            watch_files: AtomicBool::new(false),
         }
     }
 
@@ -74,11 +78,11 @@ impl Backend {
     }
 
     async fn update_file(&self, uri: Uri, text: String) {
-        let (doc, files) = {
+        let (doc, files, dependents) = {
             let mut workspace = self.workspace.lock().await;
             let doc = workspace.open(uri.clone(), text);
             let files = workspace.file_set(&uri).expect("document was just opened");
-            (doc, files)
+            (doc, files, workspace.dependents(&uri))
         };
         let diagnostics = diagnostics::get_file_set_diagnostics(&files);
 
@@ -94,6 +98,74 @@ impl Backend {
         self.client
             .publish_diagnostics(uri, diagnostics, None)
             .await;
+
+        self.republish(dependents).await;
+    }
+
+    /// Recompute and publish diagnostics for open documents.
+    async fn republish(&self, uris: Vec<Uri>) {
+        for uri in uris {
+            let Some(files) = self.file_set(&uri).await else {
+                continue;
+            };
+            let diagnostics = diagnostics::get_file_set_diagnostics(&files);
+            let all = {
+                let mut published = self.diagnostics.lock().await;
+                // If the text changed, update_file is about to publish.
+                let Some(entry) = published
+                    .get_mut(&uri)
+                    .filter(|p| p.doc.text() == files.current().text())
+                else {
+                    continue;
+                };
+                entry.file = diagnostics;
+                entry.all()
+            };
+            self.client.publish_diagnostics(uri, all, None).await;
+        }
+    }
+
+    /// Ask the client to tell us about changes to makefiles on disk, so
+    /// diagnostics of open documents that include them can be refreshed.
+    ///
+    /// Only common makefile names are watched; requests re-check every
+    /// included file's mtime anyway, so other included files are picked up
+    /// on the next edit.
+    async fn register_file_watchers(&self) {
+        let watchers = [
+            "**/*.mk",
+            "**/*.make",
+            "**/Makefile",
+            "**/makefile",
+            "**/GNUmakefile",
+        ]
+        .iter()
+        .map(|glob| FileSystemWatcher {
+            glob_pattern: GlobPattern::String(glob.to_string()),
+            kind: None,
+        })
+        .collect();
+        let options =
+            match serde_json::to_value(DidChangeWatchedFilesRegistrationOptions { watchers }) {
+                Ok(options) => options,
+                Err(e) => {
+                    tracing::error!("unable to serialize file watcher options: {e}");
+                    return;
+                }
+            };
+        let registration = Registration {
+            id: "makefile-watcher".to_string(),
+            method: "workspace/didChangeWatchedFiles".to_string(),
+            register_options: Some(options),
+        };
+        if let Err(e) = self.client.register_capability(vec![registration]).await {
+            self.client
+                .log_message(
+                    MessageType::WARNING,
+                    format!("unable to register file watchers: {e}"),
+                )
+                .await;
+        }
     }
 
     /// Check the recipes of an open file for shell syntax errors in the
@@ -152,6 +224,14 @@ impl LanguageServer for Backend {
                 .collect(),
         };
         self.workspace.lock().await.set_roots(roots);
+        let watch_files = params
+            .capabilities
+            .workspace
+            .as_ref()
+            .and_then(|w| w.did_change_watched_files.as_ref())
+            .and_then(|w| w.dynamic_registration)
+            .unwrap_or(false);
+        self.watch_files.store(watch_files, Ordering::Relaxed);
 
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
@@ -234,6 +314,9 @@ impl LanguageServer for Backend {
     }
 
     async fn initialized(&self, _: InitializedParams) {
+        if self.watch_files.load(Ordering::Relaxed) {
+            self.register_file_watchers().await;
+        }
         self.client
             .log_message(MessageType::INFO, "Makefile LSP initialized!")
             .await;
@@ -256,8 +339,41 @@ impl LanguageServer for Backend {
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         let uri = params.text_document.uri;
-        self.workspace.lock().await.close(&uri);
+        let dependents = {
+            let mut workspace = self.workspace.lock().await;
+            let dependents = workspace.dependents(&uri);
+            workspace.close(&uri);
+            dependents
+        };
         self.diagnostics.lock().await.remove(&uri);
+        // The file on disk may differ from the unsaved buffer.
+        self.republish(dependents).await;
+    }
+
+    async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
+        let uris = {
+            let mut workspace = self.workspace.lock().await;
+            let mut uris: Vec<Uri> = Vec::new();
+            for change in &params.changes {
+                let Some(path) = workspace::file_path(&change.uri) else {
+                    continue;
+                };
+                workspace.invalidate(&path);
+                // A new or removed file may change how includes resolve
+                // anywhere, so refresh everything.
+                if change.typ != FileChangeType::CHANGED {
+                    uris = workspace.open_documents();
+                    break;
+                }
+                for uri in workspace.open_documents_seeing(&path) {
+                    if !uris.contains(&uri) {
+                        uris.push(uri);
+                    }
+                }
+            }
+            uris
+        };
+        self.republish(uris).await;
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {

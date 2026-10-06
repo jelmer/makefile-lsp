@@ -24,6 +24,13 @@ const MAX_FILES: usize = 256;
 /// Included files larger than this are not loaded.
 const MAX_FILE_SIZE: u64 = 4 * 1024 * 1024;
 
+/// The names make looks for when run without `-f`, in order.
+const DEFAULT_MAKEFILES: &[&str] = &["GNUmakefile", "makefile", "Makefile"];
+
+/// How many directories above a document to look for a makefile that may
+/// include it, when the document isn't inside a workspace folder.
+const MAX_PROBE_DEPTH: usize = 2;
+
 /// A parsed makefile, either an open editor buffer or a file read from disk.
 pub struct Document {
     uri: Uri,
@@ -479,6 +486,10 @@ pub struct Workspace {
     includes: HashMap<PathBuf, BTreeSet<PathBuf>>,
     /// The reverse of `includes`.
     included_by: HashMap<PathBuf, BTreeSet<PathBuf>>,
+    /// Makefiles checked for includes of nearby files, with their mtime then.
+    probed: HashMap<PathBuf, SystemTime>,
+    /// The paths in the last file set built for each open document.
+    visible: HashMap<Uri, BTreeSet<PathBuf>>,
     /// Workspace folders.
     roots: Vec<PathBuf>,
 }
@@ -504,6 +515,7 @@ impl Workspace {
 
     /// Forget an open editor buffer; the file on disk is used from now on.
     pub fn close(&mut self, uri: &Uri) {
+        self.visible.remove(uri);
         if let Some(path) = self.open.remove(uri).and_then(|d| d.path.clone()) {
             self.open_paths.remove(&path);
         }
@@ -525,6 +537,7 @@ impl Workspace {
         let mut includes = walk.includes.remove(uri).unwrap_or_default();
 
         if let Some(path) = current.path() {
+            self.probe_includers(path);
             for root in self.roots_including(path) {
                 let Some(root_walk) = self.walk_from(&root) else {
                     continue;
@@ -545,12 +558,114 @@ impl Workspace {
             }
         }
 
+        self.visible.insert(
+            uri.clone(),
+            docs.iter()
+                .filter_map(|d| d.path().map(Path::to_path_buf))
+                .collect(),
+        );
         let editable = docs.iter().map(|d| self.is_editable(d)).collect();
         Some(FileSet {
             docs,
             editable,
             includes,
         })
+    }
+
+    /// Open documents other than `uri` whose diagnostics may depend on it:
+    /// those that saw it in their last file set, and those in its own last
+    /// file set.
+    pub fn dependents(&self, uri: &Uri) -> Vec<Uri> {
+        let own = self.visible.get(uri);
+        let path = file_path(uri);
+        let mut dependents: Vec<Uri> = self
+            .open
+            .values()
+            .filter(|doc| doc.uri() != uri)
+            .filter(|doc| {
+                let seen_by_doc = path
+                    .as_ref()
+                    .is_some_and(|p| self.visible.get(doc.uri()).is_some_and(|v| v.contains(p)));
+                let seen_by_uri = doc
+                    .path()
+                    .is_some_and(|p| own.is_some_and(|v| v.contains(p)));
+                seen_by_doc || seen_by_uri
+            })
+            .map(|doc| doc.uri().clone())
+            .collect();
+        dependents.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        dependents
+    }
+
+    /// Open documents whose last file set contained `path`.
+    pub fn open_documents_seeing(&self, path: &Path) -> Vec<Uri> {
+        let mut uris: Vec<Uri> = self
+            .visible
+            .iter()
+            .filter(|(_, paths)| paths.contains(path))
+            .map(|(uri, _)| uri.clone())
+            .collect();
+        uris.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        uris
+    }
+
+    pub fn open_documents(&self) -> Vec<Uri> {
+        let mut uris: Vec<Uri> = self.open.keys().cloned().collect();
+        uris.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        uris
+    }
+
+    /// Drop the cached copy of a file that changed on disk.
+    pub fn invalidate(&mut self, path: &Path) {
+        self.disk.remove(&normalize(path));
+    }
+
+    /// Look for makefiles that may include `path` in its directory and the
+    /// ones above it, and record what they include.
+    ///
+    /// The search stops at the workspace folder containing `path`, or after
+    /// `MAX_PROBE_DEPTH` levels if there is none. Each makefile is only
+    /// re-read when it changes.
+    fn probe_includers(&mut self, path: &Path) {
+        let root = self
+            .roots
+            .iter()
+            .filter(|r| path.starts_with(r))
+            .max_by_key(|r| r.components().count())
+            .cloned();
+        let mut depth = 0;
+        let mut dir = path.parent();
+        while let Some(d) = dir {
+            if let Some(candidate) = DEFAULT_MAKEFILES
+                .iter()
+                .map(|name| d.join(name))
+                .find(|c| c.is_file())
+            {
+                if candidate != path && !self.open_paths.contains_key(&candidate) {
+                    self.probe(&candidate);
+                }
+            }
+            if root.as_deref() == Some(d) || (root.is_none() && depth >= MAX_PROBE_DEPTH) {
+                break;
+            }
+            depth += 1;
+            dir = d.parent();
+        }
+    }
+
+    fn probe(&mut self, makefile: &Path) {
+        let mtime = match std::fs::metadata(makefile).and_then(|m| m.modified()) {
+            Ok(mtime) => mtime,
+            Err(e) => {
+                tracing::warn!("unable to stat {}: {e}", makefile.display());
+                return;
+            }
+        };
+        if self.probed.get(makefile) == Some(&mtime) {
+            return;
+        }
+        self.probed.insert(makefile.to_path_buf(), mtime);
+        self.walk_from(makefile);
     }
 
     fn is_editable(&self, doc: &Document) -> bool {
@@ -737,6 +852,8 @@ pub mod tests {
         /// A workspace with `name` opened from disk.
         pub fn open(&self, name: &str) -> (Workspace, Uri) {
             let mut ws = Workspace::new();
+            // Keep the search for including makefiles inside the fixture.
+            ws.set_roots(vec![self.path("")]);
             let uri = self.open_in(&mut ws, name);
             (ws, uri)
         }
@@ -1043,5 +1160,64 @@ pub mod tests {
         assert!(set.is_editable(&uri));
         assert!(set.is_editable(&fx.uri("ws/inside.mk")));
         assert!(!set.is_editable(&fx.uri("outside.mk")));
+    }
+
+    #[test]
+    fn test_fragment_finds_makefile_nearby() {
+        let fx = Fixture::new(&[
+            ("Makefile", "TOP = 1\ninclude mk/rules.mk\n"),
+            ("mk/rules.mk", "include mk/other.mk\n"),
+            ("mk/other.mk", "O = 1\n"),
+        ]);
+        let set = fx.file_set("mk/rules.mk");
+        // mk/other.mk is relative to the top-level directory, so it's only
+        // found when following includes from the Makefile.
+        assert_eq!(
+            fx.names(&set),
+            vec!["mk/rules.mk", "Makefile", "mk/other.mk"]
+        );
+    }
+
+    #[test]
+    fn test_probe_rereads_changed_makefile() {
+        let fx = Fixture::new(&[("Makefile", "all:\n"), ("rules.mk", "")]);
+        let (mut ws, rules) = fx.open("rules.mk");
+        assert_eq!(fx.names(&ws.file_set(&rules).unwrap()), vec!["rules.mk"]);
+        // Make sure the modification time changes.
+        let later = SystemTime::now() + std::time::Duration::from_secs(10);
+        std::fs::write(fx.path("Makefile"), "include rules.mk\n").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(fx.path("Makefile"))
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
+        assert_eq!(
+            fx.names(&ws.file_set(&rules).unwrap()),
+            vec!["rules.mk", "Makefile"]
+        );
+    }
+
+    #[test]
+    fn test_dependents() {
+        let fx = Fixture::new(&[
+            ("Makefile", "include a.mk\n"),
+            ("a.mk", ""),
+            ("other/Makefile", ""),
+        ]);
+        let (mut ws, makefile) = fx.open("Makefile");
+        let a = fx.open_in(&mut ws, "a.mk");
+        let other = fx.open_in(&mut ws, "other/Makefile");
+        for uri in [&makefile, &a, &other] {
+            ws.file_set(uri).unwrap();
+        }
+        assert_eq!(ws.dependents(&a), vec![makefile.clone()]);
+        assert_eq!(ws.dependents(&makefile), vec![a.clone()]);
+        assert_eq!(ws.dependents(&other), Vec::<Uri>::new());
+        assert_eq!(ws.open_documents_seeing(&fx.path("a.mk")), {
+            let mut v = vec![makefile, a];
+            v.sort_by(|x, y| x.as_str().cmp(y.as_str()));
+            v
+        });
     }
 }
