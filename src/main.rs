@@ -8,6 +8,7 @@ use tower_lsp_server::ls_types::*;
 use tower_lsp_server::{Client, LanguageServer, LspService, Server};
 
 mod builtins;
+mod check;
 mod code_actions;
 mod completion;
 mod dep_graph;
@@ -572,6 +573,7 @@ fn main() {
             eprintln!("makefile-lsp: built without SCIP support (enable the 'scip' feature)");
             std::process::exit(2);
         }
+        Some("check") => std::process::exit(check::run(&args[2..])),
         Some("--help" | "-h") => print_usage(),
         // Printed to stdout, unlike the usage message: the version is the
         // result of this invocation, not a diagnostic. Without it, --version
@@ -597,9 +599,10 @@ fn print_usage() {
         "makefile-lsp {}\n\n\
          Usage:\n  \
          makefile-lsp                  Run the language server over stdin/stdout\n  \
+         makefile-lsp check [PATH...]  Report diagnostics for Makefiles\n  \
          makefile-lsp scip [FILE...]   Generate a SCIP index for the given Makefiles\n  \
          makefile-lsp --version        Print the version\n\n\
-         Run 'makefile-lsp scip --help' for SCIP options.",
+         Run 'makefile-lsp check --help' or 'makefile-lsp scip --help' for options.",
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -610,7 +613,9 @@ fn print_usage() {
         "makefile-lsp {}\n\n\
          Usage:\n  \
          makefile-lsp                  Run the language server over stdin/stdout\n  \
-         makefile-lsp --version        Print the version",
+         makefile-lsp check [PATH...]  Report diagnostics for Makefiles\n  \
+         makefile-lsp --version        Print the version\n\n\
+         Run 'makefile-lsp check --help' for options.",
         env!("CARGO_PKG_VERSION")
     );
 }

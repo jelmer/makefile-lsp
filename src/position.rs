@@ -83,6 +83,22 @@ pub fn try_position_to_offset(text: &str, position: Position) -> Option<TextSize
     None
 }
 
+/// Convert the UTF-16 column of an LSP position into a column counted in
+/// Unicode scalar values. Columns beyond the end of the line are clamped.
+pub fn utf16_to_char_column(text: &str, position: Position) -> u32 {
+    let line = text.split('\n').nth(position.line as usize).unwrap_or("");
+    let mut utf16_col = 0u32;
+    let mut chars = 0u32;
+    for ch in line.chars() {
+        if utf16_col >= position.character {
+            break;
+        }
+        utf16_col += ch.len_utf16() as u32;
+        chars += 1;
+    }
+    chars
+}
+
 /// Convert LSP Range to TextRange
 pub fn try_lsp_range_to_text_range(text: &str, range: &Range) -> Option<TextRange> {
     let start = try_position_to_offset(text, range.start)?;
@@ -130,6 +146,17 @@ mod tests {
         let range = Range::new(Position::new(0, 0), Position::new(0, 3));
         let text_range = try_lsp_range_to_text_range(text, &range).unwrap();
         assert_eq!(&text[..usize::from(text_range.end())], "all");
+    }
+
+    #[test]
+    fn test_utf16_to_char_column() {
+        let text = "a\n\u{1F600}x\u{e9}y\n";
+        assert_eq!(utf16_to_char_column(text, Position::new(0, 1)), 1);
+        // The emoji is two UTF-16 code units but one character.
+        assert_eq!(utf16_to_char_column(text, Position::new(1, 2)), 1);
+        assert_eq!(utf16_to_char_column(text, Position::new(1, 4)), 3);
+        assert_eq!(utf16_to_char_column(text, Position::new(1, 99)), 4);
+        assert_eq!(utf16_to_char_column(text, Position::new(5, 3)), 0);
     }
 
     #[test]
