@@ -12,6 +12,7 @@ mod builtins;
 mod check;
 mod code_actions;
 mod completion;
+mod conditionals;
 mod dep_graph;
 mod diagnostics;
 mod document_links;

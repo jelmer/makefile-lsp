@@ -191,6 +191,19 @@ mod tests {
     }
 
     #[test]
+    fn test_depth_hint_ignores_paths_across_exclusive_branches() {
+        // a -> b -> c -> d would need both branches of the conditional.
+        let text = "ifdef X\na: b\nelse\nb: c\nendif\nc: d\nd:\n";
+        assert_eq!(depth_hints(text), Vec::<String>::new());
+    }
+
+    #[test]
+    fn test_depth_hint_within_one_branch() {
+        let text = "ifdef X\na: b\nb: c\nendif\nc:\n";
+        assert_eq!(depth_hints(text), vec!["depth 2".to_string()]);
+    }
+
+    #[test]
     fn test_no_depth_hint_below_threshold() {
         // a -> b: depth is only 1, below the threshold of 2.
         let text = "a: b\n\t@:\nb:\n\t@:\n";
