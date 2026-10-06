@@ -128,7 +128,7 @@ pub fn get_code_actions(
     if let Some(dir) = current.dir() {
         actions.extend(create_target_action(
             files,
-            &makefile,
+            parsed,
             source_text,
             byte_offset,
             uri,
@@ -142,15 +142,19 @@ pub fn get_code_actions(
 /// Offer "Create target for X" on a prerequisite that no rule in the file
 /// set builds and that is not an existing file, appending an empty `X:`
 /// rule at the end of the file.
+///
+/// Not offered for names that can not be written as a target, such as
+/// `.include`, which would read back as a directive.
 fn create_target_action(
     files: &FileSet,
-    makefile: &Makefile,
+    parsed: &Parse<Makefile>,
     source_text: &str,
     byte_offset: usize,
     uri: &Uri,
     base_dir: &Path,
 ) -> Option<CodeAction> {
     let offset = text_size::TextSize::from(byte_offset as u32);
+    let makefile = parsed.tree();
     let prerequisite = makefile
         .syntax()
         .descendants()
@@ -184,25 +188,20 @@ fn create_target_action(
         return None;
     }
 
-    let eol = if source_text.contains("\r\n") {
-        "\r\n"
-    } else {
-        "\n"
-    };
-    let separator = if source_text.is_empty() || source_text.ends_with(&format!("{eol}{eol}")) {
-        String::new()
-    } else if source_text.ends_with('\n') {
-        eol.to_string()
-    } else {
-        format!("{eol}{eol}")
-    };
-    let end = offset_to_position(source_text, text_size::TextSize::of(source_text));
-    let edit = TextEdit {
-        range: Range::new(end, end),
-        new_text: format!(
-            "{separator}{}:{eol}",
-            prerequisite.text().to_string().trim()
-        ),
+    let original_range = makefile.syntax().text_range();
+    let mut updated = parsed.tree();
+    updated.try_add_rule(&name).ok()?;
+    // The rule is appended, so only the new text needs to be inserted.
+    let updated_text = updated.syntax().text().to_string();
+    let edit = match updated_text.strip_prefix(source_text) {
+        Some(appended) => {
+            let end = offset_to_position(source_text, original_range.end());
+            TextEdit {
+                range: Range::new(end, end),
+                new_text: appended.to_string(),
+            }
+        }
+        None => edit_for_node_change(source_text, original_range, updated.syntax()),
     };
 
     let mut changes = std::collections::HashMap::new();
@@ -2072,11 +2071,33 @@ mod tests {
     fn test_create_target_action_escaped() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(
-            create_target_action("all: a\\#b\n\n", Position::new(0, 6), dir.path()),
+            create_target_action("all: a\\#b\n", Position::new(0, 6), dir.path()),
             Some((
                 "Create target for 'a#b'".to_string(),
                 "all: a\\#b\n\na\\#b:\n".to_string()
             ))
+        );
+    }
+
+    #[test]
+    fn test_create_target_action_crlf() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            create_target_action("all: foo\r\n\techo\r\n", Position::new(0, 6), dir.path()),
+            Some((
+                "Create target for 'foo'".to_string(),
+                "all: foo\r\n\techo\r\n\r\nfoo:\r\n".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn test_no_create_target_action_for_unwritable_name() {
+        let dir = tempfile::tempdir().unwrap();
+        // `.include:` would read back as a BSD include directive.
+        assert_eq!(
+            create_target_action("all: .include\n", Position::new(0, 6), dir.path()),
+            None
         );
     }
 
