@@ -397,6 +397,8 @@ pub struct FileSet {
     /// The current document first, then the others in the order make reads
     /// them.
     docs: Vec<Arc<Document>>,
+    /// Whether each document may be edited by a rename.
+    editable: Vec<bool>,
     /// The include directives of the current document.
     includes: Vec<ResolvedInclude>,
 }
@@ -407,6 +409,7 @@ impl FileSet {
     pub fn single(doc: Document) -> Self {
         Self {
             docs: vec![Arc::new(doc)],
+            editable: vec![true],
             includes: Vec::new(),
         }
     }
@@ -418,6 +421,16 @@ impl FileSet {
     /// All documents, starting with the current one.
     pub fn docs(&self) -> impl Iterator<Item = &Document> {
         self.docs.iter().map(|d| d.as_ref())
+    }
+
+    /// Whether a rename may edit `uri`: open documents and files inside the
+    /// workspace folders are editable, files elsewhere (such as system-wide
+    /// makefile fragments) are not.
+    pub fn is_editable(&self, uri: &Uri) -> bool {
+        self.docs
+            .iter()
+            .zip(&self.editable)
+            .any(|(d, e)| *e && d.uri() == uri)
     }
 
     /// The include directives of the current document.
@@ -527,7 +540,20 @@ impl Workspace {
             }
         }
 
-        Some(FileSet { docs, includes })
+        let editable = docs.iter().map(|d| self.is_editable(d)).collect();
+        Some(FileSet {
+            docs,
+            editable,
+            includes,
+        })
+    }
+
+    fn is_editable(&self, doc: &Document) -> bool {
+        if self.open.contains_key(doc.uri()) || self.roots.is_empty() {
+            return true;
+        }
+        doc.path()
+            .is_some_and(|p| self.roots.iter().any(|r| p.starts_with(r)))
     }
 
     /// The topmost known makefiles that (transitively) include `path`.
@@ -996,5 +1022,21 @@ pub mod tests {
         let a = fx.open_in(&mut ws, "a.mk");
         let set = ws.file_set(&a).unwrap();
         assert_eq!(fx.names(&set), vec!["a.mk"]);
+    }
+
+    #[test]
+    fn test_editable() {
+        let fx = Fixture::new(&[
+            ("ws/Makefile", "include ../outside.mk inside.mk\n"),
+            ("ws/inside.mk", ""),
+            ("outside.mk", ""),
+        ]);
+        let mut ws = Workspace::new();
+        ws.set_roots(vec![fx.path("ws")]);
+        let uri = fx.open_in(&mut ws, "ws/Makefile");
+        let set = ws.file_set(&uri).unwrap();
+        assert!(set.is_editable(&uri));
+        assert!(set.is_editable(&fx.uri("ws/inside.mk")));
+        assert!(!set.is_editable(&fx.uri("outside.mk")));
     }
 }

@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tower_lsp_server::jsonrpc::Result;
+use tower_lsp_server::jsonrpc::{Error, Result};
 use tower_lsp_server::ls_types::*;
 use tower_lsp_server::{Client, LanguageServer, LspService, Server};
 
@@ -318,31 +318,24 @@ impl LanguageServer for Backend {
         &self,
         params: TextDocumentPositionParams,
     ) -> Result<Option<PrepareRenameResponse>> {
-        let uri = &params.text_document.uri;
-        let position = params.position;
-
-        let Some(doc) = self.document(uri).await else {
+        let Some(files) = self.file_set(&params.text_document.uri).await else {
             return Ok(None);
         };
-
-        let makefile = doc.makefile();
-        let result = rename::prepare_rename(&makefile, doc.text(), position);
-
-        Ok(result)
+        rename::prepare_rename(&files, params.position)
+            .transpose()
+            .map_err(|e| Error::invalid_params(e.to_string()))
     }
 
     async fn rename(&self, params: RenameParams) -> Result<Option<WorkspaceEdit>> {
         let uri = &params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
 
-        let Some(doc) = self.document(uri).await else {
+        let Some(files) = self.file_set(uri).await else {
             return Ok(None);
         };
-
-        let makefile = doc.makefile();
-        let result = rename::rename(&makefile, doc.text(), position, &params.new_name, uri);
-
-        Ok(result)
+        rename::rename(&files, position, &params.new_name)
+            .transpose()
+            .map_err(|e| Error::invalid_params(e.to_string()))
     }
 
     async fn references(&self, params: ReferenceParams) -> Result<Option<Vec<Location>>> {
