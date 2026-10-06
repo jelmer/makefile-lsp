@@ -98,6 +98,22 @@ mod tests {
     }
 
     #[test]
+    fn test_highlight_escaped_prerequisite() {
+        let text = "all: a\\#b\na\\#b:\n";
+        let ranges: Vec<Range> = get_hl(text, Position::new(0, 8))
+            .into_iter()
+            .map(|h| h.range)
+            .collect();
+        assert_eq!(
+            ranges,
+            vec![
+                Range::new(Position::new(0, 5), Position::new(0, 9)),
+                Range::new(Position::new(1, 0), Position::new(1, 4)),
+            ]
+        );
+    }
+
+    #[test]
     fn test_highlight_nothing() {
         let text = "all:\n\techo hello\n";
         let highlights = get_hl(text, Position::new(1, 2));

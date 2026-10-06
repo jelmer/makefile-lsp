@@ -1,16 +1,17 @@
 //! Find references for Makefiles.
 
 use makefile_lossless::{
-    is_in_prerequisites, word_at_offset, Lang, Makefile, Recipe, SyntaxKind, TextRange,
-    VariableDefinition, VariableReference,
+    Lang, Makefile, Recipe, SyntaxKind, TextRange, VariableDefinition, VariableReference,
 };
 use rowan::ast::AstNode;
 use rowan::WalkEvent;
 use text_size::TextSize;
-use tower_lsp_server::ls_types::{Location, Position, Range, Uri};
+use tower_lsp_server::ls_types::{Location, Position, Uri};
 
 use crate::position::{text_range_to_lsp_range, try_position_to_offset};
-use crate::targets::{target_at_offset, targets_with_ranges};
+use crate::targets::{
+    prerequisite_at_offset, prerequisites_with_ranges, target_at_offset, targets_with_ranges,
+};
 use crate::workspace::FileSet;
 
 /// A target or variable name.
@@ -22,7 +23,7 @@ pub enum Symbol {
 
 /// Identify the symbol at `byte_offset`: a variable reference, a prerequisite,
 /// or the name in a target or variable definition.
-pub fn symbol_at(makefile: &Makefile, source_text: &str, byte_offset: usize) -> Option<Symbol> {
+pub fn symbol_at(makefile: &Makefile, byte_offset: usize) -> Option<Symbol> {
     let offset = TextSize::from(byte_offset as u32);
     // The innermost reference, for nested ones such as `$(FOO.$(BAR))`.
     let reference = variable_references(makefile)
@@ -33,15 +34,9 @@ pub fn symbol_at(makefile: &Makefile, source_text: &str, byte_offset: usize) -> 
         return Some(Symbol::Variable(name));
     }
 
-    let word = word_at_offset(source_text, byte_offset)?;
-    if is_in_prerequisites(source_text, byte_offset) {
-        return Some(Symbol::Target(word.to_string()));
-    }
-
-    if let Some((target, _)) = makefile
-        .rules()
-        .find_map(|r| target_at_offset(&r, byte_offset))
-    {
+    if let Some((target, _)) = makefile.rules().find_map(|r| {
+        target_at_offset(&r, byte_offset).or_else(|| prerequisite_at_offset(&r, byte_offset))
+    }) {
         return Some(Symbol::Target(target));
     }
 
@@ -83,7 +78,7 @@ pub fn find_references(
     let Some(offset) = try_position_to_offset(current.text(), position) else {
         return vec![];
     };
-    let Some(symbol) = symbol_at(&current.makefile(), current.text(), offset.into()) else {
+    let Some(symbol) = symbol_at(&current.makefile(), offset.into()) else {
         return vec![];
     };
     files
@@ -112,7 +107,7 @@ pub fn find_document_references(
     let Some(offset) = try_position_to_offset(source_text, position) else {
         return vec![];
     };
-    let Some(symbol) = symbol_at(makefile, source_text, offset.into()) else {
+    let Some(symbol) = symbol_at(makefile, offset.into()) else {
         return vec![];
     };
     symbol_locations(makefile, source_text, uri, &symbol, include_declaration)
@@ -129,93 +124,26 @@ fn find_target_references(
     let mut locations = Vec::new();
 
     for rule in makefile.rules() {
-        // Target definitions
-        if include_declaration {
-            for (target, range) in targets_with_ranges(&rule) {
-                if target == target_name {
-                    locations.push(Location {
-                        uri: uri.clone(),
-                        range: text_range_to_lsp_range(source_text, range),
-                    });
-                }
-            }
-        }
-
-        // Prerequisite references
-        for prereq in rule.prerequisites() {
-            if prereq == target_name {
-                // Find the prerequisite in the source text by scanning
-                find_word_in_prerequisites(source_text, &rule, target_name, uri, &mut locations);
-            }
-        }
-    }
-
-    // Also find references in .PHONY and similar
-    for rule in makefile.rules() {
-        let targets: Vec<String> = rule.targets().collect();
-        if targets.iter().any(|t| t.starts_with('.')) && targets.iter().all(|t| t != target_name) {
-            for prereq in rule.prerequisites() {
-                if prereq == target_name {
-                    find_word_in_prerequisites(
-                        source_text,
-                        &rule,
-                        target_name,
-                        uri,
-                        &mut locations,
-                    );
-                }
+        let declarations = if include_declaration {
+            targets_with_ranges(&rule)
+        } else {
+            vec![]
+        };
+        for (name, range) in declarations
+            .into_iter()
+            .chain(prerequisites_with_ranges(&rule))
+        {
+            if name == target_name {
+                locations.push(Location {
+                    uri: uri.clone(),
+                    range: text_range_to_lsp_range(source_text, range),
+                });
             }
         }
     }
 
     locations.sort_by_key(|l| (l.range.start.line, l.range.start.character));
-    locations.dedup_by(|a, b| a.range == b.range);
     locations
-}
-
-/// Find occurrences of a word in the prerequisites area of a rule.
-fn find_word_in_prerequisites(
-    source_text: &str,
-    rule: &makefile_lossless::Rule,
-    word: &str,
-    uri: &Uri,
-    locations: &mut Vec<Location>,
-) {
-    let rule_range = rule.syntax().text_range();
-    let rule_text = &source_text[usize::from(rule_range.start())..usize::from(rule_range.end())];
-    let rule_offset: usize = rule_range.start().into();
-
-    // Find the colon in the rule line
-    if let Some(colon_pos) = rule_text.find(':') {
-        let after_colon = &rule_text[colon_pos + 1..];
-        // Find newline (end of prerequisites line)
-        let end = after_colon.find('\n').unwrap_or(after_colon.len());
-        let prereq_text = &after_colon[..end];
-        let prereq_start = rule_offset + colon_pos + 1;
-
-        for (idx, _) in prereq_text.match_indices(word) {
-            let abs_offset = prereq_start + idx;
-            // Verify it's a whole word match
-            let before_ok = idx == 0
-                || !prereq_text.as_bytes()[idx - 1].is_ascii_alphanumeric()
-                    && prereq_text.as_bytes()[idx - 1] != b'_';
-            let after_idx = idx + word.len();
-            let after_ok = after_idx >= prereq_text.len()
-                || !prereq_text.as_bytes()[after_idx].is_ascii_alphanumeric()
-                    && prereq_text.as_bytes()[after_idx] != b'_';
-            if before_ok && after_ok {
-                let start = crate::position::offset_to_position(
-                    source_text,
-                    text_size::TextSize::from(abs_offset as u32),
-                );
-                let end = Position::new(start.line, start.character + word.len() as u32);
-                locations.push(Location {
-                    uri: uri.clone(),
-                    range: Range::new(start, end),
-                });
-            }
-        }
-    }
 }
 
 /// Find all references to a variable name (in $(VAR) or ${VAR} patterns).
@@ -367,6 +295,7 @@ fn scan_variable_references(text: &str, base: TextSize, out: &mut Vec<(String, T
 mod tests {
     use super::*;
     use crate::workspace::tests::Fixture;
+    use tower_lsp_server::ls_types::Range;
 
     fn test_uri() -> Uri {
         "file:///test/Makefile".parse().unwrap()
@@ -483,9 +412,9 @@ mod tests {
         let text = "FOO = a.c\nX = $(FOO:.c=.o) ${FOO:%.c=%.o}\n";
         let makefile = Makefile::parse(text).tree();
         let foo = Some(Symbol::Variable("FOO".to_string()));
-        assert_eq!(symbol_at(&makefile, text, 16), foo);
-        assert_eq!(symbol_at(&makefile, text, 19), foo);
-        assert_eq!(symbol_at(&makefile, text, 29), foo);
+        assert_eq!(symbol_at(&makefile, 16), foo);
+        assert_eq!(symbol_at(&makefile, 19), foo);
+        assert_eq!(symbol_at(&makefile, 29), foo);
     }
 
     #[test]
@@ -493,11 +422,11 @@ mod tests {
         let text = "X = $(subst a,b,$(FOO)) $(BAR.$(Y))\n";
         let makefile = Makefile::parse(text).tree();
         assert_eq!(
-            symbol_at(&makefile, text, 19),
+            symbol_at(&makefile, 19),
             Some(Symbol::Variable("FOO".to_string()))
         );
         assert_eq!(
-            symbol_at(&makefile, text, 32),
+            symbol_at(&makefile, 32),
             Some(Symbol::Variable("Y".to_string()))
         );
     }
@@ -577,6 +506,73 @@ mod tests {
                 range(1, 10, 13),
                 range(2, 11, 14),
             ]
+        );
+    }
+
+    fn ref_ranges(text: &str, pos: Position) -> Vec<Range> {
+        let makefile = Makefile::parse(text).tree();
+        find_document_references(&makefile, text, pos, &test_uri(), true)
+            .into_iter()
+            .map(|l| l.range)
+            .collect()
+    }
+
+    #[test]
+    fn test_symbol_at_escaped_prerequisite() {
+        let text = "all: a\\#b\na\\#b:\n";
+        let makefile = Makefile::parse(text).tree();
+        assert_eq!(
+            symbol_at(&makefile, 5),
+            Some(Symbol::Target("a#b".to_string()))
+        );
+        assert_eq!(
+            symbol_at(&makefile, 8),
+            Some(Symbol::Target("a#b".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_find_references_escaped_prerequisite() {
+        let text = "all: a\\#b\na\\#b:\n";
+        let expected = vec![range(0, 5, 9), range(1, 0, 4)];
+        assert_eq!(ref_ranges(text, Position::new(0, 5)), expected);
+        assert_eq!(ref_ranges(text, Position::new(1, 0)), expected);
+    }
+
+    #[test]
+    fn test_find_references_prerequisite_not_substring() {
+        // `a` must not match inside `a.o` or `b-a`.
+        let text = "all: a.o b-a a\na:\n";
+        assert_eq!(
+            ref_ranges(text, Position::new(1, 0)),
+            vec![range(0, 13, 14), range(1, 0, 1)]
+        );
+    }
+
+    #[test]
+    fn test_find_references_prerequisite_with_slash() {
+        let text = "all: dir/foo\ndir/foo:\n";
+        assert_eq!(
+            ref_ranges(text, Position::new(0, 10)),
+            vec![range(0, 5, 12), range(1, 0, 7)]
+        );
+    }
+
+    #[test]
+    fn test_find_references_prerequisites_on_continuation_line() {
+        let text = "all: a \\\n  b\nb:\n";
+        assert_eq!(
+            ref_ranges(text, Position::new(2, 0)),
+            vec![range(1, 2, 3), range(2, 0, 1)]
+        );
+    }
+
+    #[test]
+    fn test_find_references_phony_prerequisite() {
+        let text = ".PHONY: build\nbuild:\n";
+        assert_eq!(
+            ref_ranges(text, Position::new(1, 0)),
+            vec![range(0, 8, 13), range(1, 0, 5)]
         );
     }
 

@@ -62,7 +62,7 @@ fn symbol_name(symbol: &Symbol) -> &str {
 fn renameable_symbol(files: &FileSet, position: Position) -> Option<Result<Symbol, RenameError>> {
     let current = files.current();
     let byte_offset: usize = try_position_to_offset(current.text(), position)?.into();
-    let symbol = symbol_at(&current.makefile(), current.text(), byte_offset)?;
+    let symbol = symbol_at(&current.makefile(), byte_offset)?;
     let defining: Vec<&Uri> = files
         .docs()
         .filter(|d| is_defined(&d.makefile(), &symbol))
@@ -96,8 +96,6 @@ pub fn prepare_rename(
     };
     let current = files.current();
     let source_text = current.text();
-    // TODO: some occurrences, such as prerequisites written with escapes,
-    // are not found by symbol_locations, so can't be renamed from.
     let range = symbol_locations(
         &current.makefile(),
         source_text,
@@ -278,6 +276,39 @@ mod tests {
                 range: range(0, 0, 4),
                 new_text: "x".to_string()
             }]
+        );
+    }
+
+    #[test]
+    fn test_rename_escaped_prerequisite() {
+        let text = "all: a\\#b\na\\#b:\n";
+        let expected = Some((range(0, 5, 9), "a\\#b".to_string()));
+        assert_eq!(prepared(text, Position::new(0, 5)), expected);
+        assert_eq!(prepared(text, Position::new(0, 8)), expected);
+        let edit = |line, start, end| TextEdit {
+            range: range(line, start, end),
+            new_text: "x".to_string(),
+        };
+        assert_eq!(
+            get_edits(text, Position::new(0, 8), "x"),
+            vec![edit(0, 5, 9), edit(1, 0, 4)]
+        );
+        assert_eq!(
+            get_edits(text, Position::new(1, 0), "x"),
+            vec![edit(0, 5, 9), edit(1, 0, 4)]
+        );
+    }
+
+    #[test]
+    fn test_rename_order_only_prerequisite() {
+        let text = "all: | dir\ndir:\n";
+        let edit = |line, start, end| TextEdit {
+            range: range(line, start, end),
+            new_text: "x".to_string(),
+        };
+        assert_eq!(
+            get_edits(text, Position::new(1, 0), "x"),
+            vec![edit(0, 7, 10), edit(1, 0, 3)]
         );
     }
 
