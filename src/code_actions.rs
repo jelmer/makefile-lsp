@@ -5,8 +5,8 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use makefile_lossless::{
-    Conditional, Include, Makefile, Parse, ParseErrorKind, Recipe, Rule, SyntaxKind,
-    VariableDefinition, VariableReference,
+    Conditional, Include, Makefile, MakefileVariant, Parse, ParseErrorKind, Recipe, Rule,
+    SyntaxKind, VariableDefinition, VariableReference,
 };
 use rowan::ast::AstNode;
 use tower_lsp_server::ls_types::{
@@ -812,8 +812,8 @@ fn replace_all_spaces_with_tabs_action(
 ///
 /// Replaces every `$(NAME)` / `${NAME}` reference, including those in
 /// recipes and define bodies, with the literal value, then deletes the
-/// variable definition's line. Not offered if a recipe or define body uses
-/// the variable with modifiers, as in `$(NAME:.c=.o)`.
+/// variable definition's line. Not offered if any reference uses modifiers,
+/// as in `$(NAME:.c=.o)`.
 ///
 /// Only offered for plain assignments (`=`, `:=`, `::=`, `:::=`). `+=`,
 /// `?=`, and `!=` have semantics we don't want to inline silently.
@@ -859,6 +859,13 @@ fn inline_variable_action(
             .contains_range(var_ref.text_range())
         {
             continue;
+        }
+        // name() leaves out modifiers, so `$(NAME:.c=.o)` matches too.
+        let plain = var_ref
+            .parse(MakefileVariant::GNUMake)
+            .is_ok_and(|r| r.name == name && r.modifiers.is_empty());
+        if !plain {
+            return None;
         }
         let range = text_range_to_lsp_range(source_text, var_ref.text_range());
         edits.push(TextEdit {
@@ -1825,6 +1832,36 @@ mod tests {
         let text = "override FOO = bar\nall:\n\techo $(FOO)\n";
         let actions = parse_and_actions(text, Position::new(0, 0));
         assert!(!actions.iter().any(|a| a.title == "Inline variable 'FOO'"));
+    }
+
+    #[test]
+    fn test_no_inline_for_substitution_reference() {
+        assert_eq!(inline_result("FOO = a.c\nX = $(FOO:.c=.o)\n", "FOO"), None);
+        assert_eq!(
+            inline_result("FOO = a.c\nX = $(FOO) ${FOO:%.c=%.o}\n", "FOO"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_no_inline_for_bsd_modifier() {
+        assert_eq!(inline_result("FOO = a.c\nX = ${FOO:M*.c}\n", "FOO"), None);
+    }
+
+    #[test]
+    fn test_inline_variable_in_function_argument() {
+        assert_eq!(
+            inline_result("FOO = a.c\nX = $(subst a,b,$(FOO))\n", "FOO"),
+            Some("X = $(subst a,b,a.c)\n".to_string())
+        );
+    }
+
+    #[test]
+    fn test_inline_variable_in_computed_name() {
+        assert_eq!(
+            inline_result("FOO = c\nX = $(BAR.$(FOO)) $($(FOO))\n", "FOO"),
+            Some("X = $(BAR.c) $(c)\n".to_string())
+        );
     }
 
     #[test]
