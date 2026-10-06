@@ -5,8 +5,7 @@
 //! * Top-level targets (graph entry points) show `depth N` when the longest
 //!   path through their prerequisites is non-trivial.
 
-use makefile_lossless::{Makefile, SyntaxKind};
-use rowan::ast::AstNode;
+use makefile_lossless::Makefile;
 use tower_lsp_server::ls_types::{InlayHint, InlayHintKind, InlayHintLabel, Range};
 
 use crate::dep_graph::DependencyGraph;
@@ -108,14 +107,10 @@ fn target_depth_hints(makefile: &Makefile, source_text: &str, range: Range) -> V
             continue;
         }
 
-        let Some(targets_node) = rule
-            .syntax()
-            .children()
-            .find(|c| c.kind() == SyntaxKind::TARGETS)
-        else {
+        let Some(target_range) = rule.target_ranges().last() else {
             continue;
         };
-        let anchor = text_range_to_lsp_range(source_text, targets_node.text_range()).end;
+        let anchor = text_range_to_lsp_range(source_text, target_range).end;
 
         if anchor.line < range.start.line || anchor.line > range.end.line {
             continue;
@@ -139,9 +134,9 @@ fn target_depth_hints(makefile: &Makefile, source_text: &str, range: Range) -> V
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tower_lsp_server::ls_types::Position;
 
     fn get_hints(text: &str) -> Vec<InlayHint> {
-        use tower_lsp_server::ls_types::Position;
         let parsed = Makefile::parse(text);
         let makefile = parsed.tree();
         let range = Range::new(Position::new(0, 0), Position::new(100, 0));
@@ -248,6 +243,17 @@ mod tests {
         // 'all' is on line 0, end of "all" is column 3.
         assert_eq!(depth[0].position.line, 0);
         assert_eq!(depth[0].position.character, 3);
+    }
+
+    #[test]
+    fn test_depth_hint_anchored_before_space() {
+        let text = "all : build\n\t@:\nbuild: dep\n\t@:\ndep:\n\t@:\n";
+        let positions: Vec<_> = get_hints(text)
+            .into_iter()
+            .filter(|h| matches!(&h.label, InlayHintLabel::String(s) if s.starts_with("depth ")))
+            .map(|h| h.position)
+            .collect();
+        assert_eq!(positions, vec![Position::new(0, 3)]);
     }
 
     #[test]
