@@ -16,6 +16,7 @@ mod dep_graph;
 mod diagnostics;
 mod document_links;
 mod folding;
+mod formatting;
 mod goto;
 mod highlights;
 mod hover;
@@ -210,6 +211,15 @@ impl Backend {
     }
 }
 
+/// Report a formatting failure as an LSP RequestFailed error.
+fn format_error(e: formatting::FormatError) -> tower_lsp_server::jsonrpc::Error {
+    tower_lsp_server::jsonrpc::Error {
+        code: tower_lsp_server::jsonrpc::ErrorCode::ServerError(-32803),
+        message: e.to_string().into(),
+        data: None,
+    }
+}
+
 impl LanguageServer for Backend {
     async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
         #[allow(deprecated)]
@@ -271,6 +281,8 @@ impl LanguageServer for Backend {
                 document_highlight_provider: Some(OneOf::Left(true)),
                 references_provider: Some(OneOf::Left(true)),
                 definition_provider: Some(OneOf::Left(true)),
+                document_formatting_provider: Some(OneOf::Left(true)),
+                document_range_formatting_provider: Some(OneOf::Left(true)),
                 document_on_type_formatting_provider: Some(DocumentOnTypeFormattingOptions {
                     first_trigger_character: "\n".to_string(),
                     more_trigger_character: None,
@@ -651,6 +663,27 @@ impl LanguageServer for Backend {
             selection_ranges::get_selection_ranges(&makefile, doc.text(), &params.positions);
 
         Ok(Some(ranges))
+    }
+
+    async fn formatting(&self, params: DocumentFormattingParams) -> Result<Option<Vec<TextEdit>>> {
+        let Some(doc) = self.document(&params.text_document.uri).await else {
+            return Ok(None);
+        };
+        formatting::format_document(doc.parsed(), doc.text())
+            .map(Some)
+            .map_err(format_error)
+    }
+
+    async fn range_formatting(
+        &self,
+        params: DocumentRangeFormattingParams,
+    ) -> Result<Option<Vec<TextEdit>>> {
+        let Some(doc) = self.document(&params.text_document.uri).await else {
+            return Ok(None);
+        };
+        formatting::format_range(doc.parsed(), doc.text(), params.range)
+            .map(Some)
+            .map_err(format_error)
     }
 
     async fn on_type_formatting(
