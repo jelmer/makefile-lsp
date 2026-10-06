@@ -82,6 +82,22 @@ mod tests {
     }
 
     #[test]
+    fn test_highlight_substitution_reference() {
+        let text = "FOO = a.c\nX = $(FOO:.c=.o)\n";
+        let ranges: Vec<Range> = get_hl(text, Position::new(1, 7))
+            .into_iter()
+            .map(|h| h.range)
+            .collect();
+        assert_eq!(
+            ranges,
+            vec![
+                Range::new(Position::new(0, 0), Position::new(0, 3)),
+                Range::new(Position::new(1, 6), Position::new(1, 9)),
+            ]
+        );
+    }
+
+    #[test]
     fn test_highlight_nothing() {
         let text = "all:\n\techo hello\n";
         let highlights = get_hl(text, Position::new(1, 2));
