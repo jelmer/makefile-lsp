@@ -53,6 +53,7 @@ Each diagnostic carries a code, so it can be identified in editors:
 | `recursive-variable-reference` | warning | `=` assignment that references itself |
 | `empty-variable-reference` | warning | `$()` or `${}` |
 | `empty-automatic-variable` | warning | `$<`, `$^`, `$+` or `$?` in a rule without prerequisites, or `$*` outside a pattern rule |
+| `automatic-variable-outside-recipe` | warning | automatic variable like `$@` in a target list, prerequisite list, `:=` assignment or conditional, where it is always empty |
 | `unused-variable` | hint | variable that is assigned but never referenced |
 | `mixed-assignment-operators` | warning | variable assigned with both `=` and `:=` |
 | `shell-in-recursive-assignment` | warning | `$(shell ...)` in an `=` assignment, which runs on every expansion |

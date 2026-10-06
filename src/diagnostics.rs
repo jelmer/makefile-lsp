@@ -183,6 +183,10 @@ fn collect_diagnostics(
         external,
     ));
     diagnostics.extend(check_include_files(source_text, includes));
+    diagnostics.extend(check_automatic_variable_outside_recipe(
+        source_text,
+        &makefile,
+    ));
     if let Some(dir) = base_dir {
         diagnostics.extend(check_missing_phony(source_text, &makefile, external, dir));
         diagnostics.extend(check_unresolved_prerequisites(
@@ -1697,6 +1701,111 @@ fn has_file_with_same_stem(path: &std::path::Path) -> bool {
         }
     }
     false
+}
+
+/// Check for automatic variables (`$@`, `$<`, `$(@D)`, ...) used where make
+/// never sets them.
+///
+/// Automatic variables only have a value while a recipe is expanded, or
+/// during the second expansion of prerequisites when `.SECONDEXPANSION` is
+/// in effect. Text that is expanded immediately while the makefile is read
+/// sees them as empty, so these are flagged:
+///
+/// - targets of a rule
+/// - prerequisites, unless `.SECONDEXPANSION` appears anywhere in the file
+/// - values of global `:=`, `::=`, `:::=` and `!=` assignments
+/// - `ifeq`/`ifneq` conditions
+///
+/// Recursive (`=`, `?=`) and appended (`+=`) values, target-specific
+/// variables and `define` bodies may be expanded later in a recipe, and
+/// arguments to `$(eval)` and `$(call)` usually build text that is, so those
+/// are left alone.
+fn check_automatic_variable_outside_recipe(
+    source_text: &str,
+    makefile: &Makefile,
+) -> Vec<Diagnostic> {
+    let second_expansion = makefile
+        .rules_by_target(".SECONDEXPANSION")
+        .next()
+        .is_some();
+
+    makefile
+        .variable_references()
+        .filter_map(|var_ref| {
+            let text = var_ref.syntax().text().to_string();
+            if !is_automatic_variable_reference(&text) {
+                return None;
+            }
+            let context = immediate_expansion_context(var_ref.syntax(), second_expansion)?;
+            Some(make_diagnostic(
+                text_range_to_lsp_range(source_text, var_ref.syntax().text_range()),
+                DiagnosticSeverity::WARNING,
+                "automatic-variable-outside-recipe",
+                format!(
+                    "automatic variable '{}' is only set in recipes and is empty in {}",
+                    text, context
+                ),
+            ))
+        })
+        .collect()
+}
+
+/// Is `text` a reference to an automatic variable, such as `$@`, `$(<)` or
+/// `${@D}`?
+fn is_automatic_variable_reference(text: &str) -> bool {
+    let Some(body) = text.strip_prefix('$') else {
+        return false;
+    };
+    let name = body
+        .strip_prefix('(')
+        .and_then(|b| b.strip_suffix(')'))
+        .or_else(|| body.strip_prefix('{').and_then(|b| b.strip_suffix('}')))
+        .unwrap_or(body);
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|c| matches!(c, '@' | '<' | '^' | '?' | '*' | '+' | '|' | '%'))
+        && matches!(chars.as_str(), "" | "D" | "F")
+}
+
+/// Describe the immediately-expanded context `node` sits in, or `None` if it
+/// may be expanded later (or we can't tell).
+fn immediate_expansion_context(
+    node: &rowan::SyntaxNode<makefile_lossless::Lang>,
+    second_expansion: bool,
+) -> Option<&'static str> {
+    for ancestor in node.ancestors().skip(1) {
+        match ancestor.kind() {
+            SyntaxKind::EXPR => {
+                let deferring = VariableReference::cast(ancestor)
+                    .and_then(|r| r.name())
+                    .is_some_and(|name| name == "eval" || name == "call");
+                if deferring {
+                    return None;
+                }
+            }
+            SyntaxKind::PREREQUISITE => {}
+            SyntaxKind::TARGETS => return Some("a target list"),
+            SyntaxKind::PREREQUISITES => {
+                return (!second_expansion).then_some("a prerequisite list");
+            }
+            SyntaxKind::VARIABLE => {
+                let target_specific = ancestor.ancestors().any(|a| a.kind() == SyntaxKind::RULE);
+                let var_def = makefile_lossless::VariableDefinition::cast(ancestor)?;
+                if target_specific || var_def.is_define() {
+                    return None;
+                }
+                let op = var_def.assignment_operator()?;
+                let immediate = matches!(op.as_str(), ":=" | "::=" | ":::=" | "!=");
+                return immediate.then_some("an immediately-expanded assignment");
+            }
+            SyntaxKind::CONDITIONAL_IF | SyntaxKind::CONDITIONAL_ELSE => {
+                return Some("a conditional directive");
+            }
+            _ => return None,
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -3708,5 +3817,140 @@ mod tests {
             file_set_unresolved_prereqs(&files, "rules.mk"),
             Vec::<String>::new()
         );
+    }
+
+    fn auto_var_messages(text: &str) -> Vec<String> {
+        get_diags(text)
+            .into_iter()
+            .filter(|d| {
+                d.code
+                    == Some(NumberOrString::String(
+                        "automatic-variable-outside-recipe".to_string(),
+                    ))
+            })
+            .map(|d| d.message)
+            .collect()
+    }
+
+    #[test]
+    fn test_automatic_variable_in_immediate_assignment() {
+        let diags: Vec<_> = get_diags("OBJ := $@.o\n")
+            .into_iter()
+            .filter(|d| {
+                d.code
+                    == Some(NumberOrString::String(
+                        "automatic-variable-outside-recipe".to_string(),
+                    ))
+            })
+            .collect();
+        assert_eq!(diags.len(), 1);
+        assert_eq!(
+            diags[0].message,
+            "automatic variable '$@' is only set in recipes and is empty in \
+             an immediately-expanded assignment"
+        );
+        assert_eq!(diags[0].severity, Some(DiagnosticSeverity::WARNING));
+        assert_eq!(
+            diags[0].range,
+            Range::new(Position::new(0, 7), Position::new(0, 9))
+        );
+    }
+
+    #[test]
+    fn test_automatic_variable_forms_in_immediate_assignment() {
+        assert_eq!(
+            auto_var_messages("X := $(@D) ${<F} $(notdir $^) $? $*\n").len(),
+            5
+        );
+    }
+
+    #[test]
+    fn test_automatic_variable_in_other_immediate_operators() {
+        assert_eq!(auto_var_messages("X ::= $<\n").len(), 1);
+        assert_eq!(auto_var_messages("X :::= $<\n").len(), 1);
+        assert_eq!(auto_var_messages("X != echo $@\n").len(), 1);
+    }
+
+    #[test]
+    fn test_automatic_variable_in_target_list() {
+        assert_eq!(
+            auto_var_messages("$@: foo\n\ttouch $@\n"),
+            vec![
+                "automatic variable '$@' is only set in recipes and is empty in a target list"
+                    .to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn test_automatic_variable_in_prerequisites() {
+        assert_eq!(
+            auto_var_messages("foo: $(@D)/bar\n\ttouch $@\n"),
+            vec![
+                "automatic variable '$(@D)' is only set in recipes and is empty in a \
+                 prerequisite list"
+                    .to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn test_automatic_variable_in_conditional() {
+        assert_eq!(auto_var_messages("ifeq ($@,foo)\nX = 1\nendif\n").len(), 1);
+    }
+
+    #[test]
+    fn test_automatic_variable_in_conditional_body_assignment() {
+        assert_eq!(auto_var_messages("ifdef X\nY := $@\nendif\n").len(), 1);
+    }
+
+    #[test]
+    fn test_automatic_variable_in_recursive_assignment_ok() {
+        assert_eq!(auto_var_messages("X = $@\nY ?= $<\nZ += $^\n").len(), 0);
+    }
+
+    #[test]
+    fn test_automatic_variable_in_target_specific_variable_ok() {
+        assert_eq!(auto_var_messages("foo: X := $@\nfoo: Y = $<\n").len(), 0);
+    }
+
+    #[test]
+    fn test_automatic_variable_in_recipe_ok() {
+        assert_eq!(
+            auto_var_messages("foo: bar\n\tcc -o $@ $< $(@D)\nall: ; echo $@\n").len(),
+            0
+        );
+    }
+
+    #[test]
+    fn test_automatic_variable_in_define_ok() {
+        assert_eq!(
+            auto_var_messages("define RULE\n$@: $<\n\ttouch $@\nendef\n").len(),
+            0
+        );
+    }
+
+    #[test]
+    fn test_automatic_variable_in_eval_ok() {
+        assert_eq!(auto_var_messages("$(eval foo: ; echo $@)\n").len(), 0);
+        assert_eq!(auto_var_messages("X := $(call tmpl,$@)\n").len(), 0);
+    }
+
+    #[test]
+    fn test_escaped_automatic_variable_ok() {
+        assert_eq!(auto_var_messages("X := $$@\n").len(), 0);
+    }
+
+    #[test]
+    fn test_automatic_variable_with_second_expansion_ok() {
+        assert_eq!(
+            auto_var_messages(".SECONDEXPANSION:\nfoo: $$(@D)/x $(@D)/y\n\ttouch $@\n").len(),
+            0
+        );
+    }
+
+    #[test]
+    fn test_non_automatic_single_char_variable_ok() {
+        assert_eq!(auto_var_messages("X := $A $(@X) $(DD)\n").len(), 0);
     }
 }
