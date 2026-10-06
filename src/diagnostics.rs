@@ -165,7 +165,7 @@ fn collect_diagnostics(
     ));
     diagnostics.extend(check_include_files(source_text, includes));
     if let Some(dir) = base_dir {
-        diagnostics.extend(check_missing_phony(source_text, &makefile, dir));
+        diagnostics.extend(check_missing_phony(source_text, &makefile, external, dir));
     }
 
     diagnostics
@@ -1416,19 +1416,26 @@ fn is_conventional_non_file_target(name: &str) -> bool {
 /// - Targets for which a file exists next to the makefile are skipped.
 /// - Rules without prerequisites and recipe are left to
 ///   `empty-rule-probably-phony`.
+/// - Targets declared `.PHONY` in another makefile of the file set are
+///   skipped.
 /// - The check is skipped entirely if `.PHONY` lists a variable reference,
 ///   or if the makefile includes others and declares nothing `.PHONY`
 ///   itself, since the declarations may then live elsewhere.
 fn check_missing_phony(
     source_text: &str,
     makefile: &Makefile,
+    external: &ExternalSymbols,
     base_dir: &std::path::Path,
 ) -> Vec<Diagnostic> {
     let phony_prereqs: Vec<String> = makefile
         .rules_by_target(".PHONY")
         .flat_map(|r| r.prerequisites().collect::<Vec<_>>())
         .collect();
-    if phony_prereqs.iter().any(|p| p.contains('$')) {
+    if phony_prereqs
+        .iter()
+        .chain(&external.phony)
+        .any(|p| p.contains('$'))
+    {
         return Vec::new();
     }
     let has_include = makefile
@@ -1450,6 +1457,7 @@ fn check_missing_phony(
         for (name, range) in target_name_ranges(&rule) {
             if !is_conventional_non_file_target(&name)
                 || makefile.is_phony(&name)
+                || external.phony.contains(&name)
                 || base_dir.join(&name).exists()
                 || !seen.insert(name.clone())
             {
@@ -3112,6 +3120,24 @@ mod tests {
         let empty: Vec<String> = vec![];
         assert_eq!(file_set_codes(&fx, "Makefile"), empty);
         assert_eq!(file_set_codes(&fx, "rules.mk"), empty);
+    }
+
+    #[test]
+    fn test_cross_file_missing_phony() {
+        let fx = crate::workspace::tests::Fixture::new(&[
+            (
+                "Makefile",
+                "include rules.mk\n.PHONY: all install\nall: x\n\techo\nclean:\n\trm -f x\n",
+            ),
+            ("rules.mk", ".PHONY: clean\ninstall: x\n\tcp x /usr/bin\n"),
+        ]);
+        for name in ["Makefile", "rules.mk"] {
+            let codes = file_set_codes(&fx, name);
+            assert!(
+                !codes.contains(&"missing-phony".to_string()),
+                "{name}: {codes:?}"
+            );
+        }
     }
 
     #[test]
