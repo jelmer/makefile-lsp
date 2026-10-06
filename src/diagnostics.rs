@@ -1031,12 +1031,14 @@ fn check_empty_rule_probably_phony(
 /// These flavours have different evaluation semantics; mixing them means the
 /// later assignment silently wins and changes how earlier-referencing code
 /// behaves. `+=` (append) and `?=` (conditional) are not flagged — they're
-/// normal companions to either flavour.
+/// normal companions to either flavour. Assignments in different branches of
+/// a conditional never both take effect, so they do not mix.
 fn check_mixed_assignment_operators(source_text: &str, makefile: &Makefile) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
 
-    // For each name, collect (flavour, range, line) for each non-`+=`/`?=`
-    // assignment. Compare flavours within each name.
+    // For each name, collect (flavour, range, branches) for each
+    // non-`+=`/`?=` assignment. Compare flavours within each name.
+    #[derive(PartialEq)]
     enum Flavour {
         Recursive, // `=`
         Immediate, // `:=`, `::=`, `:::=`
@@ -1047,7 +1049,7 @@ fn check_mixed_assignment_operators(source_text: &str, makefile: &Makefile) -> V
         _ => None,
     };
 
-    let mut by_name: HashMap<String, Vec<(Flavour, Range)>> = HashMap::new();
+    let mut by_name: HashMap<String, Vec<(Flavour, Range, Branches)>> = HashMap::new();
     for var_def in makefile.variable_definitions() {
         let Some(name) = var_def.name() else { continue };
         let Some(op) = var_def.assignment_operator() else {
@@ -1057,25 +1059,23 @@ fn check_mixed_assignment_operators(source_text: &str, makefile: &Makefile) -> V
             continue;
         };
         let range = text_range_to_lsp_range(source_text, var_def.syntax().text_range());
-        by_name.entry(name).or_default().push((flavour, range));
+        let branches = conditional_branches(var_def.syntax());
+        by_name
+            .entry(name)
+            .or_default()
+            .push((flavour, range, branches));
     }
 
     for (name, assignments) in by_name {
-        if assignments.len() < 2 {
-            continue;
-        }
-        let has_recursive = assignments
-            .iter()
-            .any(|(f, _)| matches!(f, Flavour::Recursive));
-        let has_immediate = assignments
-            .iter()
-            .any(|(f, _)| matches!(f, Flavour::Immediate));
-        if !(has_recursive && has_immediate) {
-            continue;
-        }
-        // Flag every assignment that participated in the mix, so the user
-        // sees each problem assignment.
-        for (_, range) in &assignments {
+        // Flag every assignment that mixes with another one that can take
+        // effect alongside it, so the user sees each problem assignment.
+        for (flavour, range, branches) in &assignments {
+            let mixed = assignments
+                .iter()
+                .any(|(f, _, b)| f != flavour && !mutually_exclusive(b, branches));
+            if !mixed {
+                continue;
+            }
             diagnostics.push(make_diagnostic(
                 *range,
                 DiagnosticSeverity::WARNING,
@@ -3286,6 +3286,37 @@ mod tests {
         assert_eq!(mixed.len(), 2);
         assert!(mixed[0].message.contains("FOO"));
         assert_eq!(mixed[0].severity, Some(DiagnosticSeverity::WARNING));
+    }
+
+    fn mixed_assignment_lines(text: &str) -> Vec<u32> {
+        get_diags(text)
+            .iter()
+            .filter(|d| {
+                d.code
+                    == Some(NumberOrString::String(
+                        "mixed-assignment-operators".to_string(),
+                    ))
+            })
+            .map(|d| d.range.start.line)
+            .collect()
+    }
+
+    #[test]
+    fn test_mixed_assignment_in_exclusive_branches_ok() {
+        let text = "ifdef X\nFOO = a\nelse\nFOO := b\nendif\n";
+        assert_eq!(mixed_assignment_lines(text), Vec::<u32>::new());
+    }
+
+    #[test]
+    fn test_mixed_assignment_in_same_branch() {
+        let text = "ifdef X\nFOO = a\nFOO := b\nendif\n";
+        assert_eq!(mixed_assignment_lines(text), vec![1, 2]);
+    }
+
+    #[test]
+    fn test_mixed_assignment_outside_and_inside_conditional() {
+        let text = "FOO = a\nifdef X\nFOO := b\nelse\nFOO = c\nendif\n";
+        assert_eq!(mixed_assignment_lines(text), vec![0, 2]);
     }
 
     // Unterminated conditional tests
