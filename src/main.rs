@@ -53,8 +53,12 @@ impl Backend {
     }
 
     async fn update_file(&self, uri: Uri, text: String) {
-        let doc = self.workspace.lock().await.open(uri.clone(), text);
-        let diagnostics = diagnostics::get_diagnostics(doc.text(), doc.parsed(), doc.dir());
+        let files = {
+            let mut workspace = self.workspace.lock().await;
+            workspace.open(uri.clone(), text);
+            workspace.file_set(&uri).expect("document was just opened")
+        };
+        let diagnostics = diagnostics::get_file_set_diagnostics(&files);
 
         self.client
             .publish_diagnostics(uri, diagnostics, None)

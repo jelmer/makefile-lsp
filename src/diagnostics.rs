@@ -12,6 +12,7 @@ use tower_lsp_server::ls_types::{Diagnostic, DiagnosticSeverity, NumberOrString,
 
 use crate::builtins;
 use crate::position::text_range_to_lsp_range;
+use crate::workspace::{FileSet, Resolution, ResolvedInclude};
 
 fn make_diagnostic(
     range: Range,
@@ -29,15 +30,90 @@ fn make_diagnostic(
     }
 }
 
-/// Collect diagnostics from parse errors and semantic analysis.
+/// Symbols defined or used in the other makefiles of a file set, which
+/// cross-file checks take into account to avoid false positives.
+#[derive(Debug, Default)]
+pub struct ExternalSymbols {
+    variables_defined: HashSet<String>,
+    variables_referenced: HashSet<String>,
+    targets: HashSet<String>,
+    /// Names used as prerequisites of ordinary (non-special) rules.
+    prerequisites: HashSet<String>,
+    phony: HashSet<String>,
+}
+
+impl ExternalSymbols {
+    pub fn add(&mut self, makefile: &Makefile) {
+        self.variables_defined
+            .extend(makefile.variable_definitions().filter_map(|v| v.name()));
+        self.variables_referenced
+            .extend(referenced_variables(makefile));
+        for rule in makefile.rules() {
+            let targets: Vec<String> = rule.targets().collect();
+            if targets.iter().any(|t| t == ".PHONY") {
+                self.phony.extend(rule.prerequisites());
+            }
+            if targets.iter().any(|t| crate::dep_graph::is_graph_target(t)) {
+                self.prerequisites.extend(rule.prerequisites());
+            }
+            self.targets.extend(targets);
+        }
+    }
+}
+
+/// Collect diagnostics for a single makefile.
 ///
 /// `base_dir`, when provided, is used to resolve relative include paths for
 /// the missing-include-file check. Pass `None` to skip filesystem-touching
 /// checks (e.g. in tests where the makefile doesn't live on disk).
+#[cfg(any(test, feature = "scip"))]
 pub fn get_diagnostics(
     source_text: &str,
     parsed: &Parse<makefile_lossless::Makefile>,
     base_dir: Option<&std::path::Path>,
+) -> Vec<Diagnostic> {
+    let makefile = parsed.tree();
+    let includes: Vec<ResolvedInclude> = match base_dir {
+        Some(dir) => {
+            use crate::workspace::{include_paths, resolve_include, LiteralVariables};
+
+            let mut vars = LiteralVariables::default();
+            vars.add(&makefile);
+            include_paths(&makefile, source_text)
+                .into_iter()
+                .map(|path| {
+                    let resolution =
+                        resolve_include(&path.name, &vars, Some(dir), Some(dir), &|p| p.is_file());
+                    ResolvedInclude { path, resolution }
+                })
+                .collect()
+        }
+        None => Vec::new(),
+    };
+    collect_diagnostics(source_text, parsed, &ExternalSymbols::default(), &includes)
+}
+
+/// Collect diagnostics for the current document of a file set, taking the
+/// definitions and uses in the other makefiles into account.
+pub fn get_file_set_diagnostics(files: &FileSet) -> Vec<Diagnostic> {
+    let mut external = ExternalSymbols::default();
+    for doc in files.others() {
+        external.add(&doc.makefile());
+    }
+    let current = files.current();
+    collect_diagnostics(
+        current.text(),
+        current.parsed(),
+        &external,
+        files.includes(),
+    )
+}
+
+fn collect_diagnostics(
+    source_text: &str,
+    parsed: &Parse<makefile_lossless::Makefile>,
+    external: &ExternalSymbols,
+    includes: &[ResolvedInclude],
 ) -> Vec<Diagnostic> {
     let mut diagnostics: Vec<Diagnostic> = parsed
         .positioned_errors()
@@ -46,7 +122,7 @@ pub fn get_diagnostics(
         .collect();
 
     let makefile = parsed.tree();
-    diagnostics.extend(check_undefined_variables(source_text, &makefile));
+    diagnostics.extend(check_undefined_variables(source_text, &makefile, external));
     diagnostics.extend(check_recursive_variable_self_reference(
         source_text,
         &makefile,
@@ -55,8 +131,12 @@ pub fn get_diagnostics(
     diagnostics.extend(check_self_dependency(source_text, &makefile));
     diagnostics.extend(check_circular_dependencies(source_text, &makefile));
     diagnostics.extend(check_duplicate_targets(source_text, &makefile));
-    diagnostics.extend(check_missing_phony_targets(source_text, &makefile));
-    diagnostics.extend(check_unused_phony_targets(source_text, &makefile));
+    diagnostics.extend(check_missing_phony_targets(
+        source_text,
+        &makefile,
+        external,
+    ));
+    diagnostics.extend(check_unused_phony_targets(source_text, &makefile, external));
     diagnostics.extend(check_include_missing_path(source_text, &makefile));
     diagnostics.extend(check_trailing_whitespace_in_value(source_text, &makefile));
     diagnostics.extend(check_duplicate_prerequisites(source_text, &makefile));
@@ -67,12 +147,14 @@ pub fn get_diagnostics(
     diagnostics.extend(check_shell_in_recursive_assignment(source_text, &makefile));
     diagnostics.extend(check_empty_automatic_variables(source_text, &makefile));
     diagnostics.extend(check_unterminated_conditionals(source_text, &makefile));
-    diagnostics.extend(check_unused_variables(source_text, &makefile));
+    diagnostics.extend(check_unused_variables(source_text, &makefile, external));
     diagnostics.extend(check_mixed_assignment_operators(source_text, &makefile));
-    diagnostics.extend(check_empty_rule_probably_phony(source_text, &makefile));
-    if let Some(dir) = base_dir {
-        diagnostics.extend(check_missing_include_file(source_text, &makefile, dir));
-    }
+    diagnostics.extend(check_empty_rule_probably_phony(
+        source_text,
+        &makefile,
+        external,
+    ));
+    diagnostics.extend(check_include_files(source_text, includes));
 
     diagnostics
 }
@@ -138,13 +220,18 @@ fn line_range(source_text: &str, offset: TextSize) -> TextRange {
 }
 
 /// Check for references to undefined variables.
-fn check_undefined_variables(source_text: &str, makefile: &Makefile) -> Vec<Diagnostic> {
+fn check_undefined_variables(
+    source_text: &str,
+    makefile: &Makefile,
+    external: &ExternalSymbols,
+) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
 
-    let defined_vars: HashSet<String> = makefile
+    let mut defined_vars: HashSet<String> = makefile
         .variable_definitions()
         .filter_map(|v| v.name())
         .collect();
+    defined_vars.extend(external.variables_defined.iter().cloned());
 
     for var_ref in makefile.variable_references() {
         let Some(name) = var_ref.name() else {
@@ -352,13 +439,18 @@ fn check_circular_dependencies(source_text: &str, makefile: &Makefile) -> Vec<Di
 }
 
 /// Check for `.PHONY` prerequisites that are never defined as targets.
-fn check_missing_phony_targets(source_text: &str, makefile: &Makefile) -> Vec<Diagnostic> {
+fn check_missing_phony_targets(
+    source_text: &str,
+    makefile: &Makefile,
+    external: &ExternalSymbols,
+) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
 
-    let defined_targets: HashSet<String> = makefile
+    let mut defined_targets: HashSet<String> = makefile
         .rules()
         .flat_map(|r| r.targets().collect::<Vec<_>>())
         .collect();
+    defined_targets.extend(external.targets.iter().cloned());
 
     for rule in makefile.rules_by_target(".PHONY") {
         let rule_range = text_range_to_lsp_range(source_text, rule.syntax().text_range());
@@ -395,7 +487,11 @@ fn check_missing_phony_targets(source_text: &str, makefile: &Makefile) -> Vec<Di
 ///
 /// Self-references don't count as incoming edges. Targets that don't appear
 /// as the head of any rule are handled by `check_missing_phony_targets`.
-fn check_unused_phony_targets(source_text: &str, makefile: &Makefile) -> Vec<Diagnostic> {
+fn check_unused_phony_targets(
+    source_text: &str,
+    makefile: &Makefile,
+    external: &ExternalSymbols,
+) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
 
     let graph = crate::dep_graph::DependencyGraph::from_makefile(makefile);
@@ -438,7 +534,8 @@ fn check_unused_phony_targets(source_text: &str, makefile: &Makefile) -> Vec<Dia
             // No rule at all -> handled by check_missing_phony_targets.
             continue;
         }
-        let referenced = graph.referrers(name).any(|r| r != name);
+        let referenced =
+            graph.referrers(name).any(|r| r != name) || external.prerequisites.contains(name);
         if referenced {
             continue;
         }
@@ -606,22 +703,8 @@ fn scan_automatic_vars(text: &str) -> Vec<(char, usize, usize)> {
     out
 }
 
-/// Check for variables that are defined but never referenced.
-///
-/// Emits a hint (not a warning) to keep the noise low: the check has known
-/// false-positive sources (recipes are byte-scanned because makefile-lossless
-/// tokenizes them flatly; `$(eval)` and `$(call)` can reference variables in
-/// ways we can't see statically) and many makefiles intentionally export
-/// variables for sub-makes or external tooling.
-///
-/// Skipped:
-/// - Variables exported with `export` (consumed outside the makefile).
-/// - Variables overriding a builtin (would change make's behaviour).
-/// - Variables defined inside conditionals (often configuration toggles).
-fn check_unused_variables(source_text: &str, makefile: &Makefile) -> Vec<Diagnostic> {
-    let mut diagnostics = Vec::new();
-
-    // Collect every name that's referenced anywhere we can see.
+/// Collect the names of all variables a makefile references.
+fn referenced_variables(makefile: &Makefile) -> HashSet<String> {
     let mut referenced: HashSet<String> = makefile
         .variable_references()
         .filter_map(|v| v.name())
@@ -665,11 +748,34 @@ fn check_unused_variables(source_text: &str, makefile: &Makefile) -> Vec<Diagnos
         }
     }
 
+    referenced
+}
+
+/// Check for variables that are defined but never referenced.
+///
+/// Emits a hint (not a warning) to keep the noise low: the check has known
+/// false-positive sources (recipes are byte-scanned because makefile-lossless
+/// tokenizes them flatly; `$(eval)` and `$(call)` can reference variables in
+/// ways we can't see statically) and many makefiles intentionally export
+/// variables for sub-makes or external tooling.
+///
+/// Skipped:
+/// - Variables exported with `export` (consumed outside the makefile).
+/// - Variables overriding a builtin (would change make's behaviour).
+/// - Variables defined inside conditionals (often configuration toggles).
+fn check_unused_variables(
+    source_text: &str,
+    makefile: &Makefile,
+    external: &ExternalSymbols,
+) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+    let referenced = referenced_variables(makefile);
+
     for var_def in makefile.variable_definitions() {
         let Some(name) = var_def.name() else {
             continue;
         };
-        if referenced.contains(&name) {
+        if referenced.contains(&name) || external.variables_referenced.contains(&name) {
             continue;
         }
         if var_def.is_export() {
@@ -766,54 +872,37 @@ fn is_valid_var_name(s: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-')
 }
 
-/// Check for `include` directives whose path doesn't exist on disk.
+/// Check for `include` directives whose file doesn't exist or can't be read.
 ///
-/// Resolves the path relative to `base_dir`. Optional includes (`-include` /
-/// `sinclude`) are skipped — they explicitly tolerate a missing file. Paths
-/// containing variable references (`include $(CONFIG)`) are also skipped
-/// since we can't evaluate them statically.
-fn check_missing_include_file(
-    source_text: &str,
-    makefile: &Makefile,
-    base_dir: &std::path::Path,
-) -> Vec<Diagnostic> {
-    let mut diagnostics = Vec::new();
-
-    for item in makefile.items() {
-        let MakefileItem::Include(inc) = item else {
-            continue;
-        };
-        if inc.is_optional() {
-            continue;
-        }
-        let Some(path) = inc.path() else { continue };
-        if path.is_empty() {
-            // Covered by check_include_missing_path; skip here.
-            continue;
-        }
-        // Skip if the path contains an unresolved variable reference.
-        if path.contains('$') {
-            continue;
-        }
-
-        let resolved = base_dir.join(&path);
-        if resolved.exists() {
-            continue;
-        }
-
-        let range = inc
-            .path_range()
-            .map(|r| text_range_to_lsp_range(source_text, r))
-            .unwrap_or_else(|| text_range_to_lsp_range(source_text, inc.syntax().text_range()));
-        diagnostics.push(make_diagnostic(
-            range,
-            DiagnosticSeverity::WARNING,
-            "missing-include-file",
-            format!("included file '{}' does not exist", path),
-        ));
-    }
-
-    diagnostics
+/// Optional includes (`-include` / `sinclude`) explicitly tolerate a missing
+/// file. Names that can't be resolved statically (`include $(shell ...)`)
+/// are skipped.
+fn check_include_files(source_text: &str, includes: &[ResolvedInclude]) -> Vec<Diagnostic> {
+    includes
+        .iter()
+        .filter_map(|inc| {
+            let range = text_range_to_lsp_range(source_text, inc.path.range);
+            match &inc.resolution {
+                Resolution::Missing(_) if !inc.path.optional => Some(make_diagnostic(
+                    range,
+                    DiagnosticSeverity::WARNING,
+                    "missing-include-file",
+                    format!("included file '{}' does not exist", inc.path.name),
+                )),
+                Resolution::Unreadable(path, error) => Some(make_diagnostic(
+                    range,
+                    DiagnosticSeverity::WARNING,
+                    "unreadable-include-file",
+                    format!(
+                        "included file '{}' could not be read: {}",
+                        path.display(),
+                        error
+                    ),
+                )),
+                _ => None,
+            }
+        })
+        .collect()
 }
 
 /// Check for rules with no prerequisites and no recipe lines — these are
@@ -822,7 +911,11 @@ fn check_missing_include_file(
 /// Hint-level: a regular target that already exists as a file is fine to
 /// declare empty (it relies on the file's existence). The hint nudges the
 /// common case where the author meant to make it phony.
-fn check_empty_rule_probably_phony(source_text: &str, makefile: &Makefile) -> Vec<Diagnostic> {
+fn check_empty_rule_probably_phony(
+    source_text: &str,
+    makefile: &Makefile,
+    external: &ExternalSymbols,
+) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
 
     for rule in makefile.rules() {
@@ -843,7 +936,7 @@ fn check_empty_rule_probably_phony(source_text: &str, makefile: &Makefile) -> Ve
             if target.starts_with('.') || target.contains('%') {
                 continue;
             }
-            if makefile.is_phony(target) {
+            if makefile.is_phony(target) || external.phony.contains(target) {
                 continue;
             }
 
@@ -2140,11 +2233,37 @@ mod tests {
     }
 
     #[test]
-    fn test_include_with_variable_skipped() {
+    fn test_include_with_literal_variable_resolved() {
         let dir = tempfile::tempdir().unwrap();
         let codes = codes_with_dir("CONFIG = config.mk\ninclude $(CONFIG)\n", dir.path());
-        // Can't resolve $(CONFIG) at lint time, so we don't flag.
+        assert!(codes.contains(&"missing-include-file".to_string()));
+    }
+
+    #[test]
+    fn test_include_with_variable_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let codes = codes_with_dir("CONFIG ?= config.mk\ninclude $(CONFIG)\n", dir.path());
+        // Can't resolve $(CONFIG) at lint time, since it may be overridden.
         assert!(!codes.contains(&"missing-include-file".to_string()));
+    }
+
+    #[test]
+    fn test_missing_include_file_among_several() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.mk"), "").unwrap();
+        let diags = diags_with_dir("include a.mk b.mk\n", dir.path());
+        let missing: Vec<(Range, String)> = diags
+            .into_iter()
+            .filter(|d| d.code == Some(NumberOrString::String("missing-include-file".to_string())))
+            .map(|d| (d.range, d.message))
+            .collect();
+        assert_eq!(
+            missing,
+            vec![(
+                Range::new(Position::new(0, 13), Position::new(0, 17)),
+                "included file 'b.mk' does not exist".to_string()
+            )]
+        );
     }
 
     #[test]
@@ -2463,5 +2582,68 @@ mod tests {
         assert_eq!(unt.len(), 1);
         assert_eq!(unt[0].message, "'ifdef' is missing a matching 'endif'");
         assert_eq!(unt[0].severity, Some(DiagnosticSeverity::ERROR));
+    }
+
+    fn file_set_codes(fx: &crate::workspace::tests::Fixture, name: &str) -> Vec<String> {
+        let (mut ws, makefile) = fx.open("Makefile");
+        ws.file_set(&makefile).unwrap();
+        let uri = if name == "Makefile" {
+            makefile
+        } else {
+            fx.open_in(&mut ws, name)
+        };
+        let mut codes: Vec<String> = get_file_set_diagnostics(&ws.file_set(&uri).unwrap())
+            .into_iter()
+            .filter_map(|d| d.code)
+            .map(|c| match c {
+                NumberOrString::String(s) => s,
+                NumberOrString::Number(n) => n.to_string(),
+            })
+            .collect();
+        codes.sort();
+        codes
+    }
+
+    #[test]
+    fn test_cross_file_variables() {
+        let fx = crate::workspace::tests::Fixture::new(&[
+            (
+                "Makefile",
+                "TOOL = x\ninclude rules.mk\nall:\n\t$(FROM_RULES)\n",
+            ),
+            ("rules.mk", "FROM_RULES = y\nOUT = $(TOOL)\n"),
+        ]);
+        let empty: Vec<String> = vec![];
+        // Without the includer, rules.mk would report undefined-variable for
+        // TOOL and unused-variable for FROM_RULES and OUT.
+        assert_eq!(file_set_codes(&fx, "Makefile"), empty);
+        assert_eq!(file_set_codes(&fx, "rules.mk"), vec!["unused-variable"]);
+    }
+
+    #[test]
+    fn test_cross_file_phony_targets() {
+        let fx = crate::workspace::tests::Fixture::new(&[
+            ("Makefile", "include rules.mk\n.PHONY: build\nall: lint\n"),
+            ("rules.mk", ".PHONY: lint\nbuild:\n\techo\nlint:\n"),
+        ]);
+        let empty: Vec<String> = vec![];
+        assert_eq!(file_set_codes(&fx, "Makefile"), empty);
+        assert_eq!(file_set_codes(&fx, "rules.mk"), empty);
+    }
+
+    #[test]
+    fn test_unreadable_include_file() {
+        let fx = crate::workspace::tests::Fixture::new(&[("Makefile", "include bad.mk\n")]);
+        std::fs::write(fx.path("bad.mk"), [0xff]).unwrap();
+        let (mut ws, uri) = fx.open("Makefile");
+        let diags = get_file_set_diagnostics(&ws.file_set(&uri).unwrap());
+        let messages: Vec<String> = diags.into_iter().map(|d| d.message).collect();
+        assert_eq!(
+            messages,
+            vec![format!(
+                "included file '{}' could not be read: stream did not contain valid UTF-8",
+                fx.path("bad.mk").display()
+            )]
+        );
     }
 }
