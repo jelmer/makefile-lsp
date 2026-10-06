@@ -55,6 +55,7 @@ pub fn get_diagnostics(
     diagnostics.extend(check_self_dependency(source_text, &makefile));
     diagnostics.extend(check_circular_dependencies(source_text, &makefile));
     diagnostics.extend(check_duplicate_targets(source_text, &makefile));
+    diagnostics.extend(check_mixed_rule_separators(source_text, &makefile));
     diagnostics.extend(check_missing_phony_targets(source_text, &makefile));
     diagnostics.extend(check_unused_phony_targets(source_text, &makefile));
     diagnostics.extend(check_include_missing_path(source_text, &makefile));
@@ -1048,6 +1049,107 @@ fn check_shell_in_recursive_assignment(source_text: &str, makefile: &Makefile) -
     diagnostics
 }
 
+/// Check for targets that have both single-colon and double-colon rules.
+///
+/// GNU Make refuses to run such a makefile ("target file 'x' has both : and
+/// :: entries"). Pattern rules are exempt, as `::` there marks a terminal
+/// rule rather than a separate kind of entry. Rules in different branches
+/// of a conditional never both take effect, so they do not conflict.
+fn check_mixed_rule_separators(source_text: &str, makefile: &Makefile) -> Vec<Diagnostic> {
+    struct Seen {
+        double_colon: bool,
+        line: u32,
+        branches: Vec<(TextRange, usize)>,
+    }
+
+    let mut diagnostics = Vec::new();
+    let mut seen: HashMap<String, Vec<Seen>> = HashMap::new();
+
+    // A line without a separator is a parse error, not a rule.
+    for rule in makefile.rules().filter(|r| r.operator().is_some()) {
+        let double_colon = rule.is_double_colon();
+        let branches = conditional_branches(rule.syntax());
+        for target in rule.targets() {
+            if target.contains('%') {
+                continue;
+            }
+            let range = text_range_to_lsp_range(source_text, target_range(&rule, &target));
+            let previous = seen.entry(target.clone()).or_default();
+            let conflict = previous.iter().find(|p| {
+                p.double_colon != double_colon && !mutually_exclusive(&p.branches, &branches)
+            });
+            if let Some(first) = conflict {
+                let separator = |dc| if dc { "::" } else { ":" };
+                diagnostics.push(make_diagnostic(
+                    range,
+                    DiagnosticSeverity::ERROR,
+                    "mixed-rule-separator",
+                    format!(
+                        "target '{}' has both : and :: rules (first defined with '{}' on line {})",
+                        target,
+                        separator(first.double_colon),
+                        first.line + 1
+                    ),
+                ));
+            }
+            previous.push(Seen {
+                double_colon,
+                line: range.start.line,
+                branches: branches.clone(),
+            });
+        }
+    }
+
+    diagnostics
+}
+
+/// The range of `target` in the head of `rule`, or of all its targets if it
+/// is not written literally (e.g. because of a line continuation).
+fn target_range(rule: &Rule, target: &str) -> TextRange {
+    let Some(targets) = rule
+        .syntax()
+        .children()
+        .find(|c| c.kind() == SyntaxKind::TARGETS)
+    else {
+        return rule.syntax().text_range();
+    };
+    let text = targets.text().to_string();
+    let mut offset = 0;
+    for word in text.split(|c: char| c.is_whitespace()) {
+        if word == target {
+            let start = targets.text_range().start() + TextSize::from(offset as u32);
+            return TextRange::at(start, TextSize::of(word));
+        }
+        offset += word.len() + 1;
+    }
+    targets.text_range()
+}
+
+/// For each conditional enclosing `node`, its range and the index of the
+/// branch `node` is in.
+fn conditional_branches(
+    node: &rowan::SyntaxNode<makefile_lossless::Lang>,
+) -> Vec<(TextRange, usize)> {
+    node.ancestors()
+        .zip(node.ancestors().skip(1))
+        .filter(|(_, parent)| parent.kind() == SyntaxKind::CONDITIONAL)
+        .map(|(child, conditional)| {
+            let branch = conditional
+                .children()
+                .take_while(|c| c != &child)
+                .filter(|c| c.kind() == SyntaxKind::CONDITIONAL_ELSE)
+                .count();
+            (conditional.text_range(), branch)
+        })
+        .collect()
+}
+
+/// Whether two sets of conditional branches can never be taken together.
+fn mutually_exclusive(a: &[(TextRange, usize)], b: &[(TextRange, usize)]) -> bool {
+    a.iter()
+        .any(|(cond, branch)| b.iter().any(|(c, br)| c == cond && br != branch))
+}
+
 /// Check for duplicate prerequisites within a single rule.
 ///
 /// `foo: a b a` is harmless but always a mistake — the duplicate adds no
@@ -1775,6 +1877,89 @@ mod tests {
     }
 
     // Duplicate prerequisites tests
+
+    fn mixed_separator_diags(text: &str) -> Vec<(Range, String)> {
+        get_diags(text)
+            .into_iter()
+            .filter(|d| d.code == Some(NumberOrString::String("mixed-rule-separator".to_string())))
+            .map(|d| (d.range, d.message))
+            .collect()
+    }
+
+    #[test]
+    fn test_mixed_rule_separator() {
+        let diags = mixed_separator_diags("x: a\nx:: b\n");
+        assert_eq!(
+            diags,
+            vec![(
+                Range::new(Position::new(1, 0), Position::new(1, 1)),
+                "target 'x' has both : and :: rules (first defined with ':' on line 1)".to_string()
+            )]
+        );
+        let d = get_diags("x: a\nx:: b\n");
+        assert_eq!(d[0].severity, Some(DiagnosticSeverity::ERROR));
+    }
+
+    #[test]
+    fn test_mixed_rule_separator_double_colon_first() {
+        let diags = mixed_separator_diags("a x:: y\n\techo 1\nx: z\n");
+        assert_eq!(
+            diags,
+            vec![(
+                Range::new(Position::new(2, 0), Position::new(2, 1)),
+                "target 'x' has both : and :: rules (first defined with '::' on line 1)"
+                    .to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn test_mixed_rule_separator_consistent_ok() {
+        assert_eq!(mixed_separator_diags("x:: a\nx:: b\n"), vec![]);
+        assert_eq!(mixed_separator_diags("x: a\nx: b\n"), vec![]);
+    }
+
+    #[test]
+    fn test_mixed_rule_separator_in_conditional_branches_ok() {
+        assert_eq!(
+            mixed_separator_diags("ifdef A\nx: a\nelse ifdef B\nx:: b\nelse\nx: c\nendif\n"),
+            vec![]
+        );
+    }
+
+    #[test]
+    fn test_mixed_rule_separator_in_conditional() {
+        assert_eq!(
+            mixed_separator_diags("x: a\nifdef A\nx:: b\nendif\n"),
+            vec![(
+                Range::new(Position::new(2, 0), Position::new(2, 1)),
+                "target 'x' has both : and :: rules (first defined with ':' on line 1)".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn test_mixed_rule_separator_archive_member() {
+        assert_eq!(mixed_separator_diags("lib.a: x\nlib.a(m.o):: y\n"), vec![]);
+        assert_eq!(
+            mixed_separator_diags("lib.a(m.o): x\nlib.a(m.o):: y\n"),
+            vec![(
+                Range::new(Position::new(1, 0), Position::new(1, 10)),
+                "target 'lib.a(m.o)' has both : and :: rules (first defined with ':' on line 1)"
+                    .to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn test_mixed_rule_separator_variable_in_target() {
+        assert_eq!(mixed_separator_diags("foo: x\nfoo$(V):: y\n"), vec![]);
+    }
+
+    #[test]
+    fn test_mixed_rule_separator_pattern_rule_ok() {
+        assert_eq!(mixed_separator_diags("%.o: %.c\n%.o:: %.s\n"), vec![]);
+    }
 
     #[test]
     fn test_duplicate_prerequisite() {

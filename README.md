@@ -55,6 +55,7 @@ Each diagnostic carries a code, so it can be identified in editors:
 | `shell-in-recursive-assignment` | warning | `$(shell ...)` in an `=` assignment, which runs on every expansion |
 | `trailing-whitespace-in-value` | warning | trailing whitespace that becomes part of a variable value |
 | `duplicate-target` | warning | target defined by more than one single-colon rule |
+| `mixed-rule-separator` | error | target with both `:` and `::` rules |
 | `self-dependency` | warning | target that lists itself as a prerequisite |
 | `circular-dependency` | warning | cycle between targets |
 | `duplicate-prerequisite` | warning | prerequisite listed more than once in the same rule |
