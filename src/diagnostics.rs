@@ -1009,6 +1009,7 @@ fn check_mixed_assignment_operators(source_text: &str, makefile: &Makefile) -> V
             ));
         }
     }
+    diagnostics.sort_by_key(|d| d.range.start);
 
     diagnostics
 }
@@ -1231,7 +1232,6 @@ fn check_redundant_transitive_prerequisites(
         if prereqs.len() < 2 {
             continue;
         }
-        let prereq_set: HashSet<&str> = prereqs.iter().map(String::as_str).collect();
         let branches = conditional_branches(rule.syntax());
 
         let mut reported: HashSet<&str> = HashSet::new();
@@ -1240,9 +1240,8 @@ fn check_redundant_transitive_prerequisites(
                 continue;
             }
             // Reachable via any *other* prereq in this rule?
-            let via = prereq_set.iter().find(|other| {
-                **other != prereq.as_str()
-                    && graph.reachable_from(other, &branches).contains(prereq)
+            let via = prereqs.iter().find(|other| {
+                *other != prereq && graph.reachable_from(other, &branches).contains(prereq)
             });
             if let Some(via) = via {
                 let rule_range = text_range_to_lsp_range(source_text, rule.syntax().text_range());
@@ -2368,6 +2367,18 @@ mod tests {
     }
 
     #[test]
+    fn test_redundant_prereq_via_first_prerequisite() {
+        // Both `b` and `a` pull in `c`; report the first in the rule.
+        let text = "all: b a c\na: c\nb: c\nc:\n";
+        for _ in 0..20 {
+            assert_eq!(
+                redundant_messages(text),
+                vec!["prerequisite 'c' is already pulled in transitively via 'b'".to_string()]
+            );
+        }
+    }
+
+    #[test]
     fn test_redundant_prereq_skips_single_prereq_rule() {
         let text = "all: only\n\t@:\nonly:\n\t@:\n";
         let diags = redundant_diags(text);
@@ -3270,6 +3281,14 @@ mod tests {
     fn test_mixed_assignment_outside_and_inside_conditional() {
         let text = "FOO = a\nifdef X\nFOO := b\nelse\nFOO = c\nendif\n";
         assert_eq!(mixed_assignment_lines(text), vec![0, 2]);
+    }
+
+    #[test]
+    fn test_mixed_assignment_in_source_order() {
+        let text = "A = 1\nB = 1\nC = 1\nA := 2\nB := 2\nC := 2\n";
+        for _ in 0..20 {
+            assert_eq!(mixed_assignment_lines(text), vec![0, 1, 2, 3, 4, 5]);
+        }
     }
 
     // Unterminated conditional tests
