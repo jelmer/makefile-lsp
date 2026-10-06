@@ -289,10 +289,41 @@ fn final_newline_edit(text: &str, tail_start: usize) -> Option<ByteEdit> {
     })
 }
 
+/// Whether `line` (0-based) is the first line of a rule header, so that
+/// a recipe line may follow it.
+pub fn is_rule_header(makefile: &Makefile, line: usize) -> bool {
+    makefile.rules().any(|rule| {
+        rule.line() == line && rule.operator().is_some() && rule.scoped_assignment().is_none()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tower_lsp_server::ls_types::Position;
+
+    fn rule_header_lines(text: &str) -> Vec<usize> {
+        let makefile = Makefile::parse(text).tree();
+        (0..text.lines().count())
+            .filter(|&line| is_rule_header(&makefile, line))
+            .collect()
+    }
+
+    #[test]
+    fn test_is_rule_header() {
+        assert_eq!(rule_header_lines("all: foo\n\techo a: b\n"), vec![0]);
+        assert_eq!(rule_header_lines("a b:: c\n"), vec![0]);
+        assert_eq!(
+            rule_header_lines("x := a:b\nall: CFLAGS = -O2\n"),
+            Vec::<usize>::new()
+        );
+        assert_eq!(
+            rule_header_lines("ifeq ($(A),a:b)\nendif\n"),
+            Vec::<usize>::new()
+        );
+        assert_eq!(rule_header_lines("# note: x\nall:\n"), vec![1]);
+        assert_eq!(rule_header_lines("all: $(SRCS:.c=.o)\n"), vec![0]);
+    }
 
     fn format(text: &str) -> String {
         let parsed = Makefile::parse(text);
