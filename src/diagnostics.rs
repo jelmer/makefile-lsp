@@ -3,9 +3,11 @@
 use std::collections::{HashMap, HashSet};
 
 use makefile_lossless::{
-    Conditional, Makefile, MakefileItem, Parse, SyntaxKind, VariableReference,
+    Conditional, Makefile, MakefileItem, Parse, ParseErrorKind, PositionedParseError, SyntaxKind,
+    VariableReference,
 };
 use rowan::ast::AstNode;
+use text_size::{TextRange, TextSize};
 use tower_lsp_server::ls_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Position, Range};
 
 use crate::builtins;
@@ -40,15 +42,7 @@ pub fn get_diagnostics(
     let mut diagnostics: Vec<Diagnostic> = parsed
         .positioned_errors()
         .iter()
-        .map(|error| {
-            let range = text_range_to_lsp_range(source_text, error.range);
-            make_diagnostic(
-                range,
-                DiagnosticSeverity::ERROR,
-                error.code.as_deref().unwrap_or("parse-error"),
-                error.message.clone(),
-            )
-        })
+        .map(|error| parse_error_diagnostic(source_text, error))
         .collect();
 
     let makefile = parsed.tree();
@@ -64,7 +58,6 @@ pub fn get_diagnostics(
     diagnostics.extend(check_missing_phony_targets(source_text, &makefile));
     diagnostics.extend(check_unused_phony_targets(source_text, &makefile));
     diagnostics.extend(check_include_missing_path(source_text, &makefile));
-    diagnostics.extend(check_spaces_in_recipes(source_text, &makefile));
     diagnostics.extend(check_trailing_whitespace_in_value(source_text, &makefile));
     diagnostics.extend(check_duplicate_prerequisites(source_text, &makefile));
     diagnostics.extend(check_redundant_transitive_prerequisites(
@@ -76,13 +69,72 @@ pub fn get_diagnostics(
     diagnostics.extend(check_unterminated_conditionals(source_text, &makefile));
     diagnostics.extend(check_unused_variables(source_text, &makefile));
     diagnostics.extend(check_mixed_assignment_operators(source_text, &makefile));
-    diagnostics.extend(check_orphan_recipe_line(source_text, &makefile));
     diagnostics.extend(check_empty_rule_probably_phony(source_text, &makefile));
     if let Some(dir) = base_dir {
         diagnostics.extend(check_missing_include_file(source_text, &makefile, dir));
     }
 
     diagnostics
+}
+
+/// Convert a parse error to a diagnostic.
+///
+/// Recipe lines indented with spaces and recipe lines outside any rule are
+/// both parse errors, but common enough mistakes to get their own codes (and
+/// quick fixes in code_actions).
+fn parse_error_diagnostic(source_text: &str, error: &PositionedParseError) -> Diagnostic {
+    if let Some(indent) = space_indent_range(source_text, error) {
+        return make_diagnostic(
+            text_range_to_lsp_range(source_text, indent),
+            DiagnosticSeverity::ERROR,
+            "spaces-instead-of-tab",
+            "recipe lines must start with a tab, not spaces".to_string(),
+        );
+    }
+    if error.kind() == ParseErrorKind::RecipeBeforeFirstTarget {
+        return make_diagnostic(
+            text_range_to_lsp_range(source_text, line_range(source_text, error.range.start())),
+            DiagnosticSeverity::ERROR,
+            "orphan-recipe-line",
+            "recipe line is not attached to any target".to_string(),
+        );
+    }
+    make_diagnostic(
+        text_range_to_lsp_range(source_text, error.range),
+        DiagnosticSeverity::ERROR,
+        error.code.as_deref().unwrap_or("parse-error"),
+        error.message.clone(),
+    )
+}
+
+/// If `error` is a missing separator on a line indented with spaces, return
+/// the range of those spaces.
+///
+/// GNU make only accepts a tab (or `.RECIPEPREFIX`) before a recipe line, so
+/// a space-indented recipe is parsed as a rule without a `:`. A line of plain
+/// text indented with spaces is almost always a recipe that was meant to be
+/// indented with a tab.
+pub fn space_indent_range(source_text: &str, error: &PositionedParseError) -> Option<TextRange> {
+    if error.kind() != ParseErrorKind::MissingSeparator {
+        return None;
+    }
+    let line = line_range(source_text, error.range.start());
+    let line_text = &source_text[line];
+    let spaces = line_text.len() - line_text.trim_start_matches(' ').len();
+    if spaces == 0 {
+        return None;
+    }
+    Some(TextRange::at(line.start(), TextSize::from(spaces as u32)))
+}
+
+/// The range of the line containing `offset`, excluding its line ending.
+fn line_range(source_text: &str, offset: TextSize) -> TextRange {
+    let offset: usize = offset.into();
+    let start = source_text[..offset].rfind('\n').map_or(0, |i| i + 1);
+    let end = source_text[offset..]
+        .find('\n')
+        .map_or(source_text.len(), |i| offset + i);
+    TextRange::new(TextSize::from(start as u32), TextSize::from(end as u32))
 }
 
 /// Check for references to undefined variables.
@@ -437,47 +489,6 @@ fn check_include_missing_path(source_text: &str, makefile: &Makefile) -> Vec<Dia
     diagnostics
 }
 
-/// Check for recipe lines that use spaces instead of a tab for indentation.
-///
-/// GNU Make requires recipe lines to start with a tab character. When spaces
-/// are used instead, make rejects the file with a confusing error message.
-fn check_spaces_in_recipes(source_text: &str, makefile: &Makefile) -> Vec<Diagnostic> {
-    let mut diagnostics = Vec::new();
-
-    for rule in makefile.rules() {
-        for recipe in rule.recipe_nodes() {
-            let indent = recipe.indent();
-            if let Some(ref indent_text) = indent {
-                if !indent_text.starts_with('\t') {
-                    // Find the INDENT token's text range for precise positioning
-                    let indent_range = recipe
-                        .syntax()
-                        .children_with_tokens()
-                        .find_map(|it| {
-                            if let Some(token) = it.as_token() {
-                                if token.kind() == SyntaxKind::INDENT {
-                                    return Some(token.text_range());
-                                }
-                            }
-                            None
-                        })
-                        .unwrap_or_else(|| recipe.syntax().text_range());
-
-                    let range = text_range_to_lsp_range(source_text, indent_range);
-                    diagnostics.push(make_diagnostic(
-                        range,
-                        DiagnosticSeverity::ERROR,
-                        "spaces-instead-of-tab",
-                        "recipe lines must start with a tab, not spaces".to_string(),
-                    ));
-                }
-            }
-        }
-    }
-
-    diagnostics
-}
-
 /// Check for automatic variables that expand to empty in their context.
 ///
 /// `$<`, `$^`, `$+`, `$?` all expand to (part of) the prerequisite list, so
@@ -676,13 +687,8 @@ fn check_unused_variables(source_text: &str, makefile: &Makefile) -> Vec<Diagnos
             continue;
         }
 
-        // Point at the IDENTIFIER token (the variable name) for precision.
         let name_range = var_def
-            .syntax()
-            .children_with_tokens()
-            .filter_map(|c| c.into_token())
-            .find(|t| t.kind() == SyntaxKind::IDENTIFIER && t.text() != "export")
-            .map(|t| t.text_range())
+            .name_range()
             .unwrap_or_else(|| var_def.syntax().text_range());
 
         let range = text_range_to_lsp_range(source_text, name_range);
@@ -853,46 +859,6 @@ fn check_empty_rule_probably_phony(source_text: &str, makefile: &Makefile) -> Ve
                 ),
             ));
         }
-    }
-
-    diagnostics
-}
-
-/// Check for tab-indented recipe lines that aren't attached to any rule.
-///
-/// A line like `\techo something` outside any rule is parsed as a stray
-/// INDENT + TEXT at the root level. This almost always means the author
-/// forgot the target above it, or a copy-paste leftover.
-fn check_orphan_recipe_line(source_text: &str, makefile: &Makefile) -> Vec<Diagnostic> {
-    let mut diagnostics = Vec::new();
-    let root = makefile.syntax();
-
-    let mut iter = root.children_with_tokens().peekable();
-    while let Some(elem) = iter.next() {
-        let Some(token) = elem.as_token() else {
-            continue;
-        };
-        if token.kind() != SyntaxKind::INDENT {
-            continue;
-        }
-        // Empty indent (no following text) is not a recipe line.
-        let mut end = token.text_range().end();
-        while let Some(next) = iter.peek() {
-            let kind = next.kind();
-            end = next.text_range().end();
-            iter.next();
-            if kind == SyntaxKind::NEWLINE {
-                break;
-            }
-        }
-        let range = text_size::TextRange::new(token.text_range().start(), end);
-        let lsp_range = text_range_to_lsp_range(source_text, range);
-        diagnostics.push(make_diagnostic(
-            lsp_range,
-            DiagnosticSeverity::ERROR,
-            "orphan-recipe-line",
-            "recipe line is not attached to any target".to_string(),
-        ));
     }
 
     diagnostics
@@ -2283,6 +2249,48 @@ mod tests {
         let text = "VAR = 1\n\techo orphan\n";
         let codes = diag_codes(text);
         assert!(codes.contains(&"orphan-recipe-line".to_string()));
+    }
+
+    #[test]
+    fn test_space_indented_recipe_continuation_ok() {
+        let text = "all:\n\techo a \\\n    b\n";
+        assert_eq!(diag_codes(text), Vec::<String>::new());
+    }
+
+    #[test]
+    fn test_spaces_instead_of_tab_range() {
+        let diags = get_diags("all:\n    echo done\n");
+        assert_eq!(
+            diags
+                .iter()
+                .filter(
+                    |d| d.code == Some(NumberOrString::String("spaces-instead-of-tab".to_string()))
+                )
+                .map(|d| d.range)
+                .collect::<Vec<_>>(),
+            vec![Range::new(Position::new(1, 0), Position::new(1, 4))]
+        );
+    }
+
+    #[test]
+    fn test_automatic_variables_in_value_not_empty_references() {
+        let text = "Z = $@ $< $(@D)\nall:\n\techo $(Z)\n";
+        assert_eq!(diag_codes(text), Vec::<String>::new());
+    }
+
+    #[test]
+    fn test_unused_define_names_variable() {
+        let diags = get_diags("define FOO\nbar\nendef\n");
+        assert_eq!(
+            diags
+                .iter()
+                .map(|d| (d.message.as_str(), d.range))
+                .collect::<Vec<_>>(),
+            vec![(
+                "variable 'FOO' is defined but never used",
+                Range::new(Position::new(0, 7), Position::new(0, 10))
+            )]
+        );
     }
 
     #[test]

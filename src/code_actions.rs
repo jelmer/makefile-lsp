@@ -33,7 +33,7 @@ pub fn get_code_actions(
         uri,
     ));
     actions.extend(replace_spaces_with_tab_action(
-        &makefile,
+        parsed,
         source_text,
         byte_offset,
         uri,
@@ -215,54 +215,56 @@ fn define_variable_action(
 
 /// Offer "Replace spaces with tab" for a recipe line indented with spaces.
 fn replace_spaces_with_tab_action(
-    makefile: &Makefile,
+    parsed: &Parse<Makefile>,
     source_text: &str,
     byte_offset: usize,
     uri: &Uri,
 ) -> Option<CodeAction> {
-    let offset = text_size::TextSize::from(byte_offset as u32);
+    let indent = space_indented_recipes(parsed, source_text).find(|range| {
+        let start = usize::from(range.start());
+        start <= byte_offset && !source_text[start..byte_offset].contains('\n')
+    })?;
+    tab_edit_action("Replace spaces with tab", vec![indent], source_text, uri)
+}
 
-    for rule in makefile.rules() {
-        for recipe in rule.recipe_nodes() {
-            if !recipe.syntax().text_range().contains(offset) {
-                continue;
-            }
-            // Find the INDENT token
-            let indent_token = recipe.syntax().children_with_tokens().find_map(|it| {
-                if let Some(token) = it.as_token() {
-                    if token.kind() == SyntaxKind::INDENT {
-                        return Some(token.clone());
-                    }
-                }
-                None
-            })?;
+/// Ranges of the leading spaces of recipe lines indented with spaces.
+fn space_indented_recipes<'a>(
+    parsed: &'a Parse<Makefile>,
+    source_text: &'a str,
+) -> impl Iterator<Item = text_size::TextRange> + 'a {
+    parsed
+        .positioned_errors()
+        .iter()
+        .filter_map(|error| crate::diagnostics::space_indent_range(source_text, error))
+}
 
-            // Only offer if the indent is spaces, not a tab
-            if indent_token.text().starts_with('\t') {
-                return None;
-            }
+/// Build a quick fix replacing each of `ranges` with a tab.
+fn tab_edit_action(
+    title: &str,
+    ranges: Vec<text_size::TextRange>,
+    source_text: &str,
+    uri: &Uri,
+) -> Option<CodeAction> {
+    let edits = ranges
+        .into_iter()
+        .map(|range| TextEdit {
+            range: text_range_to_lsp_range(source_text, range),
+            new_text: "\t".to_string(),
+        })
+        .collect();
 
-            let range = text_range_to_lsp_range(source_text, indent_token.text_range());
-            let edit = TextEdit {
-                range,
-                new_text: "\t".to_string(),
-            };
+    let mut changes = std::collections::HashMap::new();
+    changes.insert(uri.clone(), edits);
 
-            let mut changes = std::collections::HashMap::new();
-            changes.insert(uri.clone(), vec![edit]);
-
-            return Some(CodeAction {
-                title: "Replace spaces with tab".to_string(),
-                kind: Some(CodeActionKind::QUICKFIX),
-                edit: Some(WorkspaceEdit {
-                    changes: Some(changes),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            });
-        }
-    }
-    None
+    Some(CodeAction {
+        title: title.to_string(),
+        kind: Some(CodeActionKind::QUICKFIX),
+        edit: Some(WorkspaceEdit {
+            changes: Some(changes),
+            ..Default::default()
+        }),
+        ..Default::default()
+    })
 }
 
 /// Offer "Remove trailing whitespace" when the cursor is on a variable
@@ -530,45 +532,16 @@ fn replace_all_spaces_with_tabs_action(
     source_text: &str,
     uri: &Uri,
 ) -> Option<CodeAction> {
-    let makefile = parsed.tree();
-
-    let mut edits: Vec<TextEdit> = Vec::new();
-    for rule in makefile.rules() {
-        for recipe in rule.recipe_nodes() {
-            let Some(indent_token) = recipe.syntax().children_with_tokens().find_map(|it| {
-                it.as_token()
-                    .filter(|t| t.kind() == SyntaxKind::INDENT)
-                    .cloned()
-            }) else {
-                continue;
-            };
-            if indent_token.text().starts_with('\t') {
-                continue;
-            }
-            let range = text_range_to_lsp_range(source_text, indent_token.text_range());
-            edits.push(TextEdit {
-                range,
-                new_text: "\t".to_string(),
-            });
-        }
-    }
-
-    if edits.len() < 2 {
+    let ranges: Vec<_> = space_indented_recipes(parsed, source_text).collect();
+    if ranges.len() < 2 {
         return None;
     }
-
-    let mut changes = std::collections::HashMap::new();
-    changes.insert(uri.clone(), edits);
-
-    Some(CodeAction {
-        title: "Convert all space-indented recipes to tabs".to_string(),
-        kind: Some(CodeActionKind::QUICKFIX),
-        edit: Some(WorkspaceEdit {
-            changes: Some(changes),
-            ..Default::default()
-        }),
-        ..Default::default()
-    })
+    tab_edit_action(
+        "Convert all space-indented recipes to tabs",
+        ranges,
+        source_text,
+        uri,
+    )
 }
 
 /// Offer "Inline variable" when the cursor is on a variable definition with a
