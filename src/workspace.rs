@@ -13,7 +13,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use makefile_lossless::{Include, Makefile, MakefileVariant, Parse, SyntaxKind};
+use makefile_lossless::{Makefile, MakefileVariant, Parse, SyntaxKind};
 use rowan::ast::AstNode;
 use text_size::{TextRange, TextSize};
 use tower_lsp_server::ls_types::Uri;
@@ -126,9 +126,7 @@ pub struct IncludePath {
 /// GNU make allows several names per directive; each gets its own entry.
 pub fn include_paths(makefile: &Makefile, text: &str) -> Vec<IncludePath> {
     makefile
-        .syntax()
-        .descendants()
-        .filter_map(Include::cast)
+        .includes()
         .flat_map(|inc| {
             let optional = inc.is_optional();
             let Some(range) = inc.path_range() else {
