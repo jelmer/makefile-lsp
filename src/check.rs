@@ -249,7 +249,11 @@ pub fn check_file(path: &Path) -> std::io::Result<Vec<Finding>> {
         Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
         _ => PathBuf::from("."),
     };
-    let diagnostics = crate::diagnostics::get_diagnostics(&text, &parsed, Some(&base_dir));
+    let mut diagnostics = crate::diagnostics::get_diagnostics(&text, &parsed, Some(&base_dir));
+    diagnostics.extend(crate::shell_check::check_shell_syntax(
+        &text,
+        &parsed.tree(),
+    ));
     let mut findings: Vec<Finding> = diagnostics
         .iter()
         .map(|d| Finding::from_diagnostic(path, &text, d))
@@ -764,6 +768,19 @@ mod tests {
         );
         assert_eq!(code, EXIT_ERROR);
         assert!(err.contains("missing"), "{err}");
+    }
+
+    #[test]
+    fn test_check_file_includes_shell_syntax() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Makefile");
+        std::fs::write(&path, ".PHONY: all\nall:\n\tls )\n").unwrap();
+        let codes: Vec<_> = check_file(&path)
+            .unwrap()
+            .into_iter()
+            .map(|f| f.code)
+            .collect();
+        assert_eq!(codes, vec![Some("invalid-shell-syntax".to_string())]);
     }
 
     #[test]

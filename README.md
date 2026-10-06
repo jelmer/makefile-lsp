@@ -66,6 +66,7 @@ Each diagnostic carries a code, so it can be identified in editors:
 | `empty-rule-probably-phony` | hint | rule without prerequisites or recipe that should probably be phony |
 | `spaces-instead-of-tab` | error | recipe line indented with spaces |
 | `orphan-recipe-line` | error | recipe line outside of any rule |
+| `invalid-shell-syntax` | warning | recipe line rejected by `sh -n` (or the shell `SHELL` names); checked on open and save only |
 | `unterminated-conditional` | error | `ifdef`/`ifeq` without a matching `endif` |
 | `include-missing-path` | error | `include` without a path |
 | `missing-include-file` | warning | `include` of a file that does not exist |
