@@ -4,10 +4,12 @@ use std::collections::HashMap;
 
 use makefile_lossless::Makefile;
 use text_size::TextRange;
-use tower_lsp_server::ls_types::{Position, PrepareRenameResponse, TextEdit, Uri, WorkspaceEdit};
+use tower_lsp_server::ls_types::{
+    Position, PrepareRenameResponse, Range, TextEdit, Uri, WorkspaceEdit,
+};
 
-use crate::position::try_position_to_offset;
-use crate::references::{symbol_at, symbol_locations, Symbol};
+use crate::position::{text_range_to_lsp_range, try_position_to_offset};
+use crate::references::{single_char_reference_ranges, symbol_at, symbol_locations, Symbol};
 use crate::workspace::FileSet;
 
 /// Why a symbol can't be renamed.
@@ -130,12 +132,26 @@ pub fn rename(
 
     let mut changes: HashMap<Uri, Vec<TextEdit>> = HashMap::new();
     for doc in files.docs() {
+        let makefile = doc.makefile();
+        // `$X` renamed to `$NEW` would be read as `$(N)EW`.
+        let needs_parens: Vec<Range> = if new_name.chars().count() > 1 {
+            single_char_reference_ranges(&makefile)
+                .into_iter()
+                .map(|r| text_range_to_lsp_range(doc.text(), r))
+                .collect()
+        } else {
+            vec![]
+        };
         let edits: Vec<TextEdit> =
-            symbol_locations(&doc.makefile(), doc.text(), doc.uri(), &symbol, true)
+            symbol_locations(&makefile, doc.text(), doc.uri(), &symbol, true)
                 .into_iter()
                 .map(|loc| TextEdit {
+                    new_text: if needs_parens.contains(&loc.range) {
+                        format!("({new_name})")
+                    } else {
+                        new_name.to_string()
+                    },
                     range: loc.range,
-                    new_text: new_name.to_string(),
                 })
                 .collect();
         if edits.is_empty() {
@@ -162,7 +178,6 @@ mod tests {
     use super::*;
     use crate::workspace::tests::Fixture;
     use crate::workspace::{Document, Workspace};
-    use tower_lsp_server::ls_types::Range;
 
     fn test_uri() -> Uri {
         "file:///test/Makefile".parse().unwrap()
@@ -225,6 +240,46 @@ mod tests {
             new_text: "x".to_string(),
         };
         assert_eq!(edits, vec![edit(0, 5, 6), edit(1, 2, 3)]);
+    }
+
+    fn edit(line: u32, start: u32, end: u32, new_text: &str) -> TextEdit {
+        TextEdit {
+            range: Range::new(Position::new(line, start), Position::new(line, end)),
+            new_text: new_text.to_string(),
+        }
+    }
+
+    #[test]
+    fn test_rename_single_char_reference_to_longer_name() {
+        // `$NEW` would be read as `$(N)EW`.
+        let text = "X = 1\nY = $X ${X}\nall: $X\n";
+        assert_eq!(
+            get_edits(text, Position::new(0, 0), "NEW"),
+            vec![
+                edit(0, 0, 1, "NEW"),
+                edit(1, 5, 6, "(NEW)"),
+                edit(1, 9, 10, "NEW"),
+                edit(2, 6, 7, "(NEW)"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_rename_single_char_reference_to_single_char() {
+        let text = "X = 1\nY = $X $(X)\n";
+        assert_eq!(
+            get_edits(text, Position::new(1, 5), "Z"),
+            vec![edit(0, 0, 1, "Z"), edit(1, 5, 6, "Z"), edit(1, 9, 10, "Z")]
+        );
+    }
+
+    #[test]
+    fn test_rename_to_single_char() {
+        let text = "FOO = 1\nY = $(FOO)\n";
+        assert_eq!(
+            get_edits(text, Position::new(0, 0), "F"),
+            vec![edit(0, 0, 3, "F"), edit(1, 6, 9, "F")]
+        );
     }
 
     #[test]
