@@ -210,6 +210,19 @@ pub(crate) fn variable_references(makefile: &Makefile) -> Vec<(String, TextRange
     refs
 }
 
+/// The name ranges of single-character references such as `$X`, outside
+/// recipes and define bodies.
+pub(crate) fn single_char_reference_ranges(makefile: &Makefile) -> Vec<TextRange> {
+    makefile
+        .variable_references()
+        .filter_map(|reference| {
+            let (_, range) = reference_name(&reference)?;
+            // The name follows the `$` directly, without a parenthesis.
+            (range.start() == reference.text_range().start() + TextSize::from(1)).then_some(range)
+        })
+        .collect()
+}
+
 /// The name of `reference` and its range.
 fn reference_name(reference: &VariableReference) -> Option<(String, TextRange)> {
     let name = reference.name()?;
