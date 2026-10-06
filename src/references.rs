@@ -1,7 +1,12 @@
 //! Find references for Makefiles.
 
-use makefile_lossless::{is_in_prerequisites, variable_at_offset, word_at_offset, Makefile};
+use makefile_lossless::{
+    is_in_prerequisites, word_at_offset, Lang, Makefile, Recipe, SyntaxKind, TextRange,
+    VariableDefinition, VariableReference,
+};
 use rowan::ast::AstNode;
+use rowan::WalkEvent;
+use text_size::TextSize;
 use tower_lsp_server::ls_types::{Location, Position, Range, Uri};
 
 use crate::position::{text_range_to_lsp_range, try_position_to_offset};
@@ -18,8 +23,14 @@ pub enum Symbol {
 /// Identify the symbol at `byte_offset`: a variable reference, a prerequisite,
 /// or the name in a target or variable definition.
 pub fn symbol_at(makefile: &Makefile, source_text: &str, byte_offset: usize) -> Option<Symbol> {
-    if let Some(var_name) = variable_at_offset(source_text, byte_offset) {
-        return Some(Symbol::Variable(var_name.to_string()));
+    let offset = TextSize::from(byte_offset as u32);
+    // The innermost reference, for nested ones such as `$(FOO.$(BAR))`.
+    let reference = variable_references(makefile)
+        .into_iter()
+        .filter(|(_, range)| range.start() <= offset && offset <= range.end())
+        .min_by_key(|(_, range)| range.len());
+    if let Some((name, _)) = reference {
+        return Some(Symbol::Variable(name));
     }
 
     let word = word_at_offset(source_text, byte_offset)?;
@@ -232,37 +243,124 @@ fn find_variable_references(
         }
     }
 
-    // Find all $(VAR) and ${VAR} references in source text
-    let paren_pattern = format!("$({}", var_name);
-    let brace_pattern = format!("${{{}", var_name);
-
-    for pattern in [&paren_pattern, &brace_pattern] {
-        let close = if pattern.starts_with("$(") { ')' } else { '}' };
-        for (idx, _) in source_text.match_indices(pattern.as_str()) {
-            let after = idx + pattern.len();
-            // Check that the next char is the closing delimiter or whitespace/comma (for functions)
-            if after < source_text.len() {
-                let next = source_text.as_bytes()[after];
-                if next == close as u8 || next == b' ' || next == b')' || next == b'}' {
-                    // The variable name starts after "$(" or "${"
-                    let name_start = idx + 2;
-                    let start = crate::position::offset_to_position(
-                        source_text,
-                        text_size::TextSize::from(name_start as u32),
-                    );
-                    let end = Position::new(start.line, start.character + var_name.len() as u32);
-                    locations.push(Location {
-                        uri: uri.clone(),
-                        range: Range::new(start, end),
-                    });
-                }
-            }
+    for (name, range) in variable_references(makefile) {
+        if name == var_name {
+            locations.push(Location {
+                uri: uri.clone(),
+                range: text_range_to_lsp_range(source_text, range),
+            });
         }
     }
 
     locations.sort_by_key(|l| (l.range.start.line, l.range.start.character));
-    locations.dedup_by(|a, b| a.range == b.range);
     locations
+}
+
+/// All `$(VAR)` and `${VAR}` references in the document, and `$V` outside
+/// recipes and define bodies, with the range of the variable name. Function
+/// calls such as `$(shell ...)` are left out, but references in their
+/// arguments are included.
+fn variable_references(makefile: &Makefile) -> Vec<(String, TextRange)> {
+    let mut refs = Vec::new();
+    let mut preorder = makefile.syntax().preorder();
+    while let Some(event) = preorder.next() {
+        let WalkEvent::Enter(node) = event else {
+            continue;
+        };
+        if is_define_body(&node) {
+            // Define bodies are not parsed into nested references.
+            scan_variable_references(
+                &node.text().to_string(),
+                node.text_range().start(),
+                &mut refs,
+            );
+            preorder.skip_subtree();
+        } else if let Some(recipe) = Recipe::cast(node.clone()) {
+            refs.extend(
+                recipe
+                    .variable_references()
+                    .into_iter()
+                    .map(|r| (r.name().to_string(), r.text_range())),
+            );
+        } else if let Some(reference) = VariableReference::cast(node) {
+            if !reference.is_function_call() {
+                refs.extend(reference_name(&reference));
+            }
+        }
+    }
+    refs
+}
+
+fn is_define_body(node: &rowan::SyntaxNode<Lang>) -> bool {
+    node.kind() == SyntaxKind::EXPR
+        && node
+            .parent()
+            .and_then(VariableDefinition::cast)
+            .is_some_and(|v| v.is_define())
+}
+
+/// The name of `reference` and its range.
+fn reference_name(reference: &VariableReference) -> Option<(String, TextRange)> {
+    let name = reference.name()?;
+    let mut children = reference.syntax().children_with_tokens().skip(1);
+    let open = children.next()?;
+    if !matches!(open.kind(), SyntaxKind::LPAREN | SyntaxKind::LBRACE) {
+        return Some((name, open.text_range()));
+    }
+    // As in VariableReference::name, which also takes nested references
+    // into the name.
+    let range = children
+        .take_while(|c| {
+            !matches!(
+                c.kind(),
+                SyntaxKind::RPAREN
+                    | SyntaxKind::RBRACE
+                    | SyntaxKind::WHITESPACE
+                    | SyntaxKind::COMMA
+                    | SyntaxKind::OPERATOR
+                    | SyntaxKind::NEWLINE
+            )
+        })
+        .map(|c| c.text_range())
+        .reduce(|a, b| a.cover(b))?;
+    Some((name, range))
+}
+
+/// Find `$(VAR)` and `${VAR}` references in `text`, which starts at `base`
+/// in the document. References whose name contains another reference, and
+/// function calls, are left out.
+fn scan_variable_references(text: &str, base: TextSize, out: &mut Vec<(String, TextRange)>) {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        if bytes[i] != b'$' {
+            i += 1;
+            continue;
+        }
+        let close = match bytes[i + 1] {
+            b'(' => b')',
+            b'{' => b'}',
+            // `$$` is an escaped dollar sign; skip it along with `$V`.
+            _ => {
+                i += 2;
+                continue;
+            }
+        };
+        let start = i + 2;
+        let end = bytes[start..]
+            .iter()
+            .position(|&b| b == close || b":\t ,\n$".contains(&b))
+            .map(|n| start + n);
+        if let Some(end) = end.filter(|&e| e > start && (bytes[e] == close || bytes[e] == b':')) {
+            let range = TextRange::new(
+                base + TextSize::from(start as u32),
+                base + TextSize::from(end as u32),
+            );
+            out.push((text[start..end].to_string(), range));
+        }
+        // Continue inside the reference to find nested ones.
+        i = start;
+    }
 }
 
 #[cfg(test)]
@@ -364,6 +462,122 @@ mod tests {
         let refs =
             find_document_references(&makefile, text, Position::new(1, 2), &test_uri(), true);
         assert!(refs.is_empty());
+    }
+
+    fn range(line: u32, start: u32, end: u32) -> Range {
+        Range::new(Position::new(line, start), Position::new(line, end))
+    }
+
+    /// References to `FOO`, found from its definition on the first line.
+    fn foo_refs(text: &str) -> Vec<Range> {
+        assert!(text.starts_with("FOO = 1\n"));
+        let makefile = Makefile::parse(text).tree();
+        find_document_references(&makefile, text, Position::new(0, 0), &test_uri(), true)
+            .into_iter()
+            .map(|l| l.range)
+            .collect()
+    }
+
+    #[test]
+    fn test_symbol_at_substitution_reference() {
+        let text = "FOO = a.c\nX = $(FOO:.c=.o) ${FOO:%.c=%.o}\n";
+        let makefile = Makefile::parse(text).tree();
+        let foo = Some(Symbol::Variable("FOO".to_string()));
+        assert_eq!(symbol_at(&makefile, text, 16), foo);
+        assert_eq!(symbol_at(&makefile, text, 19), foo);
+        assert_eq!(symbol_at(&makefile, text, 29), foo);
+    }
+
+    #[test]
+    fn test_symbol_at_nested_reference() {
+        let text = "X = $(subst a,b,$(FOO)) $(BAR.$(Y))\n";
+        let makefile = Makefile::parse(text).tree();
+        assert_eq!(
+            symbol_at(&makefile, text, 19),
+            Some(Symbol::Variable("FOO".to_string()))
+        );
+        assert_eq!(
+            symbol_at(&makefile, text, 32),
+            Some(Symbol::Variable("Y".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_find_variable_references_in_values() {
+        let text = "FOO = 1\nX = $(FOO:.c=.o) ${FOO} $(subst a,b,$(FOO)) $(FOO)$(FOO)\n";
+        assert_eq!(
+            foo_refs(text),
+            vec![
+                range(0, 0, 3),
+                range(1, 6, 9),
+                range(1, 19, 22),
+                range(1, 38, 41),
+                range(1, 46, 49),
+                range(1, 52, 55),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_find_variable_references_skips_other_names() {
+        let text = "FOO = 1\nX = $(FOOBAR) $(FOO.$(Y)) $$(FOO) $(FOO x)\n";
+        assert_eq!(foo_refs(text), vec![range(0, 0, 3)]);
+    }
+
+    #[test]
+    fn test_find_variable_references_in_conditional_headers() {
+        let text = "FOO = 1\nifeq ($(FOO:a=b),x)\nendif\nifneq \"$(FOO)\" \"\"\nendif\n";
+        assert_eq!(
+            foo_refs(text),
+            vec![range(0, 0, 3), range(1, 8, 11), range(3, 9, 12)]
+        );
+    }
+
+    #[test]
+    fn test_find_variable_references_in_define_bodies() {
+        let text = "FOO = 1\ndefine A\n$(FOO) $(FOO:a=b)\nendef\n\
+                    define B\n\techo $(FOO) $$(FOO)\nall: ${FOO}\nendef\n";
+        assert_eq!(
+            foo_refs(text),
+            vec![
+                range(0, 0, 3),
+                range(2, 2, 5),
+                range(2, 9, 12),
+                range(5, 8, 11),
+                range(6, 7, 10),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_find_variable_references_in_recipes() {
+        let text = "FOO = 1\nall: ; echo $(FOO)\n\
+                    \techo $(FOO:.c=.o) $$(FOO) $(shell ${FOO})\n\
+                    ifdef X\n\techo $(FOO)\nendif\n";
+        assert_eq!(
+            foo_refs(text),
+            vec![
+                range(0, 0, 3),
+                range(1, 14, 17),
+                range(2, 8, 11),
+                range(2, 37, 40),
+                range(4, 8, 11),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_find_variable_references_in_rule_heads() {
+        let text = "FOO = 1\n$(FOO): $(FOO:.c=.o)\nall: Z = $(FOO)\n";
+        assert_eq!(
+            foo_refs(text),
+            vec![
+                range(0, 0, 3),
+                range(1, 2, 5),
+                range(1, 10, 13),
+                range(2, 11, 14),
+            ]
+        );
     }
 
     fn locations(locs: &[Location]) -> Vec<(Uri, u32, u32)> {
