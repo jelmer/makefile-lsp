@@ -3,7 +3,7 @@
 use std::path::Path;
 
 use makefile_lossless::{is_in_prerequisites, Makefile};
-use tower_lsp_server::ls_types::{CompletionItem, CompletionItemKind, Position};
+use tower_lsp_server::ls_types::{CompletionItem, CompletionItemKind, Documentation, Position};
 
 use crate::builtins;
 use crate::position::try_position_to_offset;
@@ -55,13 +55,34 @@ pub fn get_completions(
         }
     }
 
-    // At column 0 on an empty line, offer target completions
-    if position.character == 0 && line.trim().is_empty() {
-        return get_target_completions(makefile);
+    let typing_variable = position.character > 0 && !line.contains('=') && !line.contains(':');
+    let prefix = &line[..col.min(line.len())];
+    match words_before_cursor(prefix).as_deref() {
+        Some([]) if line.trim().is_empty() => {
+            let mut items = get_directive_completions(|_| true);
+            items.extend(get_target_completions(makefile));
+            return items;
+        }
+        Some([]) if typing_variable => {
+            let mut items = get_directive_completions(|_| true);
+            items.extend(get_variable_completions(makefile));
+            return items;
+        }
+        Some(["else"]) => {
+            return get_directive_completions(|name| {
+                builtins::CONDITIONAL_DIRECTIVES.contains(&name)
+            });
+        }
+        Some(["override"]) => {
+            let mut items = get_directive_completions(|name| name == "define");
+            items.extend(get_variable_completions(makefile));
+            return items;
+        }
+        _ => {}
     }
 
     // If typing a variable name (no = or : yet), offer variable completions
-    if position.character > 0 && !line.contains('=') && !line.contains(':') {
+    if typing_variable {
         return get_variable_completions(makefile);
     }
 
@@ -77,6 +98,43 @@ pub fn get_completions(
     }
 
     vec![]
+}
+
+/// Return the complete words on the line before the word being typed, or
+/// `None` if the cursor is past a point where a directive could appear (after
+/// `:`, `=`, a variable reference or a comment).
+fn words_before_cursor(prefix: &str) -> Option<Vec<&str>> {
+    if prefix.contains([':', '=', '$', '#']) {
+        return None;
+    }
+    let mut words: Vec<&str> = prefix.split_whitespace().collect();
+    if !prefix.ends_with(char::is_whitespace) {
+        words.pop();
+    }
+    Some(words)
+}
+
+/// Generate completions for the directives accepted by `filter`.
+fn get_directive_completions(filter: impl Fn(&str) -> bool) -> Vec<CompletionItem> {
+    builtins::DIRECTIVES
+        .iter()
+        .filter(|d| filter(d.name))
+        .map(|d| {
+            let takes_args = !matches!(d.name, "else" | "endif" | "endef");
+            CompletionItem {
+                label: d.name.to_string(),
+                kind: Some(CompletionItemKind::KEYWORD),
+                detail: Some(d.syntax.to_string()),
+                documentation: Some(Documentation::String(d.doc.to_string())),
+                insert_text: Some(if takes_args {
+                    format!("{} ", d.name)
+                } else {
+                    d.name.to_string()
+                }),
+                ..Default::default()
+            }
+        })
+        .collect()
 }
 
 /// Generate target name completions including built-in special targets.
@@ -644,6 +702,85 @@ mod tests {
         let completions = get_completions(&makefile, text, Position::new(0, 14), Some(dir.path()));
         let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
         assert!(labels.contains(&"rules/common.mk"), "got {:?}", labels);
+    }
+
+    fn labels(text: &str, pos: Position) -> Vec<String> {
+        let parsed = Makefile::parse(text);
+        let makefile = parsed.tree();
+        get_completions(&makefile, text, pos, None)
+            .into_iter()
+            .map(|c| c.label)
+            .collect()
+    }
+
+    #[test]
+    fn test_directive_completions_on_empty_line() {
+        let completions = labels("all:\n\n", Position::new(1, 0));
+        let directives: Vec<&str> = builtins::DIRECTIVES.iter().map(|d| d.name).collect();
+        assert_eq!(&completions[..directives.len()], &directives[..]);
+        assert!(completions.contains(&".PHONY".to_string()));
+    }
+
+    #[test]
+    fn test_directive_completions_while_typing() {
+        let text = "CC = gcc\nifd\n";
+        let parsed = Makefile::parse(text);
+        let makefile = parsed.tree();
+        let completions = get_completions(&makefile, text, Position::new(1, 3), None);
+        let ifdef = completions.iter().find(|c| c.label == "ifdef").unwrap();
+        assert_eq!(ifdef.kind, Some(CompletionItemKind::KEYWORD));
+        assert_eq!(ifdef.insert_text.as_deref(), Some("ifdef "));
+        let endif = completions.iter().find(|c| c.label == "endif").unwrap();
+        assert_eq!(endif.insert_text.as_deref(), Some("endif"));
+        // Variable names are still offered.
+        assert!(completions.iter().any(|c| c.label == "CC"));
+    }
+
+    #[test]
+    fn test_no_directive_completions_after_first_word() {
+        let completions = labels("FOO ba\n", Position::new(0, 6));
+        assert!(!completions.contains(&"include".to_string()));
+        let completions = labels("all: in\n", Position::new(0, 7));
+        assert!(!completions.contains(&"include".to_string()));
+    }
+
+    #[test]
+    fn test_no_directive_completions_in_recipe() {
+        assert_eq!(
+            labels("all:\n\tin\n", Position::new(1, 3)),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn test_conditional_completions_after_else() {
+        assert_eq!(
+            labels("ifdef A\nelse \nendif\n", Position::new(1, 5)),
+            vec!["ifeq", "ifneq", "ifdef", "ifndef"]
+        );
+        assert_eq!(
+            labels("ifdef A\nelse ifn\nendif\n", Position::new(1, 8)),
+            vec!["ifeq", "ifneq", "ifdef", "ifndef"]
+        );
+    }
+
+    #[test]
+    fn test_define_completion_after_override() {
+        assert_eq!(
+            labels("CC = gcc\noverride \n", Position::new(1, 9)),
+            vec!["define", "CC"]
+        );
+    }
+
+    #[test]
+    fn test_words_before_cursor() {
+        assert_eq!(words_before_cursor(""), Some(vec![]));
+        assert_eq!(words_before_cursor("inc"), Some(vec![]));
+        assert_eq!(words_before_cursor("else "), Some(vec!["else"]));
+        assert_eq!(words_before_cursor("else if"), Some(vec!["else"]));
+        assert_eq!(words_before_cursor("all: "), None);
+        assert_eq!(words_before_cursor("FOO = x"), None);
+        assert_eq!(words_before_cursor("$(fo"), None);
     }
 
     #[test]

@@ -9,7 +9,8 @@ Makefile is never executed.
 
 - **Diagnostics** - parse errors plus a set of lint checks (listed below)
 - **Code actions** - quick fixes and refactorings (listed below)
-- **Completion** - targets and special targets at the start of a line,
+- **Completion** - directives, targets and special targets at the start of
+  a line, conditional directives after `else`,
   variable names, built-in functions and variables after `$(`, automatic
   variables after `$`, targets and file paths in prerequisite lists, and file
   paths after `include`
