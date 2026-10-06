@@ -815,6 +815,11 @@ fn replace_all_spaces_with_tabs_action(
 /// variable definition's line. Not offered if any reference uses modifiers,
 /// as in `$(NAME:.c=.o)`.
 ///
+/// Also not offered if the value is written differently from what it
+/// stores, as with `\#` or a line continuation, or if a reference sits where
+/// characters of the value would change how make parses it; see
+/// [`InlineContext`].
+///
 /// Only offered for plain assignments (`=`, `:=`, `::=`, `:::=`). `+=`,
 /// `?=`, and `!=` have semantics we don't want to inline silently.
 fn inline_variable_action(
@@ -841,7 +846,7 @@ fn inline_variable_action(
     // Only inline values that are plain literals: no variable references,
     // function calls, or `$$` escapes. We'd otherwise be reasoning about
     // expansion order.
-    if value.contains('$') {
+    if value.contains('$') || var_def.value(MakefileVariant::GNUMake)? != value {
         return None;
     }
 
@@ -867,6 +872,12 @@ fn inline_variable_action(
         if !plain {
             return None;
         }
+        if !reference_contexts(&var_ref)
+            .iter()
+            .all(|context| context.accepts(&value))
+        {
+            return None;
+        }
         let range = text_range_to_lsp_range(source_text, var_ref.text_range());
         edits.push(TextEdit {
             range,
@@ -879,13 +890,21 @@ fn inline_variable_action(
     for node in makefile.syntax().descendants() {
         let raw_refs = if let Some(recipe) = Recipe::cast(node.clone()) {
             recipe.variable_references()
-        } else if let Some(definition) = VariableDefinition::cast(node) {
+        } else if let Some(definition) = VariableDefinition::cast(node.clone()) {
             definition.define_variable_references()
         } else {
             continue;
         };
+        let node_start = usize::from(node.text_range().start());
         for raw_ref in raw_refs.iter().filter(|r| r.name() == name) {
             let range = plain_reference_range(source_text, raw_ref.text_range())?;
+            let preceding = &source_text[node_start..usize::from(range.start())];
+            if !enclosing_text_references(preceding)
+                .iter()
+                .all(|context| context.accepts(&value))
+            {
+                return None;
+            }
             edits.push(TextEdit {
                 range: text_range_to_lsp_range(source_text, range),
                 new_text: value.clone(),
@@ -917,6 +936,124 @@ fn inline_variable_action(
         }),
         ..Default::default()
     })
+}
+
+/// How the text that a reference expands to would be parsed if it were
+/// written in place of the reference.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InlineContext {
+    /// A function argument, which a comma or closing paren ends.
+    FunctionArgument,
+    /// A rule line, where `=` makes an assignment, `&:` a grouped target and
+    /// `;` ends a target-specific variable's value.
+    RuleLine,
+    /// Variable and computed names, conditionals and anything else.
+    Other,
+}
+
+impl InlineContext {
+    fn accepts(self, value: &str) -> bool {
+        let special = match self {
+            InlineContext::FunctionArgument => ",(){}",
+            InlineContext::RuleLine => "=&;",
+            InlineContext::Other => ",(){}=:;&\"'",
+        };
+        !value.contains(|c: char| {
+            special.contains(c) || (self == InlineContext::Other && c.is_whitespace())
+        })
+    }
+}
+
+/// The contexts a reference in the syntax tree is nested in.
+///
+/// Variable values, include lines and the text around a reference in a
+/// recipe or define body take the expanded text as is, so add no context.
+fn reference_contexts(var_ref: &VariableReference) -> Vec<InlineContext> {
+    let start = var_ref.text_range().start();
+    let mut contexts = Vec::new();
+    for node in var_ref.syntax().ancestors().skip(1) {
+        if let Some(outer) = VariableReference::cast(node.clone()) {
+            contexts.push(if outer.is_function_call() {
+                InlineContext::FunctionArgument
+            } else {
+                InlineContext::Other
+            });
+            continue;
+        }
+        match node.kind() {
+            SyntaxKind::EXPR
+            | SyntaxKind::TARGETS
+            | SyntaxKind::PREREQUISITES
+            | SyntaxKind::PREREQUISITE => continue,
+            SyntaxKind::VARIABLE => {
+                let in_value = node
+                    .children_with_tokens()
+                    .filter_map(|it| it.into_token())
+                    .find(|t| t.kind() == SyntaxKind::OPERATOR)
+                    .is_some_and(|op| op.text_range().end() <= start);
+                if !in_value {
+                    contexts.push(InlineContext::Other);
+                } else if node.parent().is_some_and(|p| p.kind() == SyntaxKind::RULE) {
+                    contexts.push(InlineContext::RuleLine);
+                }
+            }
+            SyntaxKind::RULE => contexts.push(InlineContext::RuleLine),
+            SyntaxKind::INCLUDE => {}
+            _ => contexts.push(InlineContext::Other),
+        }
+        break;
+    }
+    contexts
+}
+
+/// The contexts of the references left open at the end of `text`, the
+/// recipe or define body text before a reference.
+fn enclosing_text_references(text: &str) -> Vec<InlineContext> {
+    // Each open reference's body start, closing char and nested paren depth.
+    let mut open: Vec<(usize, u8, usize)> = Vec::new();
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let close = match (bytes[i], bytes.get(i + 1)) {
+            (b'$', Some(b'$')) => {
+                i += 2;
+                continue;
+            }
+            (b'$', Some(b'(')) => Some(b')'),
+            (b'$', Some(b'{')) => Some(b'}'),
+            _ => None,
+        };
+        if let Some(close) = close {
+            open.push((i + 2, close, 0));
+            i += 2;
+            continue;
+        }
+        if let Some((_, close, depth)) = open.last_mut() {
+            let opening = if *close == b')' { b'(' } else { b'{' };
+            if bytes[i] == opening {
+                *depth += 1;
+            } else if bytes[i] == *close && *depth > 0 {
+                *depth -= 1;
+            } else if bytes[i] == *close {
+                open.pop();
+            }
+        }
+        i += 1;
+    }
+    open.iter()
+        .map(|&(body_start, _, _)| {
+            let body = &text[body_start..];
+            let name_len = body
+                .find(|c: char| c.is_whitespace() || ",$(){}:=".contains(c))
+                .unwrap_or(body.len());
+            let after_name = &body[name_len..];
+            if name_len > 0 && after_name.starts_with(|c: char| c.is_whitespace() || c == ',') {
+                InlineContext::FunctionArgument
+            } else {
+                InlineContext::Other
+            }
+        })
+        .collect()
 }
 
 /// The range of the whole `$(NAME)` or `${NAME}` reference whose name is at
@@ -1861,6 +1998,134 @@ mod tests {
         assert_eq!(
             inline_result("FOO = c\nX = $(BAR.$(FOO)) $($(FOO))\n", "FOO"),
             Some("X = $(BAR.c) $(c)\n".to_string())
+        );
+    }
+
+    #[test]
+    fn test_no_inline_comma_into_function_argument() {
+        assert_eq!(
+            inline_result("FOO = a,b\nX = $(if $(FOO),y,n)\n", "FOO"),
+            None
+        );
+        assert_eq!(
+            inline_result("FOO = a,b\nX = $(subst x,y,$(FOO))\n", "FOO"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_no_inline_paren_into_function_argument() {
+        assert_eq!(
+            inline_result("FOO = a)b\nX = $(subst x,y,$(FOO))\n", "FOO"),
+            None
+        );
+        assert_eq!(
+            inline_result("FOO = a}b\nX = ${subst x,y,${FOO}}\n", "FOO"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_inline_spaces_into_function_argument() {
+        assert_eq!(
+            inline_result("FOO = a b\nX = $(subst x,y,$(FOO))\n", "FOO"),
+            Some("X = $(subst x,y,a b)\n".to_string())
+        );
+    }
+
+    #[test]
+    fn test_inline_comma_outside_function() {
+        assert_eq!(
+            inline_result("FOO = a,b\nX = $(FOO)\n", "FOO"),
+            Some("X = a,b\n".to_string())
+        );
+        assert_eq!(
+            inline_result("FOO = a,b\nall:\n\techo $(FOO)\n", "FOO"),
+            Some("all:\n\techo a,b\n".to_string())
+        );
+    }
+
+    #[test]
+    fn test_no_inline_into_computed_name() {
+        assert_eq!(
+            inline_result("FOO = x:y=z\nX = $(BAR.$(FOO))\n", "FOO"),
+            None
+        );
+        assert_eq!(inline_result("FOO = info hi\nX = $($(FOO))\n", "FOO"), None);
+    }
+
+    #[test]
+    fn test_no_inline_into_variable_name() {
+        assert_eq!(inline_result("FOO = a b\nX$(FOO) = y\n", "FOO"), None);
+    }
+
+    #[test]
+    fn test_no_inline_into_rule_line() {
+        assert_eq!(
+            inline_result("FOO = x=y\nall: $(FOO)\n\techo\n", "FOO"),
+            None
+        );
+        assert_eq!(
+            inline_result("FOO = &\na b $(FOO): c\n\techo\n", "FOO"),
+            None
+        );
+        assert_eq!(inline_result("FOO = a;b\nall: Y = $(FOO)\n", "FOO"), None);
+    }
+
+    #[test]
+    fn test_inline_into_rule_line() {
+        assert_eq!(
+            inline_result("FOO = a b\nall: $(FOO)\n\techo\n", "FOO"),
+            Some("all: a b\n\techo\n".to_string())
+        );
+    }
+
+    #[test]
+    fn test_no_inline_into_conditional() {
+        assert_eq!(
+            inline_result("FOO = a,b\nifeq ($(FOO),x)\nendif\n", "FOO"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_no_inline_into_expression_statement() {
+        assert_eq!(inline_result("FOO = x = y\n$(FOO)\n", "FOO"), None);
+    }
+
+    #[test]
+    fn test_no_inline_into_function_argument_in_recipe() {
+        assert_eq!(
+            inline_result("FOO = a,b\nall:\n\techo $(if $(FOO),y,n)\n", "FOO"),
+            None
+        );
+        assert_eq!(
+            inline_result("FOO = a,b\ndefine F\n$(if $(FOO),y,n)\nendef\n", "FOO"),
+            None
+        );
+        assert_eq!(
+            inline_result("FOO = info hi\nall:\n\techo $($(FOO))\n", "FOO"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_inline_into_function_argument_in_recipe() {
+        assert_eq!(
+            inline_result("FOO = a b\nall:\n\techo $(subst x,y,$(FOO))\n", "FOO"),
+            Some("all:\n\techo $(subst x,y,a b)\n".to_string())
+        );
+    }
+
+    #[test]
+    fn test_no_inline_escaped_value() {
+        assert_eq!(
+            inline_result("FOO = a\\#b\nall:\n\techo $(FOO)\n", "FOO"),
+            None
+        );
+        assert_eq!(
+            inline_result("FOO = a \\\n  b\nall:\n\techo $(FOO)\n", "FOO"),
+            None
         );
     }
 
