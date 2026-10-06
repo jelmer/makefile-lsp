@@ -313,6 +313,7 @@ dependencies = [
  "protobuf",
  "rowan",
  "scip",
+ "serde_json",
  "tempfile",
  "text-size",
  "tokio",
