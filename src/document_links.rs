@@ -2,74 +2,50 @@
 //!
 //! Makes `include`/`-include`/`sinclude` paths clickable.
 
-use makefile_lossless::{Makefile, MakefileItem};
 use tower_lsp_server::ls_types::{DocumentLink, Uri};
 
 use crate::position::text_range_to_lsp_range;
+use crate::workspace::{FileSet, Resolution};
 
 /// Generate document links for include directives.
 ///
-/// Resolves include paths relative to the directory of the current file.
-pub fn get_document_links(
-    makefile: &Makefile,
-    source_text: &str,
-    document_uri: &Uri,
-) -> Vec<DocumentLink> {
-    let mut links = Vec::new();
-
-    let base_dir = document_uri
-        .path()
-        .as_str()
-        .rsplit_once('/')
-        .map(|(dir, _)| dir)
-        .unwrap_or(".");
-
-    for item in makefile.items() {
-        if let MakefileItem::Include(inc) = item {
-            let Some(path) = inc.path() else {
-                continue;
+/// Links point at the file make would read, or would try to read if it
+/// doesn't exist. Names that can't be resolved statically get no link.
+pub fn get_document_links(files: &FileSet) -> Vec<DocumentLink> {
+    let doc = files.current();
+    files
+        .includes()
+        .iter()
+        .filter_map(|inc| {
+            let path = match &inc.resolution {
+                Resolution::Found(p) | Resolution::Missing(p) | Resolution::Unreadable(p, _) => p,
+                Resolution::Unresolved => return None,
             };
-            let path = path.trim().to_string();
-            if path.is_empty() || path.contains('$') {
-                continue;
-            }
-
-            let Some(path_text_range) = inc.path_range() else {
-                continue;
+            let Some(target) = Uri::from_file_path(path) else {
+                tracing::warn!("unable to convert {} to a URI", path.display());
+                return None;
             };
-            let range = text_range_to_lsp_range(source_text, path_text_range);
-
-            let target_path = if path.starts_with('/') {
-                path.clone()
-            } else {
-                format!("{}/{}", base_dir, path)
-            };
-
-            let Ok(target_uri) = format!("file://{}", target_path).parse::<Uri>() else {
-                continue;
-            };
-
-            links.push(DocumentLink {
-                range,
-                target: Some(target_uri),
-                tooltip: Some(format!("Open {}", path)),
+            Some(DocumentLink {
+                range: text_range_to_lsp_range(doc.text(), inc.path.range),
+                target: Some(target),
+                tooltip: Some(format!("Open {}", inc.path.name)),
                 data: None,
-            });
-        }
-    }
-
-    links
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    use crate::workspace::Workspace;
+
     fn get_links(text: &str) -> Vec<DocumentLink> {
-        let parsed = Makefile::parse(text);
-        let makefile = parsed.tree();
         let uri: Uri = "file:///home/user/project/Makefile".parse().unwrap();
-        get_document_links(&makefile, text, &uri)
+        let mut ws = Workspace::new();
+        ws.open(uri.clone(), text.to_string());
+        get_document_links(&ws.file_set(&uri).unwrap())
     }
 
     #[test]
@@ -114,5 +90,37 @@ mod tests {
     fn test_variable_in_path_skipped() {
         let links = get_links("include $(CONF_DIR)/config.mk\n");
         assert!(links.is_empty());
+    }
+
+    #[test]
+    fn test_several_paths_in_one_directive() {
+        let links = get_links("include a.mk b.mk\n");
+        let targets: Vec<(u32, u32, String)> = links
+            .iter()
+            .map(|l| {
+                (
+                    l.range.start.character,
+                    l.range.end.character,
+                    l.target.as_ref().unwrap().to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            targets,
+            vec![
+                (8, 12, "file:///home/user/project/a.mk".to_string()),
+                (13, 17, "file:///home/user/project/b.mk".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_literal_variable_in_path_expanded() {
+        let links = get_links("CONF_DIR = conf\ninclude $(CONF_DIR)/config.mk\n");
+        assert_eq!(links.len(), 1);
+        assert_eq!(
+            links[0].target.as_ref().unwrap().to_string(),
+            "file:///home/user/project/conf/config.mk"
+        );
     }
 }

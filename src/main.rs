@@ -1,9 +1,10 @@
 //! Makefile Language Server Protocol implementation.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tower_lsp_server::jsonrpc::Result;
+use tower_lsp_server::jsonrpc::{Error, Result};
 use tower_lsp_server::ls_types::*;
 use tower_lsp_server::{Client, LanguageServer, LspService, Server};
 
@@ -29,51 +30,143 @@ mod semantic;
 mod shell_check;
 mod signature_help;
 mod symbols;
+mod targets;
+mod workspace;
 
 use position::try_lsp_range_to_text_range;
+use workspace::{Document, FileSet, Workspace};
 
-/// Information about an open file.
-struct FileInfo {
-    /// The current source text.
-    text: String,
-    /// The parsed makefile (green node for thread safety).
-    parsed: makefile_lossless::Parse<makefile_lossless::Makefile>,
-    /// Diagnostics for `text`, other than shell syntax ones.
-    diagnostics: Vec<Diagnostic>,
+/// The diagnostics last published for an open document.
+struct PublishedDiagnostics {
+    /// The document they were computed for.
+    doc: Arc<Document>,
+    /// Diagnostics other than shell syntax ones.
+    file: Vec<Diagnostic>,
+    /// Shell syntax diagnostics, which are only computed on open and save.
+    shell: Vec<Diagnostic>,
+}
+
+impl PublishedDiagnostics {
+    fn all(&self) -> Vec<Diagnostic> {
+        self.file.iter().chain(&self.shell).cloned().collect()
+    }
 }
 
 struct Backend {
     client: Client,
-    files: Arc<Mutex<HashMap<Uri, FileInfo>>>,
+    workspace: Arc<Mutex<Workspace>>,
+    diagnostics: Arc<Mutex<HashMap<Uri, PublishedDiagnostics>>>,
+    /// Whether the client can watch files for us.
+    watch_files: AtomicBool,
 }
 
 impl Backend {
     fn new(client: Client) -> Self {
         Self {
             client,
-            files: Arc::new(Mutex::new(HashMap::new())),
+            workspace: Arc::new(Mutex::new(Workspace::new())),
+            diagnostics: Arc::new(Mutex::new(HashMap::new())),
+            watch_files: AtomicBool::new(false),
         }
     }
 
-    async fn update_file(&self, uri: Uri, text: String) {
-        let parsed = makefile_lossless::Makefile::parse(&text);
-        let base_dir = uri_to_dir(&uri);
-        let diagnostics = diagnostics::get_diagnostics(&text, &parsed, base_dir.as_deref());
+    async fn document(&self, uri: &Uri) -> Option<Arc<Document>> {
+        self.workspace.lock().await.document(uri)
+    }
 
-        let mut files = self.files.lock().await;
-        files.insert(
+    async fn file_set(&self, uri: &Uri) -> Option<FileSet> {
+        self.workspace.lock().await.file_set(uri)
+    }
+
+    async fn update_file(&self, uri: Uri, text: String) {
+        let (doc, files, dependents) = {
+            let mut workspace = self.workspace.lock().await;
+            let doc = workspace.open(uri.clone(), text);
+            let files = workspace.file_set(&uri).expect("document was just opened");
+            (doc, files, workspace.dependents(&uri))
+        };
+        let diagnostics = diagnostics::get_file_set_diagnostics(&files);
+
+        self.diagnostics.lock().await.insert(
             uri.clone(),
-            FileInfo {
-                text,
-                parsed,
-                diagnostics: diagnostics.clone(),
+            PublishedDiagnostics {
+                doc,
+                file: diagnostics.clone(),
+                shell: Vec::new(),
             },
         );
-        drop(files);
 
         self.client
             .publish_diagnostics(uri, diagnostics, None)
             .await;
+
+        self.republish(dependents).await;
+    }
+
+    /// Recompute and publish diagnostics for open documents.
+    async fn republish(&self, uris: Vec<Uri>) {
+        for uri in uris {
+            let Some(files) = self.file_set(&uri).await else {
+                continue;
+            };
+            let diagnostics = diagnostics::get_file_set_diagnostics(&files);
+            let all = {
+                let mut published = self.diagnostics.lock().await;
+                // If the text changed, update_file is about to publish.
+                let Some(entry) = published
+                    .get_mut(&uri)
+                    .filter(|p| p.doc.text() == files.current().text())
+                else {
+                    continue;
+                };
+                entry.file = diagnostics;
+                entry.all()
+            };
+            self.client.publish_diagnostics(uri, all, None).await;
+        }
+    }
+
+    /// Ask the client to tell us about changes to makefiles on disk, so
+    /// diagnostics of open documents that include them can be refreshed.
+    ///
+    /// Only common makefile names are watched; requests re-check every
+    /// included file's mtime anyway, so other included files are picked up
+    /// on the next edit.
+    async fn register_file_watchers(&self) {
+        let watchers = [
+            "**/*.mk",
+            "**/*.make",
+            "**/Makefile",
+            "**/makefile",
+            "**/GNUmakefile",
+        ]
+        .iter()
+        .map(|glob| FileSystemWatcher {
+            glob_pattern: GlobPattern::String(glob.to_string()),
+            kind: None,
+        })
+        .collect();
+        let options =
+            match serde_json::to_value(DidChangeWatchedFilesRegistrationOptions { watchers }) {
+                Ok(options) => options,
+                Err(e) => {
+                    tracing::error!("unable to serialize file watcher options: {e}");
+                    return;
+                }
+            };
+        let registration = Registration {
+            id: "makefile-watcher".to_string(),
+            method: "workspace/didChangeWatchedFiles".to_string(),
+            register_options: Some(options),
+        };
+        if let Err(e) = self.client.register_capability(vec![registration]).await {
+            self.client
+                .log_message(
+                    MessageType::WARNING,
+                    format!("unable to register file watchers: {e}"),
+                )
+                .await;
+        }
     }
 
     /// Check the recipes of an open file for shell syntax errors in the
@@ -81,16 +174,15 @@ impl Backend {
     /// alongside its other diagnostics.
     fn spawn_shell_syntax_check(&self, uri: Uri) {
         let client = self.client.clone();
-        let files = self.files.clone();
+        let published = self.diagnostics.clone();
         tokio::spawn(async move {
-            let Some(text) = files.lock().await.get(&uri).map(|f| f.text.clone()) else {
+            let Some(doc) = published.lock().await.get(&uri).map(|p| p.doc.clone()) else {
                 return;
             };
 
-            let checked_text = text.clone();
+            let checked = doc.clone();
             let shell_diagnostics = match tokio::task::spawn_blocking(move || {
-                let parsed = makefile_lossless::Makefile::parse(&checked_text);
-                shell_check::check_shell_syntax(&checked_text, &parsed.tree())
+                shell_check::check_shell_syntax(checked.text(), &checked.makefile())
             })
             .await
             {
@@ -101,33 +193,47 @@ impl Backend {
                 }
             };
 
-            let files = files.lock().await;
+            let mut published = published.lock().await;
             // If the file changed while checking, the next save checks again.
-            let Some(file_info) = files.get(&uri).filter(|f| f.text == text) else {
+            let Some(entry) = published
+                .get_mut(&uri)
+                .filter(|p| p.doc.text() == doc.text())
+            else {
                 return;
             };
-            let mut all = file_info.diagnostics.clone();
-            all.extend(shell_diagnostics);
-            drop(files);
+            entry.shell = shell_diagnostics;
+            let all = entry.all();
+            drop(published);
 
             client.publish_diagnostics(uri, all, None).await;
         });
     }
 }
 
-/// Extract the parent directory from a `file://` URI, for resolving relative
-/// include paths. Returns None for non-file URIs or URIs without a parent.
-fn uri_to_dir(uri: &Uri) -> Option<std::path::PathBuf> {
-    if uri.scheme().as_str() != "file" {
-        return None;
-    }
-    let path = uri.path();
-    let pb = std::path::PathBuf::from(path.as_str());
-    pb.parent().map(|p| p.to_path_buf())
-}
-
 impl LanguageServer for Backend {
-    async fn initialize(&self, _: InitializeParams) -> Result<InitializeResult> {
+    async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
+        #[allow(deprecated)]
+        let root_uri = params.root_uri.as_ref();
+        let roots = match &params.workspace_folders {
+            Some(folders) => folders
+                .iter()
+                .filter_map(|f| workspace::file_path(&f.uri))
+                .collect(),
+            None => root_uri
+                .and_then(workspace::file_path)
+                .into_iter()
+                .collect(),
+        };
+        self.workspace.lock().await.set_roots(roots);
+        let watch_files = params
+            .capabilities
+            .workspace
+            .as_ref()
+            .and_then(|w| w.did_change_watched_files.as_ref())
+            .and_then(|w| w.dynamic_registration)
+            .unwrap_or(false);
+        self.watch_files.store(watch_files, Ordering::Relaxed);
+
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
                 text_document_sync: Some(TextDocumentSyncCapability::Options(
@@ -209,6 +315,9 @@ impl LanguageServer for Backend {
     }
 
     async fn initialized(&self, _: InitializedParams) {
+        if self.watch_files.load(Ordering::Relaxed) {
+            self.register_file_watchers().await;
+        }
         self.client
             .log_message(MessageType::INFO, "Makefile LSP initialized!")
             .await;
@@ -229,6 +338,45 @@ impl LanguageServer for Backend {
         self.spawn_shell_syntax_check(params.text_document.uri);
     }
 
+    async fn did_close(&self, params: DidCloseTextDocumentParams) {
+        let uri = params.text_document.uri;
+        let dependents = {
+            let mut workspace = self.workspace.lock().await;
+            let dependents = workspace.dependents(&uri);
+            workspace.close(&uri);
+            dependents
+        };
+        self.diagnostics.lock().await.remove(&uri);
+        // The file on disk may differ from the unsaved buffer.
+        self.republish(dependents).await;
+    }
+
+    async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
+        let uris = {
+            let mut workspace = self.workspace.lock().await;
+            let mut uris: Vec<Uri> = Vec::new();
+            for change in &params.changes {
+                let Some(path) = workspace::file_path(&change.uri) else {
+                    continue;
+                };
+                workspace.invalidate(&path);
+                // A new or removed file may change how includes resolve
+                // anywhere, so refresh everything.
+                if change.typ != FileChangeType::CHANGED {
+                    uris = workspace.open_documents();
+                    break;
+                }
+                for uri in workspace.open_documents_seeing(&path) {
+                    if !uris.contains(&uri) {
+                        uris.push(uri);
+                    }
+                }
+            }
+            uris
+        };
+        self.republish(uris).await;
+    }
+
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
         let uri = params.text_document.uri;
 
@@ -236,9 +384,11 @@ impl LanguageServer for Backend {
             return;
         }
 
-        let files = self.files.lock().await;
-        let mut text = files.get(&uri).map(|f| f.text.clone()).unwrap_or_default();
-        drop(files);
+        let mut text = self
+            .document(&uri)
+            .await
+            .map(|d| d.text().to_string())
+            .unwrap_or_default();
 
         let mut _changed_range: Option<text_size::TextRange> = None;
 
@@ -271,16 +421,13 @@ impl LanguageServer for Backend {
         let uri = &params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
 
-        let files = self.files.lock().await;
-        let Some(file_info) = files.get(uri) else {
+        let Some(files) = self.file_set(uri).await else {
             return Ok(None);
         };
-
-        let makefile = file_info.parsed.tree();
-        let base_dir = uri_to_dir(uri);
-        let completions =
-            completion::get_completions(&makefile, &file_info.text, position, base_dir.as_deref());
-        drop(files);
+        let doc = files.current();
+        let makefiles: Vec<makefile_lossless::Makefile> =
+            files.docs().map(|d| d.makefile()).collect();
+        let completions = completion::get_completions(&makefiles, doc.text(), position, doc.dir());
 
         if completions.is_empty() {
             Ok(None)
@@ -293,55 +440,35 @@ impl LanguageServer for Backend {
         &self,
         params: TextDocumentPositionParams,
     ) -> Result<Option<PrepareRenameResponse>> {
-        let uri = &params.text_document.uri;
-        let position = params.position;
-
-        let files = self.files.lock().await;
-        let Some(file_info) = files.get(uri) else {
+        let Some(files) = self.file_set(&params.text_document.uri).await else {
             return Ok(None);
         };
-
-        let makefile = file_info.parsed.tree();
-        let result = rename::prepare_rename(&makefile, &file_info.text, position);
-        drop(files);
-
-        Ok(result)
+        rename::prepare_rename(&files, params.position)
+            .transpose()
+            .map_err(|e| Error::invalid_params(e.to_string()))
     }
 
     async fn rename(&self, params: RenameParams) -> Result<Option<WorkspaceEdit>> {
         let uri = &params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
 
-        let files = self.files.lock().await;
-        let Some(file_info) = files.get(uri) else {
+        let Some(files) = self.file_set(uri).await else {
             return Ok(None);
         };
-
-        let makefile = file_info.parsed.tree();
-        let result = rename::rename(&makefile, &file_info.text, position, &params.new_name, uri);
-        drop(files);
-
-        Ok(result)
+        rename::rename(&files, position, &params.new_name)
+            .transpose()
+            .map_err(|e| Error::invalid_params(e.to_string()))
     }
 
     async fn references(&self, params: ReferenceParams) -> Result<Option<Vec<Location>>> {
         let uri = &params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
 
-        let files = self.files.lock().await;
-        let Some(file_info) = files.get(uri) else {
+        let Some(files) = self.file_set(uri).await else {
             return Ok(None);
         };
-
-        let makefile = file_info.parsed.tree();
-        let refs = references::find_references(
-            &makefile,
-            &file_info.text,
-            position,
-            uri,
-            params.context.include_declaration,
-        );
-        drop(files);
+        let refs =
+            references::find_references(&files, position, params.context.include_declaration);
 
         if refs.is_empty() {
             Ok(None)
@@ -354,30 +481,22 @@ impl LanguageServer for Backend {
         let uri = &params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
 
-        let files = self.files.lock().await;
-        let Some(file_info) = files.get(uri) else {
+        let Some(files) = self.file_set(uri).await else {
             return Ok(None);
         };
-
-        let makefile = file_info.parsed.tree();
-        let result = hover::get_hover(&makefile, &file_info.text, position);
-        drop(files);
-
-        Ok(result)
+        Ok(hover::get_hover(&files, position))
     }
 
     async fn signature_help(&self, params: SignatureHelpParams) -> Result<Option<SignatureHelp>> {
         let uri = &params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
 
-        let files = self.files.lock().await;
-        let Some(file_info) = files.get(uri) else {
+        let Some(doc) = self.document(uri).await else {
             return Ok(None);
         };
 
-        let makefile = file_info.parsed.tree();
-        let result = signature_help::get_signature_help(&makefile, &file_info.text, position);
-        drop(files);
+        let makefile = doc.makefile();
+        let result = signature_help::get_signature_help(&makefile, doc.text(), position);
 
         Ok(result)
     }
@@ -389,35 +508,27 @@ impl LanguageServer for Backend {
         let uri = &params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
 
-        let files = self.files.lock().await;
-        let Some(file_info) = files.get(uri) else {
+        let Some(files) = self.file_set(uri).await else {
             return Ok(None);
         };
-
-        let makefile = file_info.parsed.tree();
-        let result = goto::goto_definition(&makefile, &file_info.text, position, uri);
-        drop(files);
-
-        Ok(result)
+        Ok(goto::goto_definition(&files, position))
     }
 
     async fn code_action(&self, params: CodeActionParams) -> Result<Option<CodeActionResponse>> {
         let uri = &params.text_document.uri;
         let range = params.range;
 
-        let files = self.files.lock().await;
-        let Some(file_info) = files.get(uri) else {
+        let Some(doc) = self.document(uri).await else {
             return Ok(None);
         };
 
         let actions = code_actions::get_code_actions(
-            &file_info.parsed,
-            &file_info.text,
+            doc.parsed(),
+            doc.text(),
             range,
             uri,
             &params.context.diagnostics,
         );
-        drop(files);
 
         if actions.is_empty() {
             Ok(None)
@@ -432,16 +543,10 @@ impl LanguageServer for Backend {
     }
 
     async fn document_link(&self, params: DocumentLinkParams) -> Result<Option<Vec<DocumentLink>>> {
-        let uri = &params.text_document.uri;
-
-        let files = self.files.lock().await;
-        let Some(file_info) = files.get(uri) else {
+        let Some(files) = self.file_set(&params.text_document.uri).await else {
             return Ok(None);
         };
-
-        let makefile = file_info.parsed.tree();
-        let links = document_links::get_document_links(&makefile, &file_info.text, uri);
-        drop(files);
+        let links = document_links::get_document_links(&files);
 
         if links.is_empty() {
             Ok(None)
@@ -457,14 +562,12 @@ impl LanguageServer for Backend {
         let uri = &params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
 
-        let files = self.files.lock().await;
-        let Some(file_info) = files.get(uri) else {
+        let Some(doc) = self.document(uri).await else {
             return Ok(None);
         };
 
-        let makefile = file_info.parsed.tree();
-        let hl = highlights::get_highlights(&makefile, &file_info.text, position, uri);
-        drop(files);
+        let makefile = doc.makefile();
+        let hl = highlights::get_highlights(&makefile, doc.text(), position, uri);
 
         if hl.is_empty() {
             Ok(None)
@@ -477,14 +580,12 @@ impl LanguageServer for Backend {
         let uri = &params.text_document.uri;
         let range = params.range;
 
-        let files = self.files.lock().await;
-        let Some(file_info) = files.get(uri) else {
+        let Some(doc) = self.document(uri).await else {
             return Ok(None);
         };
 
-        let makefile = file_info.parsed.tree();
-        let hints = inlay_hints::get_inlay_hints(&makefile, &file_info.text, range);
-        drop(files);
+        let makefile = doc.makefile();
+        let hints = inlay_hints::get_inlay_hints(&makefile, doc.text(), range);
 
         if hints.is_empty() {
             Ok(None)
@@ -499,14 +600,12 @@ impl LanguageServer for Backend {
     ) -> Result<Option<SemanticTokensResult>> {
         let uri = &params.text_document.uri;
 
-        let files = self.files.lock().await;
-        let Some(file_info) = files.get(uri) else {
+        let Some(doc) = self.document(uri).await else {
             return Ok(None);
         };
 
-        let makefile = file_info.parsed.tree();
-        let tokens = semantic::generate_semantic_tokens(&makefile, &file_info.text);
-        drop(files);
+        let makefile = doc.makefile();
+        let tokens = semantic::generate_semantic_tokens(&makefile, doc.text());
 
         Ok(Some(SemanticTokensResult::Tokens(SemanticTokens {
             result_id: None,
@@ -520,14 +619,12 @@ impl LanguageServer for Backend {
     ) -> Result<Option<DocumentSymbolResponse>> {
         let uri = &params.text_document.uri;
 
-        let files = self.files.lock().await;
-        let Some(file_info) = files.get(uri) else {
+        let Some(doc) = self.document(uri).await else {
             return Ok(None);
         };
 
-        let makefile = file_info.parsed.tree();
-        let symbols = symbols::generate_document_symbols(&makefile, &file_info.text);
-        drop(files);
+        let makefile = doc.makefile();
+        let symbols = symbols::generate_document_symbols(&makefile, doc.text());
 
         Ok(Some(DocumentSymbolResponse::Nested(symbols)))
     }
@@ -535,14 +632,12 @@ impl LanguageServer for Backend {
     async fn folding_range(&self, params: FoldingRangeParams) -> Result<Option<Vec<FoldingRange>>> {
         let uri = &params.text_document.uri;
 
-        let files = self.files.lock().await;
-        let Some(file_info) = files.get(uri) else {
+        let Some(doc) = self.document(uri).await else {
             return Ok(None);
         };
 
-        let makefile = file_info.parsed.tree();
-        let ranges = folding::generate_folding_ranges(&makefile, &file_info.text);
-        drop(files);
+        let makefile = doc.makefile();
+        let ranges = folding::generate_folding_ranges(&makefile, doc.text());
 
         Ok(Some(ranges))
     }
@@ -553,15 +648,13 @@ impl LanguageServer for Backend {
     ) -> Result<Option<Vec<SelectionRange>>> {
         let uri = &params.text_document.uri;
 
-        let files = self.files.lock().await;
-        let Some(file_info) = files.get(uri) else {
+        let Some(doc) = self.document(uri).await else {
             return Ok(None);
         };
 
-        let makefile = file_info.parsed.tree();
+        let makefile = doc.makefile();
         let ranges =
-            selection_ranges::get_selection_ranges(&makefile, &file_info.text, &params.positions);
-        drop(files);
+            selection_ranges::get_selection_ranges(&makefile, doc.text(), &params.positions);
 
         Ok(Some(ranges))
     }
@@ -583,20 +676,17 @@ impl LanguageServer for Backend {
             return Ok(None);
         }
 
-        let files = self.files.lock().await;
-        let Some(file_info) = files.get(uri) else {
+        let Some(doc) = self.document(uri).await else {
             return Ok(None);
         };
 
         let prev_line_idx = (position.line - 1) as usize;
-        let prev_line = file_info.text.lines().nth(prev_line_idx).unwrap_or("");
+        let prev_line = doc.text().lines().nth(prev_line_idx).unwrap_or("");
 
         // If the previous line is a rule header (has : but not =, and doesn't start with tab),
         // insert a tab at the cursor position
         let is_rule_header =
             !prev_line.starts_with('\t') && prev_line.contains(':') && !prev_line.contains('=');
-
-        drop(files);
 
         if is_rule_header {
             Ok(Some(vec![TextEdit {

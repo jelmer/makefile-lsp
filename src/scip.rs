@@ -23,6 +23,7 @@ use scip::types::{
 use tower_lsp_server::ls_types::{DiagnosticSeverity, NumberOrString};
 
 use crate::position::try_lsp_range_to_text_range;
+use crate::targets::targets_with_ranges;
 
 const SCHEME: &str = "scip-makefile";
 
@@ -219,18 +220,14 @@ fn collect_targets(makefile: &Makefile, text: &str) -> Vec<RawOccurrence> {
             continue;
         };
 
-        // Targets appear before the colon.
-        let target_section = &rule_text[..colon_pos];
-        for target in rule.targets() {
-            if let Some(idx) = find_word(target_section, &target) {
-                out.push(RawOccurrence {
-                    symbol: target_symbol(&target),
-                    start: rule_start + idx,
-                    len: target.len(),
-                    is_definition: true,
-                    syntax_kind: SyntaxKind::IdentifierFunctionDefinition,
-                });
-            }
+        for (target, range) in targets_with_ranges(&rule) {
+            out.push(RawOccurrence {
+                symbol: target_symbol(&target),
+                start: range.start().into(),
+                len: range.len().into(),
+                is_definition: true,
+                syntax_kind: SyntaxKind::IdentifierFunctionDefinition,
+            });
         }
 
         // Prerequisites appear after the colon, on the same line.
@@ -596,6 +593,26 @@ mod tests {
         assert!(doc.occurrences.iter().any(|o| o.symbol == build
             && o.range == vec![2, 0, 2, 5]
             && o.symbol_roles & SymbolRole::Definition as i32 != 0));
+    }
+
+    #[test]
+    fn test_target_definitions_in_rule_with_several_targets() {
+        let text = "a-b b: c\n";
+        let doc = build_document("Makefile", text, None);
+        let definitions: Vec<(&str, &Vec<i32>)> = occ_symbols(&doc)
+            .into_iter()
+            .filter(|(_, _, is_definition)| *is_definition)
+            .map(|(symbol, range, _)| (symbol, range))
+            .collect();
+        let a_b = target_symbol("a-b");
+        let b = target_symbol("b");
+        assert_eq!(
+            definitions,
+            vec![
+                (a_b.as_str(), &vec![0, 0, 0, 3]),
+                (b.as_str(), &vec![0, 4, 0, 5])
+            ]
+        );
     }
 
     #[test]

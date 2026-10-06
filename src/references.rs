@@ -5,9 +5,100 @@ use rowan::ast::AstNode;
 use tower_lsp_server::ls_types::{Location, Position, Range, Uri};
 
 use crate::position::{text_range_to_lsp_range, try_position_to_offset};
+use crate::targets::{target_at_offset, targets_with_ranges};
+use crate::workspace::FileSet;
 
-/// Find all references to the symbol at the given position.
+/// A target or variable name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Symbol {
+    Variable(String),
+    Target(String),
+}
+
+/// Identify the symbol at `byte_offset`: a variable reference, a prerequisite,
+/// or the name in a target or variable definition.
+pub fn symbol_at(makefile: &Makefile, source_text: &str, byte_offset: usize) -> Option<Symbol> {
+    if let Some(var_name) = variable_at_offset(source_text, byte_offset) {
+        return Some(Symbol::Variable(var_name.to_string()));
+    }
+
+    let word = word_at_offset(source_text, byte_offset)?;
+    if is_in_prerequisites(source_text, byte_offset) {
+        return Some(Symbol::Target(word.to_string()));
+    }
+
+    if let Some((target, _)) = makefile
+        .rules()
+        .find_map(|r| target_at_offset(&r, byte_offset))
+    {
+        return Some(Symbol::Target(target));
+    }
+
+    // Check if this word is a variable definition name
+    let is_var_def = makefile.variable_definitions().any(|v| {
+        if v.name().as_deref() != Some(word) {
+            return false;
+        }
+        let var_range = v.syntax().text_range();
+        let var_start: usize = var_range.start().into();
+        byte_offset >= var_start && byte_offset < var_start + word.len()
+    });
+    if is_var_def {
+        return Some(Symbol::Variable(word.to_string()));
+    }
+
+    None
+}
+
+/// Find all occurrences of `symbol` in one document.
+pub fn symbol_locations(
+    makefile: &Makefile,
+    source_text: &str,
+    uri: &Uri,
+    symbol: &Symbol,
+    include_declaration: bool,
+) -> Vec<Location> {
+    match symbol {
+        Symbol::Variable(name) => {
+            find_variable_references(makefile, source_text, name, uri, include_declaration)
+        }
+        Symbol::Target(name) => {
+            find_target_references(makefile, source_text, name, uri, include_declaration)
+        }
+    }
+}
+
+/// Find all references to the symbol at the given position, in all
+/// documents of the file set.
 pub fn find_references(
+    files: &FileSet,
+    position: Position,
+    include_declaration: bool,
+) -> Vec<Location> {
+    let current = files.current();
+    let Some(offset) = try_position_to_offset(current.text(), position) else {
+        return vec![];
+    };
+    let Some(symbol) = symbol_at(&current.makefile(), current.text(), offset.into()) else {
+        return vec![];
+    };
+    files
+        .docs()
+        .flat_map(|doc| {
+            symbol_locations(
+                &doc.makefile(),
+                doc.text(),
+                doc.uri(),
+                &symbol,
+                include_declaration,
+            )
+        })
+        .collect()
+}
+
+/// Find all references to the symbol at the given position within one
+/// document.
+pub fn find_document_references(
     makefile: &Makefile,
     source_text: &str,
     position: Position,
@@ -17,53 +108,10 @@ pub fn find_references(
     let Some(offset) = try_position_to_offset(source_text, position) else {
         return vec![];
     };
-    let byte_offset: usize = offset.into();
-
-    // Variable reference
-    if let Some(var_name) = variable_at_offset(source_text, byte_offset) {
-        return find_variable_references(makefile, source_text, var_name, uri, include_declaration);
-    }
-
-    // Target name in prerequisites
-    if is_in_prerequisites(source_text, byte_offset) {
-        if let Some(word) = word_at_offset(source_text, byte_offset) {
-            return find_target_references(makefile, source_text, word, uri, include_declaration);
-        }
-    }
-
-    // Target name at line start (the definition itself)
-    if let Some(word) = word_at_offset(source_text, byte_offset) {
-        // Check if this word is a target in a rule definition
-        let is_target = makefile.rules().any(|r| {
-            r.targets().any(|t| {
-                if t != word {
-                    return false;
-                }
-                let rule_range = r.syntax().text_range();
-                let rule_start: usize = rule_range.start().into();
-                // The target should be near the start of the rule
-                byte_offset >= rule_start && byte_offset < rule_start + t.len()
-            })
-        });
-        if is_target {
-            return find_target_references(makefile, source_text, word, uri, include_declaration);
-        }
-
-        // Check if this word is a variable definition name
-        let is_var_def = makefile.variable_definitions().any(|v| {
-            if v.name().as_deref() != Some(word) {
-                return false;
-            }
-            let var_range = v.syntax().text_range();
-            let var_start: usize = var_range.start().into();
-            byte_offset >= var_start && byte_offset < var_start + word.len()
-        });
-        if is_var_def {
-            return find_variable_references(makefile, source_text, word, uri, include_declaration);
-        }
-    }
-
-    vec![]
+    let Some(symbol) = symbol_at(makefile, source_text, offset.into()) else {
+        return vec![];
+    };
+    symbol_locations(makefile, source_text, uri, &symbol, include_declaration)
 }
 
 /// Find all references to a target name.
@@ -79,15 +127,11 @@ fn find_target_references(
     for rule in makefile.rules() {
         // Target definitions
         if include_declaration {
-            for target in rule.targets() {
+            for (target, range) in targets_with_ranges(&rule) {
                 if target == target_name {
-                    let range = text_range_to_lsp_range(source_text, rule.syntax().text_range());
-                    // Narrow to just the target name at the start
-                    let start = range.start;
-                    let end = Position::new(start.line, start.character + target.len() as u32);
                     locations.push(Location {
                         uri: uri.clone(),
-                        range: Range::new(start, end),
+                        range: text_range_to_lsp_range(source_text, range),
                     });
                 }
             }
@@ -231,6 +275,7 @@ fn find_variable_references(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::workspace::tests::Fixture;
 
     fn test_uri() -> Uri {
         "file:///test/Makefile".parse().unwrap()
@@ -242,7 +287,8 @@ mod tests {
         let parsed = Makefile::parse(text);
         let makefile = parsed.tree();
         // Cursor on "build" in prerequisites (col 5)
-        let refs = find_references(&makefile, text, Position::new(0, 5), &test_uri(), true);
+        let refs =
+            find_document_references(&makefile, text, Position::new(0, 5), &test_uri(), true);
         assert_eq!(refs.len(), 2); // declaration + prerequisite reference
     }
 
@@ -252,8 +298,27 @@ mod tests {
         let parsed = Makefile::parse(text);
         let makefile = parsed.tree();
         // Cursor on "build" in its definition (line 2, col 0)
-        let refs = find_references(&makefile, text, Position::new(2, 0), &test_uri(), true);
+        let refs =
+            find_document_references(&makefile, text, Position::new(2, 0), &test_uri(), true);
         assert_eq!(refs.len(), 2);
+    }
+
+    #[test]
+    fn test_find_target_references_second_target_of_rule() {
+        let text = "all: b\na b: c\n";
+        let makefile = Makefile::parse(text).tree();
+        let ranges: Vec<Range> =
+            find_document_references(&makefile, text, Position::new(0, 5), &test_uri(), true)
+                .into_iter()
+                .map(|l| l.range)
+                .collect();
+        assert_eq!(
+            ranges,
+            vec![
+                Range::new(Position::new(0, 5), Position::new(0, 6)),
+                Range::new(Position::new(1, 2), Position::new(1, 3)),
+            ]
+        );
     }
 
     #[test]
@@ -261,7 +326,8 @@ mod tests {
         let text = "all: build\n\nbuild:\n\techo ok\n";
         let parsed = Makefile::parse(text);
         let makefile = parsed.tree();
-        let refs = find_references(&makefile, text, Position::new(0, 5), &test_uri(), false);
+        let refs =
+            find_document_references(&makefile, text, Position::new(0, 5), &test_uri(), false);
         assert_eq!(refs.len(), 1); // only the prerequisite reference
     }
 
@@ -271,7 +337,8 @@ mod tests {
         let parsed = Makefile::parse(text);
         let makefile = parsed.tree();
         // Cursor on CC in $(CC) (line 2, col 3)
-        let refs = find_references(&makefile, text, Position::new(2, 3), &test_uri(), true);
+        let refs =
+            find_document_references(&makefile, text, Position::new(2, 3), &test_uri(), true);
         assert_eq!(refs.len(), 2); // definition + usage
     }
 
@@ -281,7 +348,8 @@ mod tests {
         let parsed = Makefile::parse(text);
         let makefile = parsed.tree();
         // Cursor on CC in definition (line 0, col 0)
-        let refs = find_references(&makefile, text, Position::new(0, 0), &test_uri(), true);
+        let refs =
+            find_document_references(&makefile, text, Position::new(0, 0), &test_uri(), true);
         assert_eq!(refs.len(), 2);
     }
 
@@ -290,7 +358,8 @@ mod tests {
         let text = "CC = gcc\nall:\n\t$(CC) main.c\nclean:\n\t$(CC) --version\n";
         let parsed = Makefile::parse(text);
         let makefile = parsed.tree();
-        let refs = find_references(&makefile, text, Position::new(0, 0), &test_uri(), true);
+        let refs =
+            find_document_references(&makefile, text, Position::new(0, 0), &test_uri(), true);
         assert_eq!(refs.len(), 3); // definition + 2 usages
     }
 
@@ -299,7 +368,44 @@ mod tests {
         let text = "all:\n\techo hello\n";
         let parsed = Makefile::parse(text);
         let makefile = parsed.tree();
-        let refs = find_references(&makefile, text, Position::new(1, 2), &test_uri(), true);
+        let refs =
+            find_document_references(&makefile, text, Position::new(1, 2), &test_uri(), true);
         assert!(refs.is_empty());
+    }
+
+    fn locations(locs: &[Location]) -> Vec<(Uri, u32, u32)> {
+        locs.iter()
+            .map(|l| (l.uri.clone(), l.range.start.line, l.range.start.character))
+            .collect()
+    }
+
+    #[test]
+    fn test_find_variable_references_across_files() {
+        let fx = Fixture::new(&[
+            ("Makefile", "include rules.mk\nall:\n\t$(CC) x\n"),
+            ("rules.mk", "CC = gcc\nX = $(CC)\n"),
+        ]);
+        let refs = find_references(&fx.file_set("Makefile"), Position::new(2, 3), true);
+        assert_eq!(
+            locations(&refs),
+            vec![
+                (fx.uri("Makefile"), 2, 3),
+                (fx.uri("rules.mk"), 0, 0),
+                (fx.uri("rules.mk"), 1, 6),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_find_target_references_from_included_file() {
+        let fx = Fixture::new(&[
+            ("Makefile", "include rules.mk\nall: build\n"),
+            ("rules.mk", "build:\n\techo\n"),
+        ]);
+        let (mut ws, makefile) = fx.open("Makefile");
+        ws.file_set(&makefile).unwrap();
+        let rules = fx.open_in(&mut ws, "rules.mk");
+        let refs = find_references(&ws.file_set(&rules).unwrap(), Position::new(0, 1), false);
+        assert_eq!(locations(&refs), vec![(makefile, 1, 5)]);
     }
 }
