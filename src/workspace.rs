@@ -423,6 +423,11 @@ impl FileSet {
         self.docs.iter().map(|d| d.as_ref())
     }
 
+    /// All documents except the current one.
+    pub fn others(&self) -> impl Iterator<Item = &Document> {
+        self.docs.iter().skip(1).map(|d| d.as_ref())
+    }
+
     /// Whether a rename may edit `uri`: open documents and files inside the
     /// workspace folders are editable, files elsewhere (such as system-wide
     /// makefile fragments) are not.
