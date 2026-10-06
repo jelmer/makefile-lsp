@@ -1631,13 +1631,13 @@ fn check_automatic_variable_outside_recipe(
     makefile
         .variable_references()
         .filter_map(|var_ref| {
-            let text = var_ref.syntax().text().to_string();
+            let text = var_ref.to_string();
             if !is_automatic_variable_reference(&text) {
                 return None;
             }
             let context = immediate_expansion_context(var_ref.syntax(), second_expansion)?;
             Some(make_diagnostic(
-                text_range_to_lsp_range(source_text, var_ref.syntax().text_range()),
+                text_range_to_lsp_range(source_text, var_ref.text_range()),
                 DiagnosticSeverity::WARNING,
                 "automatic-variable-outside-recipe",
                 format!(
