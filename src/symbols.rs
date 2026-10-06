@@ -44,6 +44,9 @@ pub fn generate_document_symbols(makefile: &Makefile, source_text: &str) -> Vec<
         };
 
         let range = text_range_to_lsp_range(source_text, var.syntax().text_range());
+        let selection_range = var
+            .name_range()
+            .map_or(range, |r| text_range_to_lsp_range(source_text, r));
         let detail = var.raw_value().map(|v| v.trim().to_string());
 
         symbols.push(DocumentSymbol {
@@ -53,7 +56,7 @@ pub fn generate_document_symbols(makefile: &Makefile, source_text: &str) -> Vec<
             tags: None,
             deprecated: None,
             range,
-            selection_range: range,
+            selection_range,
             children: None,
         });
     }
@@ -104,6 +107,21 @@ mod tests {
         assert_eq!(symbols[0].name, "CC");
         assert_eq!(symbols[0].kind, SymbolKind::VARIABLE);
         assert_eq!(symbols[1].name, "CFLAGS");
+    }
+
+    #[test]
+    fn test_symbols_variable_selection_range_is_name() {
+        let text = "export CC = gcc\n";
+        let makefile = Makefile::parse(text).tree();
+        let symbols = generate_document_symbols(&makefile, text);
+        let selections: Vec<(&str, Range)> = symbols
+            .iter()
+            .map(|s| (s.name.as_str(), s.selection_range))
+            .collect();
+        assert_eq!(
+            selections,
+            vec![("CC", Range::new(Position::new(0, 7), Position::new(0, 9)))]
+        );
     }
 
     #[test]
