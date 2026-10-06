@@ -2,305 +2,152 @@
 
 use std::collections::HashMap;
 
-use makefile_lossless::{is_in_prerequisites, variable_at_offset, word_at_offset, Makefile};
-use rowan::ast::AstNode;
+use makefile_lossless::{variable_at_offset, Makefile};
 use tower_lsp_server::ls_types::{
     Position, PrepareRenameResponse, Range, TextEdit, Uri, WorkspaceEdit,
 };
 
-use crate::position::{offset_to_position, text_range_to_lsp_range, try_position_to_offset};
+use crate::position::{offset_to_position, try_position_to_offset};
+use crate::references::{symbol_at, symbol_locations, Symbol};
+use crate::workspace::FileSet;
+
+/// Why a symbol can't be renamed.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RenameError {
+    /// The symbol is defined only outside the workspace.
+    DefinedOutsideWorkspace(String, Uri),
+    /// The symbol is used in a file outside the workspace, which would be
+    /// left referring to the old name.
+    UsedOutsideWorkspace(String, Uri),
+}
+
+impl std::fmt::Display for RenameError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RenameError::DefinedOutsideWorkspace(name, uri) => write!(
+                f,
+                "'{}' is defined outside the workspace, in {}",
+                name,
+                uri.as_str()
+            ),
+            RenameError::UsedOutsideWorkspace(name, uri) => write!(
+                f,
+                "'{}' is used outside the workspace, in {}",
+                name,
+                uri.as_str()
+            ),
+        }
+    }
+}
+
+fn is_defined(makefile: &Makefile, symbol: &Symbol) -> bool {
+    match symbol {
+        Symbol::Variable(name) => makefile
+            .variable_definitions()
+            .any(|v| v.name().as_deref() == Some(name)),
+        Symbol::Target(name) => makefile.rules().any(|r| r.targets().any(|t| &t == name)),
+    }
+}
+
+fn symbol_name(symbol: &Symbol) -> &str {
+    match symbol {
+        Symbol::Variable(name) | Symbol::Target(name) => name,
+    }
+}
+
+/// Find the renameable symbol at `position`, checking that it may be renamed.
+///
+/// Variables must be defined in one of the files. Prerequisites that aren't
+/// defined as targets anywhere (usually plain files) may be renamed. A symbol
+/// defined only in files outside the workspace can't be renamed.
+fn renameable_symbol(
+    files: &FileSet,
+    position: Position,
+) -> Option<Result<(Symbol, usize), RenameError>> {
+    let current = files.current();
+    let byte_offset: usize = try_position_to_offset(current.text(), position)?.into();
+    let symbol = symbol_at(&current.makefile(), current.text(), byte_offset)?;
+    let defining: Vec<&Uri> = files
+        .docs()
+        .filter(|d| is_defined(&d.makefile(), &symbol))
+        .map(|d| d.uri())
+        .collect();
+    if defining.is_empty() && matches!(symbol, Symbol::Variable(_)) {
+        return None;
+    }
+    if !defining.is_empty() && !defining.iter().any(|u| files.is_editable(u)) {
+        let name = symbol_name(&symbol).to_string();
+        return Some(Err(RenameError::DefinedOutsideWorkspace(
+            name,
+            defining[0].clone(),
+        )));
+    }
+    Some(Ok((symbol, byte_offset)))
+}
 
 /// Check if renaming is possible at the given position and return the current name and range.
 pub fn prepare_rename(
-    makefile: &Makefile,
-    source_text: &str,
+    files: &FileSet,
     position: Position,
-) -> Option<PrepareRenameResponse> {
-    let offset = try_position_to_offset(source_text, position)?;
-    let byte_offset: usize = offset.into();
-
-    // Variable reference
-    if let Some(var_name) = variable_at_offset(source_text, byte_offset) {
-        // Only allow renaming user-defined variables
-        if makefile
-            .variable_definitions()
-            .any(|v| v.name().as_deref() == Some(var_name))
-        {
-            let start = find_var_name_start_in_ref(source_text, byte_offset)?;
-            let start_pos =
-                offset_to_position(source_text, text_size::TextSize::from(start as u32));
-            let end_pos =
-                Position::new(start_pos.line, start_pos.character + var_name.len() as u32);
-            return Some(PrepareRenameResponse::RangeWithPlaceholder {
-                range: Range::new(start_pos, end_pos),
-                placeholder: var_name.to_string(),
-            });
-        }
-        return None;
-    }
-
-    // Target in prerequisites
-    if is_in_prerequisites(source_text, byte_offset) {
-        if let Some(word) = word_at_offset(source_text, byte_offset) {
-            let word_start = find_word_start(source_text, byte_offset);
-            let start_pos =
-                offset_to_position(source_text, text_size::TextSize::from(word_start as u32));
-            let end_pos = Position::new(start_pos.line, start_pos.character + word.len() as u32);
-            return Some(PrepareRenameResponse::RangeWithPlaceholder {
-                range: Range::new(start_pos, end_pos),
-                placeholder: word.to_string(),
-            });
-        }
-        return None;
-    }
-
-    // Target definition or variable definition at start of line
-    if let Some(word) = word_at_offset(source_text, byte_offset) {
-        let is_target = makefile.rules().any(|r| {
-            r.targets().any(|t| {
-                if t != word {
-                    return false;
-                }
-                let rule_start: usize = r.syntax().text_range().start().into();
-                byte_offset >= rule_start && byte_offset < rule_start + t.len()
-            })
-        });
-        let is_var = makefile.variable_definitions().any(|v| {
-            if v.name().as_deref() != Some(word) {
-                return false;
-            }
-            let var_start: usize = v.syntax().text_range().start().into();
-            byte_offset >= var_start && byte_offset < var_start + word.len()
-        });
-
-        if is_target || is_var {
-            let word_start = find_word_start(source_text, byte_offset);
-            let start_pos =
-                offset_to_position(source_text, text_size::TextSize::from(word_start as u32));
-            let end_pos = Position::new(start_pos.line, start_pos.character + word.len() as u32);
-            return Some(PrepareRenameResponse::RangeWithPlaceholder {
-                range: Range::new(start_pos, end_pos),
-                placeholder: word.to_string(),
-            });
-        }
-    }
-
-    None
+) -> Option<Result<PrepareRenameResponse, RenameError>> {
+    let (symbol, byte_offset) = match renameable_symbol(files, position)? {
+        Ok(found) => found,
+        Err(e) => return Some(Err(e)),
+    };
+    let source_text = files.current().text();
+    let name = symbol_name(&symbol);
+    let start = if variable_at_offset(source_text, byte_offset).is_some() {
+        find_var_name_start_in_ref(source_text, byte_offset)?
+    } else {
+        find_word_start(source_text, byte_offset)
+    };
+    let start_pos = offset_to_position(source_text, text_size::TextSize::from(start as u32));
+    let end_pos = Position::new(start_pos.line, start_pos.character + name.len() as u32);
+    Some(Ok(PrepareRenameResponse::RangeWithPlaceholder {
+        range: Range::new(start_pos, end_pos),
+        placeholder: name.to_string(),
+    }))
 }
 
-/// Perform a rename of the symbol at the given position.
+/// Perform a rename of the symbol at the given position, in all files that
+/// use it.
 pub fn rename(
-    makefile: &Makefile,
-    source_text: &str,
+    files: &FileSet,
     position: Position,
     new_name: &str,
-    uri: &Uri,
-) -> Option<WorkspaceEdit> {
-    let offset = try_position_to_offset(source_text, position)?;
-    let byte_offset: usize = offset.into();
+) -> Option<Result<WorkspaceEdit, RenameError>> {
+    let (symbol, _) = match renameable_symbol(files, position)? {
+        Ok(found) => found,
+        Err(e) => return Some(Err(e)),
+    };
 
-    // Variable reference
-    if let Some(var_name) = variable_at_offset(source_text, byte_offset) {
-        if makefile
-            .variable_definitions()
-            .any(|v| v.name().as_deref() == Some(var_name))
-        {
-            return Some(rename_variable(
-                makefile,
-                source_text,
-                var_name,
-                new_name,
-                uri,
-            ));
+    let mut changes: HashMap<Uri, Vec<TextEdit>> = HashMap::new();
+    for doc in files.docs() {
+        let edits: Vec<TextEdit> =
+            symbol_locations(&doc.makefile(), doc.text(), doc.uri(), &symbol, true)
+                .into_iter()
+                .map(|loc| TextEdit {
+                    range: loc.range,
+                    new_text: new_name.to_string(),
+                })
+                .collect();
+        if edits.is_empty() {
+            continue;
         }
-        return None;
+        if !files.is_editable(doc.uri()) {
+            let name = symbol_name(&symbol).to_string();
+            return Some(Err(RenameError::UsedOutsideWorkspace(
+                name,
+                doc.uri().clone(),
+            )));
+        }
+        changes.insert(doc.uri().clone(), edits);
     }
 
-    // Target in prerequisites
-    if is_in_prerequisites(source_text, byte_offset) {
-        if let Some(word) = word_at_offset(source_text, byte_offset) {
-            return Some(rename_target(makefile, source_text, word, new_name, uri));
-        }
-        return None;
-    }
-
-    // Target or variable definition
-    if let Some(word) = word_at_offset(source_text, byte_offset) {
-        let is_target = makefile.rules().any(|r| {
-            r.targets().any(|t| {
-                if t != word {
-                    return false;
-                }
-                let rule_start: usize = r.syntax().text_range().start().into();
-                byte_offset >= rule_start && byte_offset < rule_start + t.len()
-            })
-        });
-        if is_target {
-            return Some(rename_target(makefile, source_text, word, new_name, uri));
-        }
-
-        let is_var = makefile.variable_definitions().any(|v| {
-            if v.name().as_deref() != Some(word) {
-                return false;
-            }
-            let var_start: usize = v.syntax().text_range().start().into();
-            byte_offset >= var_start && byte_offset < var_start + word.len()
-        });
-        if is_var {
-            return Some(rename_variable(makefile, source_text, word, new_name, uri));
-        }
-    }
-
-    None
-}
-
-/// Rename all occurrences of a variable.
-fn rename_variable(
-    makefile: &Makefile,
-    source_text: &str,
-    old_name: &str,
-    new_name: &str,
-    uri: &Uri,
-) -> WorkspaceEdit {
-    let mut edits = Vec::new();
-
-    // Rename in definitions
-    for var_def in makefile.variable_definitions() {
-        if var_def.name().as_deref() == Some(old_name) {
-            let range = text_range_to_lsp_range(source_text, var_def.syntax().text_range());
-            let start = range.start;
-            let end = Position::new(start.line, start.character + old_name.len() as u32);
-            edits.push(TextEdit {
-                range: Range::new(start, end),
-                new_text: new_name.to_string(),
-            });
-        }
-    }
-
-    // Rename in $(VAR) and ${VAR} references
-    let paren_pattern = format!("$({}", old_name);
-    let brace_pattern = format!("${{{}", old_name);
-
-    for pattern in [&paren_pattern, &brace_pattern] {
-        let close = if pattern.starts_with("$(") { ')' } else { '}' };
-        for (idx, _) in source_text.match_indices(pattern.as_str()) {
-            let after = idx + pattern.len();
-            if after < source_text.len() {
-                let next = source_text.as_bytes()[after];
-                if next == close as u8 || next == b' ' || next == b')' || next == b'}' {
-                    let name_start = idx + 2;
-                    let start = offset_to_position(
-                        source_text,
-                        text_size::TextSize::from(name_start as u32),
-                    );
-                    let end = Position::new(start.line, start.character + old_name.len() as u32);
-                    edits.push(TextEdit {
-                        range: Range::new(start, end),
-                        new_text: new_name.to_string(),
-                    });
-                }
-            }
-        }
-    }
-
-    edits.sort_by_key(|e| (e.range.start.line, e.range.start.character));
-    edits.dedup_by(|a, b| a.range == b.range);
-
-    let mut changes = HashMap::new();
-    changes.insert(uri.clone(), edits);
-    WorkspaceEdit {
+    Some(Ok(WorkspaceEdit {
         changes: Some(changes),
         ..Default::default()
-    }
-}
-
-/// Rename all occurrences of a target.
-fn rename_target(
-    makefile: &Makefile,
-    source_text: &str,
-    old_name: &str,
-    new_name: &str,
-    uri: &Uri,
-) -> WorkspaceEdit {
-    let mut edits = Vec::new();
-
-    for rule in makefile.rules() {
-        // Rename in target definitions
-        for target in rule.targets() {
-            if target == old_name {
-                let range = text_range_to_lsp_range(source_text, rule.syntax().text_range());
-                let start = range.start;
-                let end = Position::new(start.line, start.character + old_name.len() as u32);
-                edits.push(TextEdit {
-                    range: Range::new(start, end),
-                    new_text: new_name.to_string(),
-                });
-            }
-        }
-
-        // Rename in prerequisites
-        for prereq in rule.prerequisites() {
-            if prereq == old_name {
-                collect_word_edits_in_prerequisites(
-                    source_text,
-                    &rule,
-                    old_name,
-                    new_name,
-                    &mut edits,
-                );
-            }
-        }
-    }
-
-    edits.sort_by_key(|e| (e.range.start.line, e.range.start.character));
-    edits.dedup_by(|a, b| a.range == b.range);
-
-    let mut changes = HashMap::new();
-    changes.insert(uri.clone(), edits);
-    WorkspaceEdit {
-        changes: Some(changes),
-        ..Default::default()
-    }
-}
-
-/// Find word occurrences in the prerequisites area and create text edits.
-fn collect_word_edits_in_prerequisites(
-    source_text: &str,
-    rule: &makefile_lossless::Rule,
-    word: &str,
-    new_name: &str,
-    edits: &mut Vec<TextEdit>,
-) {
-    let rule_range = rule.syntax().text_range();
-    let rule_text = &source_text[usize::from(rule_range.start())..usize::from(rule_range.end())];
-    let rule_offset: usize = rule_range.start().into();
-
-    if let Some(colon_pos) = rule_text.find(':') {
-        let after_colon = &rule_text[colon_pos + 1..];
-        let end = after_colon.find('\n').unwrap_or(after_colon.len());
-        let prereq_text = &after_colon[..end];
-        let prereq_start = rule_offset + colon_pos + 1;
-
-        for (idx, _) in prereq_text.match_indices(word) {
-            let abs_offset = prereq_start + idx;
-            let before_ok = idx == 0
-                || !prereq_text.as_bytes()[idx - 1].is_ascii_alphanumeric()
-                    && prereq_text.as_bytes()[idx - 1] != b'_';
-            let after_idx = idx + word.len();
-            let after_ok = after_idx >= prereq_text.len()
-                || !prereq_text.as_bytes()[after_idx].is_ascii_alphanumeric()
-                    && prereq_text.as_bytes()[after_idx] != b'_';
-            if before_ok && after_ok {
-                let start =
-                    offset_to_position(source_text, text_size::TextSize::from(abs_offset as u32));
-                let end_pos = Position::new(start.line, start.character + word.len() as u32);
-                edits.push(TextEdit {
-                    range: Range::new(start, end_pos),
-                    new_text: new_name.to_string(),
-                });
-            }
-        }
-    }
+    }))
 }
 
 /// Find the byte offset of the start of the word at the given offset.
@@ -333,17 +180,22 @@ fn find_var_name_start_in_ref(text: &str, offset: usize) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::workspace::tests::Fixture;
+    use crate::workspace::{Document, Workspace};
 
     fn test_uri() -> Uri {
         "file:///test/Makefile".parse().unwrap()
     }
 
+    fn single(text: &str) -> FileSet {
+        FileSet::single(Document::new(test_uri(), text.to_string()))
+    }
+
     fn get_edits(text: &str, pos: Position, new_name: &str) -> Vec<TextEdit> {
-        let parsed = Makefile::parse(text);
-        let makefile = parsed.tree();
         let uri = test_uri();
-        let result = rename(&makefile, text, pos, new_name, &uri);
+        let result = rename(&single(text), pos, new_name);
         result
+            .map(|r| r.unwrap())
             .and_then(|ws| ws.changes.and_then(|c| c.get(&uri).cloned()))
             .unwrap_or_default()
     }
@@ -386,11 +238,9 @@ mod tests {
     #[test]
     fn test_prepare_rename_variable() {
         let text = "CC = gcc\nall:\n\t$(CC) main.c\n";
-        let parsed = Makefile::parse(text);
-        let makefile = parsed.tree();
-        let result = prepare_rename(&makefile, text, Position::new(0, 0));
+        let result = prepare_rename(&single(text), Position::new(0, 0));
         assert!(result.is_some());
-        match result.unwrap() {
+        match result.unwrap().unwrap() {
             PrepareRenameResponse::RangeWithPlaceholder { placeholder, .. } => {
                 assert_eq!(placeholder, "CC");
             }
@@ -401,9 +251,7 @@ mod tests {
     #[test]
     fn test_prepare_rename_nothing() {
         let text = "all:\n\techo hello\n";
-        let parsed = Makefile::parse(text);
-        let makefile = parsed.tree();
-        let result = prepare_rename(&makefile, text, Position::new(1, 2));
+        let result = prepare_rename(&single(text), Position::new(1, 2));
         assert!(result.is_none());
     }
 
@@ -412,5 +260,107 @@ mod tests {
         let text = "CC = gcc\nall:\n\t$(CC) main.c\nclean:\n\t$(CC) --version\n";
         let edits = get_edits(text, Position::new(0, 0), "COMPILER");
         assert_eq!(edits.len(), 3);
+    }
+
+    fn edit_summary(edit: WorkspaceEdit) -> Vec<(Uri, u32, u32, String)> {
+        let mut out: Vec<_> = edit
+            .changes
+            .unwrap()
+            .into_iter()
+            .flat_map(|(uri, edits)| {
+                edits.into_iter().map(move |e| {
+                    (
+                        uri.clone(),
+                        e.range.start.line,
+                        e.range.start.character,
+                        e.new_text,
+                    )
+                })
+            })
+            .collect();
+        out.sort_by(|a, b| (a.0.as_str(), a.1, a.2).cmp(&(b.0.as_str(), b.1, b.2)));
+        out
+    }
+
+    #[test]
+    fn test_rename_variable_across_files() {
+        let fx = Fixture::new(&[
+            ("Makefile", "include rules.mk\nall:\n\t$(CC) x\n"),
+            ("rules.mk", "CC = gcc\n"),
+        ]);
+        let edit = rename(&fx.file_set("Makefile"), Position::new(2, 3), "GCC")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            edit_summary(edit),
+            vec![
+                (fx.uri("Makefile"), 2, 3, "GCC".to_string()),
+                (fx.uri("rules.mk"), 0, 0, "GCC".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_rename_target_from_included_file() {
+        let fx = Fixture::new(&[
+            ("Makefile", "include rules.mk\nall: build\n"),
+            ("rules.mk", "build:\n\techo\n"),
+        ]);
+        let (mut ws, makefile) = fx.open("Makefile");
+        ws.file_set(&makefile).unwrap();
+        let rules = fx.open_in(&mut ws, "rules.mk");
+        let edit = rename(
+            &ws.file_set(&rules).unwrap(),
+            Position::new(0, 0),
+            "compile",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            edit_summary(edit),
+            vec![
+                (makefile, 1, 5, "compile".to_string()),
+                (rules, 0, 0, "compile".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_rename_refused_for_symbol_defined_outside_workspace() {
+        let fx = Fixture::new(&[
+            ("ws/Makefile", "include ../sys.mk\nall:\n\t$(SYSVAR)\n"),
+            ("sys.mk", "SYSVAR = 1\n"),
+        ]);
+        let mut ws = Workspace::new();
+        ws.set_roots(vec![fx.path("ws")]);
+        let uri = fx.open_in(&mut ws, "ws/Makefile");
+        let set = ws.file_set(&uri).unwrap();
+        let expected = RenameError::DefinedOutsideWorkspace("SYSVAR".to_string(), fx.uri("sys.mk"));
+        assert_eq!(
+            prepare_rename(&set, Position::new(2, 3))
+                .unwrap()
+                .unwrap_err(),
+            expected
+        );
+        assert_eq!(
+            rename(&set, Position::new(2, 3), "X").unwrap().unwrap_err(),
+            expected
+        );
+    }
+
+    #[test]
+    fn test_rename_refused_for_symbol_used_outside_workspace() {
+        let fx = Fixture::new(&[
+            ("ws/Makefile", "VAR = 1\ninclude ../sys.mk\n"),
+            ("sys.mk", "all:\n\t$(VAR)\n"),
+        ]);
+        let mut ws = Workspace::new();
+        ws.set_roots(vec![fx.path("ws")]);
+        let uri = fx.open_in(&mut ws, "ws/Makefile");
+        let set = ws.file_set(&uri).unwrap();
+        assert_eq!(
+            rename(&set, Position::new(0, 0), "X").unwrap().unwrap_err(),
+            RenameError::UsedOutsideWorkspace("VAR".to_string(), fx.uri("sys.mk"))
+        );
     }
 }
