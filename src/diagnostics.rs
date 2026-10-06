@@ -3,8 +3,8 @@
 use std::collections::{HashMap, HashSet};
 
 use makefile_lossless::{
-    Conditional, Makefile, MakefileItem, Parse, ParseErrorKind, PositionedParseError, SyntaxKind,
-    VariableReference,
+    Conditional, Makefile, MakefileItem, Parse, ParseErrorKind, PositionedParseError, Rule,
+    SyntaxKind, VariableReference,
 };
 use rowan::ast::AstNode;
 use text_size::{TextRange, TextSize};
@@ -118,13 +118,33 @@ pub fn space_indent_range(source_text: &str, error: &PositionedParseError) -> Op
     if error.kind() != ParseErrorKind::MissingSeparator {
         return None;
     }
-    let line = line_range(source_text, error.range.start());
+    // The error is reported at the end of the line, which may be a
+    // continuation line.
+    let line = line_range(
+        source_text,
+        logical_line_start(source_text, error.range.start()),
+    );
     let line_text = &source_text[line];
     let spaces = line_text.len() - line_text.trim_start_matches(' ').len();
     if spaces == 0 {
         return None;
     }
     Some(TextRange::at(line.start(), TextSize::from(spaces as u32)))
+}
+
+/// The start of the logical line containing `offset`, i.e. the first of the
+/// physical lines joined to it by backslash continuations.
+fn logical_line_start(source_text: &str, offset: TextSize) -> TextSize {
+    let mut start = line_range(source_text, offset).start();
+    while let Some(prev) = source_text[..usize::from(start)].strip_suffix('\n') {
+        let prev = prev.strip_suffix('\r').unwrap_or(prev);
+        let backslashes = prev.len() - prev.trim_end_matches('\\').len();
+        if backslashes % 2 == 0 {
+            break;
+        }
+        start = line_range(source_text, TextSize::from(prev.len() as u32)).start();
+    }
+    start
 }
 
 /// The range of the line containing `offset`, excluding its line ending.
@@ -218,6 +238,15 @@ const ACCUMULATING_TARGETS: &[&str] = &[
     ".NOTPARALLEL",
 ];
 
+/// Rules that have a `:` separator.
+///
+/// A line that make rejects with "missing separator" (such as a
+/// space-indented recipe) is parsed as a rule without one; its words are
+/// not targets.
+fn separated_rules(makefile: &Makefile) -> impl Iterator<Item = Rule> + '_ {
+    makefile.rules().filter(|rule| rule.operator().is_some())
+}
+
 /// Check for duplicate target definitions.
 ///
 /// In GNU Make, when the same target appears in multiple single-colon rules,
@@ -228,7 +257,7 @@ fn check_duplicate_targets(source_text: &str, makefile: &Makefile) -> Vec<Diagno
     let mut diagnostics = Vec::new();
     let mut seen: HashMap<String, Range> = HashMap::new();
 
-    for rule in makefile.rules() {
+    for rule in separated_rules(makefile) {
         for target in rule.targets() {
             // Skip pattern rules (contain %)
             if target.contains('%') {
@@ -825,7 +854,7 @@ fn check_missing_include_file(
 fn check_empty_rule_probably_phony(source_text: &str, makefile: &Makefile) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
 
-    for rule in makefile.rules() {
+    for rule in separated_rules(makefile) {
         // Skip rules with prerequisites — they're meta-targets, not phony candidates.
         if rule.prerequisites().next().is_some() {
             continue;
@@ -2269,6 +2298,52 @@ mod tests {
                 .map(|d| d.range)
                 .collect::<Vec<_>>(),
             vec![Range::new(Position::new(1, 0), Position::new(1, 4))]
+        );
+    }
+
+    #[test]
+    fn test_spaces_instead_of_tab_range_continued_line() {
+        let diags = get_diags("all:\n    echo a \\\n      b \\\n  c\n");
+        assert_eq!(
+            diags
+                .iter()
+                .filter(
+                    |d| d.code == Some(NumberOrString::String("spaces-instead-of-tab".to_string()))
+                )
+                .map(|d| d.range)
+                .collect::<Vec<_>>(),
+            vec![Range::new(Position::new(1, 0), Position::new(1, 4))]
+        );
+    }
+
+    #[test]
+    fn test_line_without_separator_is_not_a_target() {
+        let diags = get_diags("all:\n    echo hi\n    echo hi\n\techo\n");
+        assert_eq!(
+            diags
+                .iter()
+                .map(|d| (d.code.clone(), d.range))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    Some(NumberOrString::String("spaces-instead-of-tab".to_string())),
+                    Range::new(Position::new(1, 0), Position::new(1, 4))
+                ),
+                (
+                    Some(NumberOrString::String("spaces-instead-of-tab".to_string())),
+                    Range::new(Position::new(2, 0), Position::new(2, 4))
+                ),
+                (
+                    Some(NumberOrString::String("orphan-recipe-line".to_string())),
+                    Range::new(Position::new(3, 0), Position::new(3, 5))
+                ),
+                (
+                    Some(NumberOrString::String(
+                        "empty-rule-probably-phony".to_string()
+                    )),
+                    Range::new(Position::new(0, 0), Position::new(1, 0))
+                ),
+            ]
         );
     }
 
