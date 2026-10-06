@@ -410,8 +410,13 @@ impl LanguageServer for Backend {
             return Ok(None);
         };
 
-        let actions =
-            code_actions::get_code_actions(&file_info.parsed, &file_info.text, range, uri);
+        let actions = code_actions::get_code_actions(
+            &file_info.parsed,
+            &file_info.text,
+            range,
+            uri,
+            &params.context.diagnostics,
+        );
         drop(files);
 
         if actions.is_empty() {

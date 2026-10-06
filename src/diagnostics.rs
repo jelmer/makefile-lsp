@@ -73,6 +73,7 @@ pub fn get_diagnostics(
     diagnostics.extend(check_empty_rule_probably_phony(source_text, &makefile));
     if let Some(dir) = base_dir {
         diagnostics.extend(check_missing_include_file(source_text, &makefile, dir));
+        diagnostics.extend(check_missing_phony(source_text, &makefile, dir));
     }
 
     diagnostics
@@ -1272,6 +1273,104 @@ fn check_trailing_whitespace_in_value(source_text: &str, makefile: &Makefile) ->
         ));
     }
 
+    diagnostics
+}
+
+/// The names of the plain (non-expression) targets of `rule`, with their
+/// ranges.
+pub fn target_name_ranges(rule: &makefile_lossless::Rule) -> Vec<(String, TextRange)> {
+    let Some(targets) = rule
+        .syntax()
+        .children()
+        .find(|c| c.kind() == SyntaxKind::TARGETS)
+    else {
+        return Vec::new();
+    };
+    targets
+        .children_with_tokens()
+        .filter_map(|c| c.into_token())
+        .filter(|t| t.kind() == SyntaxKind::IDENTIFIER)
+        .map(|t| (t.text().to_string(), t.text_range()))
+        .collect()
+}
+
+/// Is `name` a target that by convention is never a file?
+///
+/// Builds on the conventional entry points, leaving out `build`, `doc`,
+/// `docs`, `release` and `tests`, which are often real directories.
+fn is_conventional_non_file_target(name: &str) -> bool {
+    const EXTRA: &[&str] = &[
+        "coverage",
+        "fmt",
+        "format",
+        "installcheck",
+        "maintainer-clean",
+        "mostlyclean",
+    ];
+    let is_directory_like = matches!(name, "build" | "doc" | "docs" | "release" | "tests");
+    (crate::dep_graph::is_conventional_entry_point(name) && !is_directory_like)
+        || EXTRA.contains(&name)
+}
+
+/// Check for targets that by convention aren't files (`clean`, `install`,
+/// ...) but aren't declared `.PHONY`.
+///
+/// Without `.PHONY`, a file of that name makes the target appear up to date
+/// and its recipe silently stops running. Conservative to avoid noise:
+///
+/// - Targets for which a file exists next to the makefile are skipped.
+/// - Rules without prerequisites and recipe are left to
+///   `empty-rule-probably-phony`.
+/// - The check is skipped entirely if `.PHONY` lists a variable reference,
+///   or if the makefile includes others and declares nothing `.PHONY`
+///   itself, since the declarations may then live elsewhere.
+fn check_missing_phony(
+    source_text: &str,
+    makefile: &Makefile,
+    base_dir: &std::path::Path,
+) -> Vec<Diagnostic> {
+    let phony_prereqs: Vec<String> = makefile
+        .rules_by_target(".PHONY")
+        .flat_map(|r| r.prerequisites().collect::<Vec<_>>())
+        .collect();
+    if phony_prereqs.iter().any(|p| p.contains('$')) {
+        return Vec::new();
+    }
+    let has_include = makefile
+        .syntax()
+        .descendants()
+        .any(|n| n.kind() == SyntaxKind::INCLUDE);
+    if phony_prereqs.is_empty() && has_include {
+        return Vec::new();
+    }
+
+    let mut seen = HashSet::new();
+    let mut diagnostics = Vec::new();
+    for rule in makefile.rules() {
+        let is_empty =
+            rule.prerequisites().next().is_none() && rule.recipe_nodes().next().is_none();
+        if is_empty {
+            continue;
+        }
+        for (name, range) in target_name_ranges(&rule) {
+            if !is_conventional_non_file_target(&name)
+                || makefile.is_phony(&name)
+                || base_dir.join(&name).exists()
+                || !seen.insert(name.clone())
+            {
+                continue;
+            }
+            diagnostics.push(make_diagnostic(
+                text_range_to_lsp_range(source_text, range),
+                DiagnosticSeverity::HINT,
+                "missing-phony",
+                format!(
+                    "target '{}' is conventionally not a file; declare it .PHONY",
+                    name
+                ),
+            ));
+        }
+    }
     diagnostics
 }
 
@@ -2723,5 +2822,110 @@ mod tests {
         assert_eq!(unt.len(), 1);
         assert_eq!(unt[0].message, "'ifdef' is missing a matching 'endif'");
         assert_eq!(unt[0].severity, Some(DiagnosticSeverity::ERROR));
+    }
+
+    fn missing_phony_diags(text: &str, dir: &std::path::Path) -> Vec<Diagnostic> {
+        diags_with_dir(text, dir)
+            .into_iter()
+            .filter(|d| d.code == Some(NumberOrString::String("missing-phony".to_string())))
+            .collect()
+    }
+
+    #[test]
+    fn test_missing_phony() {
+        let dir = tempfile::tempdir().unwrap();
+        let diags = missing_phony_diags(
+            "all: foo\nfoo:\n\ttouch foo\nclean:\n\trm -f foo\n",
+            dir.path(),
+        );
+        assert_eq!(diags.len(), 2);
+        assert_eq!(
+            diags[0].message,
+            "target 'all' is conventionally not a file; declare it .PHONY"
+        );
+        assert_eq!(diags[0].severity, Some(DiagnosticSeverity::HINT));
+        assert_eq!(
+            diags[0].range,
+            Range::new(Position::new(0, 0), Position::new(0, 3))
+        );
+        assert_eq!(
+            diags[1].range,
+            Range::new(Position::new(3, 0), Position::new(3, 5))
+        );
+    }
+
+    #[test]
+    fn test_missing_phony_second_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let diags = missing_phony_diags(".PHONY: clean\nclean distclean:\n\trm -f x\n", dir.path());
+        assert_eq!(diags.len(), 1);
+        assert_eq!(
+            diags[0].range,
+            Range::new(Position::new(1, 6), Position::new(1, 15))
+        );
+    }
+
+    #[test]
+    fn test_missing_phony_reported_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let diags = missing_phony_diags("clean:: a\n\trm a\nclean:: b\n\trm b\n", dir.path());
+        assert_eq!(diags.len(), 1);
+    }
+
+    #[test]
+    fn test_missing_phony_declared_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = ".PHONY: all clean\nall: foo\nclean:\n\trm -f foo\n";
+        assert_eq!(missing_phony_diags(text, dir.path()).len(), 0);
+    }
+
+    #[test]
+    fn test_missing_phony_file_exists_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("install"), "").unwrap();
+        let text = "install: foo\n\tcp foo /usr/bin\n";
+        assert_eq!(missing_phony_diags(text, dir.path()).len(), 0);
+    }
+
+    #[test]
+    fn test_missing_phony_unconventional_name_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = "foo: bar\n\ttouch foo\nbuild: foo\n\tmkdir build\ndocs: foo\n\tmkdir docs\n";
+        assert_eq!(missing_phony_diags(text, dir.path()).len(), 0);
+    }
+
+    #[test]
+    fn test_missing_phony_empty_rule_left_to_other_check() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(missing_phony_diags("clean:\n", dir.path()).len(), 0);
+    }
+
+    #[test]
+    fn test_missing_phony_variable_in_phony_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = "PHONIES = clean\n.PHONY: $(PHONIES)\nclean:\n\trm -f x\n";
+        assert_eq!(missing_phony_diags(text, dir.path()).len(), 0);
+    }
+
+    #[test]
+    fn test_missing_phony_include_without_phony_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = "-include common.mk\nclean:\n\trm -f x\n";
+        assert_eq!(missing_phony_diags(text, dir.path()).len(), 0);
+        let text = "ifdef X\ninclude common.mk\nendif\nclean:\n\trm -f x\n";
+        assert_eq!(missing_phony_diags(text, dir.path()).len(), 0);
+    }
+
+    #[test]
+    fn test_missing_phony_include_with_phony() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = "-include common.mk\n.PHONY: all\nall: clean\nclean:\n\trm -f x\n";
+        assert_eq!(missing_phony_diags(text, dir.path()).len(), 1);
+    }
+
+    #[test]
+    fn test_missing_phony_needs_base_dir() {
+        let codes = diag_codes("clean:\n\trm -f x\n");
+        assert!(!codes.contains(&"missing-phony".to_string()));
     }
 }
