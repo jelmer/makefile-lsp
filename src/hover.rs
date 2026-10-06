@@ -1,6 +1,11 @@
 //! Hover information for Makefiles.
 
-use makefile_lossless::{is_in_prerequisites, variable_at_offset, word_at_offset, Makefile};
+use makefile_lossless::{
+    is_in_prerequisites, variable_at_offset, word_at_offset, Lang, Makefile, SyntaxKind,
+};
+use rowan::ast::AstNode;
+use rowan::SyntaxNode;
+use text_size::TextSize;
 use tower_lsp_server::ls_types::{Hover, HoverContents, MarkupContent, MarkupKind, Position};
 
 use crate::builtins;
@@ -14,6 +19,75 @@ fn markdown_hover(text: String) -> Hover {
         }),
         range: None,
     }
+}
+
+/// Check whether `offset` lies within the target list of a rule head.
+fn in_rule_targets(makefile: &Makefile, offset: TextSize) -> bool {
+    makefile
+        .syntax()
+        .token_at_offset(offset)
+        .any(|t| t.parent().is_some_and(|p| p.kind() == SyntaxKind::TARGETS))
+}
+
+/// Describe the first rule defining `target`: its doc comment, prerequisites
+/// and recipe.
+fn target_hover(makefile: &Makefile, target: &str) -> Option<Hover> {
+    let rule = makefile
+        .rules()
+        .find(|r| r.targets().any(|t| t == target))?;
+    let prereqs: Vec<String> = rule.prerequisites().collect();
+    let recipes: Vec<String> = rule.recipes().collect();
+    let mut info = format!("**`{}`**", target);
+    if let Some(doc) = doc_comment(rule.syntax()) {
+        info.push_str(&format!("\n\n{}", doc));
+    }
+    if !prereqs.is_empty() {
+        info.push_str(&format!("\n\nPrerequisites: `{}`", prereqs.join(" ")));
+    }
+    if !recipes.is_empty() {
+        info.push_str("\n\n```makefile");
+        for r in &recipes {
+            info.push_str(&format!("\n\t{}", r));
+        }
+        info.push_str("\n```");
+    }
+    Some(markdown_hover(info))
+}
+
+/// Collect the `#` comment lines directly above `node`, stopping at a blank
+/// line or any other content. Returns `None` if there are none.
+fn doc_comment(node: &SyntaxNode<Lang>) -> Option<String> {
+    let mut lines = Vec::new();
+    let mut token = node.first_token()?.prev_token();
+    while let Some(newline) = token.filter(|t| t.kind() == SyntaxKind::NEWLINE) {
+        let Some(comment) = newline
+            .prev_token()
+            .filter(|t| t.kind() == SyntaxKind::COMMENT && !t.text().starts_with("#!"))
+        else {
+            break;
+        };
+        // Only whole-line comments count, not trailing ones like `FOO = 1 # x`.
+        let before = comment.prev_token();
+        if before
+            .as_ref()
+            .is_some_and(|t| t.kind() != SyntaxKind::NEWLINE)
+        {
+            break;
+        }
+        let text = comment.text().trim_start_matches('#');
+        lines.push(
+            text.strip_prefix(' ')
+                .unwrap_or(text)
+                .trim_end()
+                .to_string(),
+        );
+        token = before;
+    }
+    if lines.is_empty() {
+        return None;
+    }
+    lines.reverse();
+    Some(lines.join("\n"))
 }
 
 /// Get hover information for the symbol at the given position.
@@ -47,10 +121,11 @@ pub fn get_hover(makefile: &Makefile, source_text: &str, position: Position) -> 
                 .raw_value()
                 .map(|v| v.trim().to_string())
                 .unwrap_or_default();
-            return Some(markdown_hover(format!(
-                "```makefile\n{} {} {}\n```",
-                var_name, op, value
-            )));
+            let mut info = format!("```makefile\n{} {} {}\n```", var_name, op, value);
+            if let Some(doc) = doc_comment(var_def.syntax()) {
+                info.push_str(&format!("\n\n{}", doc));
+            }
+            return Some(markdown_hover(info));
         }
 
         // Check built-in variables
@@ -68,23 +143,11 @@ pub fn get_hover(makefile: &Makefile, source_text: &str, position: Position) -> 
             return Some(markdown_hover(format!("**`{}`**: {}", word, doc)));
         }
 
-        // Show rule info if hovering over a target reference in prerequisites
-        if is_in_prerequisites(source_text, byte_offset) {
-            if let Some(rule) = makefile.rules().find(|r| r.targets().any(|t| t == word)) {
-                let prereqs: Vec<String> = rule.prerequisites().collect();
-                let recipes: Vec<String> = rule.recipes().collect();
-                let mut info = format!("**`{}`**", word);
-                if !prereqs.is_empty() {
-                    info.push_str(&format!("\n\nPrerequisites: `{}`", prereqs.join(" ")));
-                }
-                if !recipes.is_empty() {
-                    info.push_str("\n\n```makefile");
-                    for r in &recipes {
-                        info.push_str(&format!("\n\t{}", r));
-                    }
-                    info.push_str("\n```");
-                }
-                return Some(markdown_hover(info));
+        // Show rule info for a target, either where it is referenced as a
+        // prerequisite or where it is defined.
+        if is_in_prerequisites(source_text, byte_offset) || in_rule_targets(makefile, offset) {
+            if let Some(hover) = target_hover(makefile, word) {
+                return Some(hover);
             }
         }
     }
@@ -171,6 +234,76 @@ mod tests {
         let content = result.unwrap();
         assert!(content.contains("build"));
         assert!(content.contains("echo ok"));
+    }
+
+    #[test]
+    fn test_hover_target_definition() {
+        let text = "all: build\n\nbuild:\n\techo ok\n";
+        assert_eq!(
+            hover_text(text, Position::new(2, 1)).as_deref(),
+            Some("**`build`**\n\n```makefile\n\techo ok\n```")
+        );
+        assert_eq!(
+            hover_text(text, Position::new(0, 1)).as_deref(),
+            Some("**`all`**\n\nPrerequisites: `build`")
+        );
+    }
+
+    #[test]
+    fn test_hover_target_doc_comment() {
+        let text = "# Build the thing.\n# Twice.\nall: dep\n\techo hi\n\nother: all\n";
+        let expected =
+            "**`all`**\n\nBuild the thing.\nTwice.\n\nPrerequisites: `dep`\n\n```makefile\n\techo hi\n```";
+        assert_eq!(
+            hover_text(text, Position::new(2, 0)).as_deref(),
+            Some(expected)
+        );
+        assert_eq!(
+            hover_text(text, Position::new(5, 8)).as_deref(),
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn test_hover_target_doc_comment_after_recipe() {
+        let text = "all:\n\techo hi\n# About foo\nfoo:\n";
+        assert_eq!(
+            hover_text(text, Position::new(3, 0)).as_deref(),
+            Some("**`foo`**\n\nAbout foo")
+        );
+    }
+
+    #[test]
+    fn test_hover_target_doc_comment_markers() {
+        assert_eq!(
+            hover_text("## Run tests\ntest:\n", Position::new(1, 0)).as_deref(),
+            Some("**`test`**\n\nRun tests")
+        );
+        assert_eq!(
+            hover_text("#!/usr/bin/make -f\nall:\n", Position::new(1, 0)).as_deref(),
+            Some("**`all`**")
+        );
+    }
+
+    #[test]
+    fn test_hover_target_ignores_detached_comments() {
+        assert_eq!(
+            hover_text("# Unrelated\n\nfoo:\n", Position::new(2, 0)).as_deref(),
+            Some("**`foo`**")
+        );
+        assert_eq!(
+            hover_text("X = 1 # trailing\nfoo:\n", Position::new(1, 0)).as_deref(),
+            Some("**`foo`**")
+        );
+    }
+
+    #[test]
+    fn test_hover_variable_doc_comment() {
+        let text = "# The C compiler\nCC = gcc\nall:\n\t$(CC) x.c\n";
+        assert_eq!(
+            hover_text(text, Position::new(3, 3)).as_deref(),
+            Some("```makefile\nCC = gcc\n```\n\nThe C compiler")
+        );
     }
 
     #[test]
