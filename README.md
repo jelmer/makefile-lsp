@@ -167,6 +167,12 @@ makefile-lsp check Makefile build/
 makefile-lsp check --format sarif > makefile-lsp.sarif
 ```
 
+Like the language server, `check` follows `include` directives: variables,
+targets and `.PHONY` declarations in included makefiles, and in makefiles
+nearby (up to the current directory) that include a checked file, are taken
+into account. Diagnostics are still only reported for the checked files. Use
+`--no-follow-includes` to check each file on its own.
+
 Diagnostics are printed as `path:line:column: severity: message [code]`. Use
 `--format sarif` to produce SARIF 2.1.0, e.g. for GitHub code scanning.
 
@@ -190,6 +196,11 @@ they can be surfaced inline:
 makefile-lsp scip                       # index ./Makefile into index.scip
 makefile-lsp scip Makefile build/Rules.mk -o out.scip
 ```
+
+Includes are followed as in `check`, so diagnostics take included and
+including makefiles into account, and references to variables defined in
+another makefile use the same symbol as the definition. Only the given files
+are indexed.
 
 Use `--project-root` to override the root directory recorded in the index
 (defaults to the current directory).

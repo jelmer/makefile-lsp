@@ -6,12 +6,12 @@
 //! variables (`$@`, `$<`, `$(MAKE)`, ...) carry the same documentation the LSP
 //! hover serves, so SCIP consumers can show it. Each occurrence carries a
 //! `SyntaxKind` so consumers can syntax-highlight from the index. Lint and parse
-//! diagnostics are carried into the index as symbol-less occurrences. Symbol
-//! positions are emitted as UTF-8 byte offsets from the start of the line,
-//! matching `PositionEncoding::UTF8`.
+//! diagnostics are carried into the index as symbol-less occurrences. Symbols
+//! are global, so a reference to a variable defined in an included makefile
+//! links to its definition there. Symbol positions are emitted as UTF-8 byte
+//! offsets from the start of the line, matching `PositionEncoding::UTF8`.
 
-use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::collections::{BTreeMap, HashSet};
 
 use makefile_lossless::Makefile;
 use rowan::ast::AstNode;
@@ -24,6 +24,7 @@ use tower_lsp_server::ls_types::{DiagnosticSeverity, NumberOrString};
 
 use crate::position::try_lsp_range_to_text_range;
 use crate::targets::targets_with_ranges;
+use crate::workspace::FileSet;
 
 const SCHEME: &str = "scip-makefile";
 
@@ -31,11 +32,9 @@ const SCHEME: &str = "scip-makefile";
 pub struct SourceFile {
     /// Path relative to the project root, used as the document's identifier.
     pub relative_path: String,
-    /// The file's contents.
-    pub text: String,
-    /// Directory used to resolve relative `include` paths for diagnostics.
-    /// `None` skips filesystem-touching checks.
-    pub base_dir: Option<PathBuf>,
+    /// The file as the current document, together with the makefiles it
+    /// includes and those including it.
+    pub files: FileSet,
 }
 
 /// Build a SCIP index for a set of Makefiles.
@@ -45,7 +44,7 @@ pub struct SourceFile {
 pub fn build_index(project_root: &str, files: &[SourceFile]) -> Index {
     let documents = files
         .iter()
-        .map(|f| build_document(&f.relative_path, &f.text, f.base_dir.as_deref()))
+        .map(|f| build_document(&f.relative_path, &f.files))
         .collect();
 
     Index {
@@ -81,9 +80,10 @@ struct RawOccurrence {
     syntax_kind: SyntaxKind,
 }
 
-fn build_document(relative_path: &str, text: &str, base_dir: Option<&Path>) -> Document {
-    let parsed = Makefile::parse(text);
-    let makefile = parsed.tree();
+fn build_document(relative_path: &str, files: &FileSet) -> Document {
+    let current = files.current();
+    let text = current.text();
+    let makefile = current.makefile();
 
     let mut occurrences = Vec::new();
     // Track which symbols have definitions, with display name and kind, so the
@@ -94,9 +94,16 @@ fn build_document(relative_path: &str, text: &str, base_dir: Option<&Path>) -> D
     // file, keyed by symbol with (display name, description).
     let mut builtin_refs: BTreeMap<String, (String, String)> = BTreeMap::new();
 
-    let user_defined: std::collections::HashSet<String> = makefile
-        .variable_definitions()
-        .filter_map(|v| v.name())
+    // Variables defined in included or including makefiles share the global
+    // symbol of their definition, so references to them link across files.
+    let user_defined: HashSet<String> = files
+        .docs()
+        .flat_map(|doc| {
+            doc.makefile()
+                .variable_definitions()
+                .filter_map(|v| v.name())
+                .collect::<Vec<_>>()
+        })
         .collect();
 
     for raw in collect_targets(&makefile, text)
@@ -160,7 +167,7 @@ fn build_document(relative_path: &str, text: &str, base_dir: Option<&Path>) -> D
 
     // Carry lint/parse diagnostics into the index as symbol-less occurrences,
     // so consumers like Sourcegraph can render them inline.
-    occurrences.extend(diagnostic_occurrences(text, &parsed, base_dir));
+    occurrences.extend(diagnostic_occurrences(files));
 
     Document {
         language: "makefile".to_string(),
@@ -279,14 +286,15 @@ fn collect_variable_definitions(makefile: &Makefile, text: &str) -> Vec<RawOccur
 /// Collect occurrences for every `$(VAR)`/`${VAR}`/`$X` reference in the text,
 /// classifying each name.
 ///
-/// A name defined in this file (in `user_defined`) is emitted as a reference to
-/// the user's own symbol. Otherwise, if it is a built-in or automatic variable
-/// (`$@`, `$<`, `$(MAKE)`, ...), it is emitted and its documentation recorded in
-/// `docs`, reusing the same descriptions the LSP hover serves. Names that are
-/// neither are skipped (they are reported by the undefined-variable lint).
+/// A name defined in the file set (in `user_defined`) is emitted as a
+/// reference to the user's own symbol. Otherwise, if it is a built-in or
+/// automatic variable (`$@`, `$<`, `$(MAKE)`, ...), it is emitted and its
+/// documentation recorded in `docs`, reusing the same descriptions the LSP
+/// hover serves. Names that are neither are skipped (they are reported by the
+/// undefined-variable lint).
 fn collect_variable_references(
     text: &str,
-    user_defined: &std::collections::HashSet<String>,
+    user_defined: &HashSet<String>,
     docs: &mut BTreeMap<String, (String, String)>,
 ) -> Vec<RawOccurrence> {
     let mut out = Vec::new();
@@ -466,12 +474,9 @@ fn is_word_byte(b: u8) -> bool {
 /// The diagnostics come from the LSP analysis, whose ranges are in UTF-16 code
 /// units; we convert each back to a byte range and re-encode it in SCIP's
 /// UTF-8-byte-from-line-start scheme so it matches the symbol occurrences.
-fn diagnostic_occurrences(
-    text: &str,
-    parsed: &makefile_lossless::Parse<Makefile>,
-    base_dir: Option<&Path>,
-) -> Vec<Occurrence> {
-    crate::diagnostics::get_diagnostics(text, parsed, base_dir)
+fn diagnostic_occurrences(files: &FileSet) -> Vec<Occurrence> {
+    let text = files.current().text();
+    crate::diagnostics::get_file_set_diagnostics(files)
         .into_iter()
         .map(|diag| {
             let range = match try_lsp_range_to_text_range(text, &diag.range) {
@@ -550,12 +555,20 @@ fn byte_offset_to_line_col(text: &str, offset: usize) -> (i32, i32) {
 mod tests {
     use super::*;
 
+    fn single(text: &str) -> FileSet {
+        let uri = "untitled:Makefile".parse().unwrap();
+        FileSet::single(crate::workspace::Document::new(uri, text.to_string()))
+    }
+
     fn src_file(relative_path: &str, text: &str) -> SourceFile {
         SourceFile {
             relative_path: relative_path.to_string(),
-            text: text.to_string(),
-            base_dir: None,
+            files: single(text),
         }
+    }
+
+    fn build_single(relative_path: &str, text: &str) -> Document {
+        build_document(relative_path, &single(text))
     }
 
     fn occ_symbols(doc: &Document) -> Vec<(&str, &Vec<i32>, bool)> {
@@ -574,7 +587,7 @@ mod tests {
     #[test]
     fn test_target_definition_and_reference() {
         let text = "all: build\n\nbuild:\n\techo ok\n";
-        let doc = build_document("Makefile", text, None);
+        let doc = build_single("Makefile", text);
 
         let all = target_symbol("all");
         let build = target_symbol("build");
@@ -598,7 +611,7 @@ mod tests {
     #[test]
     fn test_target_definitions_in_rule_with_several_targets() {
         let text = "a-b b: c\n";
-        let doc = build_document("Makefile", text, None);
+        let doc = build_single("Makefile", text);
         let definitions: Vec<(&str, &Vec<i32>)> = occ_symbols(&doc)
             .into_iter()
             .filter(|(_, _, is_definition)| *is_definition)
@@ -618,7 +631,7 @@ mod tests {
     #[test]
     fn test_variable_definition_and_reference() {
         let text = "CC = gcc\nall:\n\t$(CC) main.c\n";
-        let doc = build_document("Makefile", text, None);
+        let doc = build_single("Makefile", text);
 
         let cc = variable_symbol("CC");
 
@@ -636,7 +649,7 @@ mod tests {
     #[test]
     fn test_occurrence_syntax_kinds() {
         let text = "CC = gcc\nall: build\n\t$(CC) x.c\nbuild:\n\techo hi\n";
-        let doc = build_document("Makefile", text, None);
+        let doc = build_single("Makefile", text);
 
         let cc = variable_symbol("CC");
         let all = target_symbol("all");
@@ -664,7 +677,7 @@ mod tests {
     #[test]
     fn test_symbol_table_lists_definitions() {
         let text = "CC = gcc\n\nall: build\n\techo ok\n";
-        let doc = build_document("Makefile", text, None);
+        let doc = build_single("Makefile", text);
 
         let names: Vec<&str> = doc
             .symbols
@@ -691,7 +704,7 @@ mod tests {
     #[test]
     fn test_special_target_documentation() {
         let text = "all: build\n\techo ok\nbuild:\n\techo b\n.PHONY: all\n";
-        let doc = build_document("Makefile", text, None);
+        let doc = build_single("Makefile", text);
         let phony = doc
             .symbols
             .iter()
@@ -706,7 +719,7 @@ mod tests {
     #[test]
     fn test_builtin_variable_documentation() {
         let text = "CC = gcc\nall:\n\t$(CC) main.c\n";
-        let doc = build_document("Makefile", text, None);
+        let doc = build_single("Makefile", text);
         let cc = doc.symbols.iter().find(|s| s.display_name == "CC").unwrap();
         assert_eq!(
             cc.documentation,
@@ -725,7 +738,7 @@ mod tests {
     #[test]
     fn test_automatic_variable_documentation() {
         let text = "all:\n\t$(CC) -o $@ $<\n";
-        let doc = build_document("Makefile", text, None);
+        let doc = build_single("Makefile", text);
 
         assert_eq!(
             doc_for(&doc, "@").as_deref(),
@@ -744,7 +757,7 @@ mod tests {
     #[test]
     fn test_automatic_variable_variant_documentation() {
         let text = "all:\n\techo $(@D) $(^F)\n";
-        let doc = build_document("Makefile", text, None);
+        let doc = build_single("Makefile", text);
         assert_eq!(
             doc_for(&doc, "@D").as_deref(),
             Some("The directory part of `$@`.")
@@ -759,7 +772,7 @@ mod tests {
     fn test_builtin_variable_reference_documentation() {
         // MAKE and CURDIR are never defined here, but referenced.
         let text = "all:\n\tcd $(CURDIR) && $(MAKE) -C sub\n";
-        let doc = build_document("Makefile", text, None);
+        let doc = build_single("Makefile", text);
         assert_eq!(
             doc_for(&doc, "CURDIR").as_deref(),
             Some("The absolute pathname of the current working directory.")
@@ -776,7 +789,7 @@ mod tests {
         // definition path (which already handles built-in docs), and must not
         // appear twice in the symbol table.
         let text = "CC = clang\nall:\n\t$(CC) main.c\n";
-        let doc = build_document("Makefile", text, None);
+        let doc = build_single("Makefile", text);
         let cc_syms: Vec<_> = doc
             .symbols
             .iter()
@@ -793,7 +806,7 @@ mod tests {
     fn test_unknown_single_char_not_documented() {
         // $$ (escaped dollar) and unknown $x must not produce symbols.
         let text = "all:\n\techo $$HOME $x\n";
-        let doc = build_document("Makefile", text, None);
+        let doc = build_single("Makefile", text);
         assert!(doc_for(&doc, "$").is_none());
         assert!(doc_for(&doc, "x").is_none());
     }
@@ -802,7 +815,7 @@ mod tests {
     fn test_nested_automatic_variable_documented() {
         // $@ nested inside $(dir ...) must still be documented.
         let text = "all:\n\techo $(dir $@)\n";
-        let doc = build_document("Makefile", text, None);
+        let doc = build_single("Makefile", text);
         assert_eq!(
             doc_for(&doc, "@").as_deref(),
             Some("The file name of the target of the rule.")
@@ -815,7 +828,7 @@ mod tests {
     fn test_nested_builtin_variable_documented() {
         // CURDIR nested inside $(addprefix ...) must still be documented.
         let text = "all:\n\techo $(addprefix $(CURDIR)/,a b)\n";
-        let doc = build_document("Makefile", text, None);
+        let doc = build_single("Makefile", text);
         assert_eq!(
             doc_for(&doc, "CURDIR").as_deref(),
             Some("The absolute pathname of the current working directory.")
@@ -826,7 +839,7 @@ mod tests {
     fn test_nested_user_variable_referenced() {
         // A user variable nested inside a function call is still referenced.
         let text = "SRC = a.c\nall:\n\techo $(notdir $(SRC))\n";
-        let doc = build_document("Makefile", text, None);
+        let doc = build_single("Makefile", text);
         let src = variable_symbol("SRC");
         let refs = doc
             .occurrences
@@ -841,7 +854,7 @@ mod tests {
         // A built-in mentioned in a full-line comment is not a reference: Make
         // never expands it.
         let text = "# see $(MAKE) docs\nall:\n\techo done\n";
-        let doc = build_document("Makefile", text, None);
+        let doc = build_single("Makefile", text);
         assert!(doc_for(&doc, "MAKE").is_none());
         let make = variable_symbol("MAKE");
         assert!(!doc.occurrences.iter().any(|o| o.symbol == make));
@@ -852,7 +865,7 @@ mod tests {
         // In a recipe, Make expands `$` before the shell sees `#`, so a variable
         // after a recipe-line `#` is a real reference.
         let text = "all:\n\techo hi # uses $(MAKE)\n";
-        let doc = build_document("Makefile", text, None);
+        let doc = build_single("Makefile", text);
         assert_eq!(
             doc_for(&doc, "MAKE").as_deref(),
             Some("The name of the make program being run.")
@@ -862,7 +875,7 @@ mod tests {
     #[test]
     fn test_user_symbols_have_no_documentation() {
         let text = "FOO = bar\nall: build\n\techo ok\nbuild:\n\techo b\n";
-        let doc = build_document("Makefile", text, None);
+        let doc = build_single("Makefile", text);
         for name in ["FOO", "all", "build"] {
             let sym = doc.symbols.iter().find(|s| s.display_name == name).unwrap();
             assert!(
@@ -875,7 +888,7 @@ mod tests {
     #[test]
     fn test_brace_variable_reference() {
         let text = "CC = gcc\nall:\n\t${CC} main.c\n";
-        let doc = build_document("Makefile", text, None);
+        let doc = build_single("Makefile", text);
         let cc = variable_symbol("CC");
         assert!(doc.occurrences.iter().any(|o| o.symbol == cc
             && o.range == vec![2, 3, 2, 5]
@@ -885,7 +898,7 @@ mod tests {
     #[test]
     fn test_multiple_variable_uses() {
         let text = "CC = gcc\nall:\n\t$(CC) a.c\nclean:\n\t$(CC) --version\n";
-        let doc = build_document("Makefile", text, None);
+        let doc = build_single("Makefile", text);
         let cc = variable_symbol("CC");
         let uses = occ_symbols(&doc)
             .into_iter()
@@ -917,7 +930,7 @@ mod tests {
 
     #[test]
     fn test_no_symbols_empty_makefile() {
-        let doc = build_document("Makefile", "", None);
+        let doc = build_single("Makefile", "");
         assert!(doc.occurrences.is_empty());
         assert!(doc.symbols.is_empty());
     }
@@ -956,7 +969,7 @@ mod tests {
 
     #[test]
     fn test_diagnostic_in_occurrence() {
-        let doc = build_document("Makefile", "CFLAGS = $(MISSING) -Wall\n", None);
+        let doc = build_single("Makefile", "CFLAGS = $(MISSING) -Wall\n");
         let found = diags(&doc);
         assert_eq!(found.len(), 1);
         let (range, diag) = found[0];
@@ -971,7 +984,7 @@ mod tests {
     fn test_multiline_diagnostic_range() {
         // A circular dependency is anchored on the whole rule, so the range
         // crosses line boundaries.
-        let doc = build_document("Makefile", "a: b\n\techo a\nb: a\n\techo b\n", None);
+        let doc = build_single("Makefile", "a: b\n\techo a\nb: a\n\techo b\n");
         let circular: Vec<_> = diags(&doc)
             .into_iter()
             .filter(|(_, d)| d.code == "circular-dependency")
@@ -983,11 +996,40 @@ mod tests {
 
     #[test]
     fn test_no_diagnostics_for_clean_makefile() {
-        let doc = build_document(
-            "Makefile",
-            "all: build\n\techo done\nbuild:\n\techo b\n",
-            None,
-        );
+        let doc = build_single("Makefile", "all: build\n\techo done\nbuild:\n\techo b\n");
         assert!(diags(&doc).is_empty());
+    }
+
+    #[test]
+    fn test_references_across_includes() {
+        use crate::workspace::tests::Fixture;
+
+        let fx = Fixture::new(&[
+            ("Makefile", "X = $(OBJ)\ninclude rules.mk\n"),
+            ("rules.mk", "OBJ = x.o\nexport Y = $(X)\n"),
+        ]);
+        let mut ws = crate::workspace::Workspace::new();
+        ws.set_roots(vec![fx.path("")]);
+        let files = ws.file_set_for_path(&fx.path("Makefile")).unwrap();
+        let doc = build_document("Makefile", &files);
+        let obj = variable_symbol("OBJ");
+        assert_eq!(
+            occ_symbols(&doc)
+                .into_iter()
+                .filter(|(s, _, _)| *s == obj)
+                .map(|(_, range, def)| (range.clone(), def))
+                .collect::<Vec<_>>(),
+            vec![(vec![0, 6, 0, 9], false)]
+        );
+        assert_eq!(diags(&doc), vec![]);
+
+        let files = ws.file_set_for_path(&fx.path("rules.mk")).unwrap();
+        let doc = build_document("rules.mk", &files);
+        assert!(occ_symbols(&doc).contains(&(
+            variable_symbol("X").as_str(),
+            &vec![1, 13, 1, 14],
+            false
+        )));
+        assert_eq!(diags(&doc), vec![]);
     }
 }
