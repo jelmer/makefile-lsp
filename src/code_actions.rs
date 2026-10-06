@@ -193,7 +193,7 @@ fn create_target_action(
     let mut updated = parsed.tree();
     updated.try_add_rule(&name).ok()?;
     // The rule is appended, so only the new text needs to be inserted.
-    let updated_text = updated.syntax().text().to_string();
+    let updated_text = updated.code();
     let edit = match updated_text.strip_prefix(source_text) {
         Some(appended) => {
             let end = offset_to_position(source_text, original_range.end());
@@ -202,7 +202,7 @@ fn create_target_action(
                 new_text: appended.to_string(),
             }
         }
-        None => edit_for_node_change(source_text, original_range, updated.syntax()),
+        None => edit_for_node_change(source_text, original_range, &updated),
     };
 
     let mut changes = std::collections::HashMap::new();
@@ -287,11 +287,11 @@ fn make_include_optional_action(
 fn edit_for_node_change(
     source_text: &str,
     original_range: text_size::TextRange,
-    mutated_node: &rowan::SyntaxNode<makefile_lossless::Lang>,
+    mutated_node: &impl std::fmt::Display,
 ) -> TextEdit {
     TextEdit {
         range: text_range_to_lsp_range(source_text, original_range),
-        new_text: mutated_node.text().to_string(),
+        new_text: mutated_node.to_string(),
     }
 }
 
@@ -487,7 +487,7 @@ fn remove_trailing_whitespace_action(
     if !var_def.trim_trailing_value_whitespace() {
         return None;
     }
-    let edit = edit_for_node_change(source_text, original_range, var_def.syntax());
+    let edit = edit_for_node_change(source_text, original_range, &var_def);
 
     let mut changes = std::collections::HashMap::new();
     changes.insert(uri.clone(), vec![edit]);
@@ -536,7 +536,7 @@ fn convert_to_simply_expanded_action(
 
     let original_range = var_def.syntax().text_range();
     var_def.set_assignment_operator(":=");
-    let edit = edit_for_node_change(source_text, original_range, var_def.syntax());
+    let edit = edit_for_node_change(source_text, original_range, &var_def);
 
     let mut changes = std::collections::HashMap::new();
     changes.insert(uri.clone(), vec![edit]);
@@ -584,7 +584,7 @@ fn add_missing_endif_action(
     if !cond.add_endif().ok()? {
         return None;
     }
-    let edit = edit_for_node_change(source_text, original_range, cond.syntax());
+    let edit = edit_for_node_change(source_text, original_range, &cond);
 
     let mut changes = std::collections::HashMap::new();
     changes.insert(uri.clone(), vec![edit]);
@@ -771,7 +771,7 @@ fn sort_phony_prerequisites_action(
     let original_range = rule.syntax().text_range();
     let sorted_refs: Vec<&str> = sorted.iter().map(|s| s.as_str()).collect();
     rule.set_prerequisites(sorted_refs).ok()?;
-    let edit = edit_for_node_change(source_text, original_range, rule.syntax());
+    let edit = edit_for_node_change(source_text, original_range, &rule);
 
     let mut changes = std::collections::HashMap::new();
     changes.insert(uri.clone(), vec![edit]);
@@ -1129,7 +1129,7 @@ fn attach_to_default_goal_action(
 
     let original_range = goal_rule.syntax().text_range();
     goal_rule.add_prerequisite(&target).ok()?;
-    let edit = edit_for_node_change(source_text, original_range, goal_rule.syntax());
+    let edit = edit_for_node_change(source_text, original_range, &goal_rule);
 
     let mut changes = std::collections::HashMap::new();
     changes.insert(uri.clone(), vec![edit]);
@@ -1224,7 +1224,7 @@ fn inline_prerequisite_action(
     let original_range = rule.syntax().text_range();
     let refs: Vec<&str> = new_prereqs.iter().map(String::as_str).collect();
     rule.set_prerequisites(refs).ok()?;
-    let edit = edit_for_node_change(source_text, original_range, rule.syntax());
+    let edit = edit_for_node_change(source_text, original_range, &rule);
 
     let mut changes = std::collections::HashMap::new();
     changes.insert(uri.clone(), vec![edit]);
