@@ -263,21 +263,20 @@ fn collect_variable_definitions(makefile: &Makefile, text: &str) -> Vec<RawOccur
     let mut out = Vec::new();
 
     for var in makefile.variable_definitions() {
-        let Some(name) = var.name() else {
+        let (Some(name), Some(range)) = (var.name(), var.name_range()) else {
             continue;
         };
-        let var_range = var.syntax().text_range();
-        let var_start: usize = var_range.start().into();
-        let var_text = &text[var_start..usize::from(var_range.end())];
-        if let Some(idx) = find_word(var_text, &name) {
-            out.push(RawOccurrence {
-                symbol: variable_symbol(&name),
-                start: var_start + idx,
-                len: name.len(),
-                is_definition: true,
-                syntax_kind: SyntaxKind::IdentifierMutableGlobal,
-            });
+        // Occurrences are single-line; skip names continued over lines.
+        if text[range].contains('\n') {
+            continue;
         }
+        out.push(RawOccurrence {
+            symbol: variable_symbol(&name),
+            start: range.start().into(),
+            len: range.len().into(),
+            is_definition: true,
+            syntax_kind: SyntaxKind::IdentifierMutableGlobal,
+        });
     }
 
     out
@@ -440,11 +439,6 @@ fn collect_definitions(
         }
     }
     out
-}
-
-/// Find the byte offset of the first whole-word occurrence of `word` in `haystack`.
-fn find_word(haystack: &str, word: &str) -> Option<usize> {
-    find_words(haystack, word).into_iter().next()
 }
 
 /// Find byte offsets of all whole-word occurrences of `word` in `haystack`.
@@ -644,6 +638,19 @@ mod tests {
         assert!(doc.occurrences.iter().any(|o| o.symbol == cc
             && o.range == vec![2, 3, 2, 5]
             && o.symbol_roles & SymbolRole::Definition as i32 == 0));
+    }
+
+    #[test]
+    fn test_variable_named_like_its_modifier() {
+        let text = "override override = 1\n";
+        let doc = build_document("Makefile", text, None);
+        let definitions: Vec<(&str, &Vec<i32>)> = occ_symbols(&doc)
+            .into_iter()
+            .filter(|(_, _, is_definition)| *is_definition)
+            .map(|(symbol, range, _)| (symbol, range))
+            .collect();
+        let symbol = variable_symbol("override");
+        assert_eq!(definitions, vec![(symbol.as_str(), &vec![0, 9, 0, 17])]);
     }
 
     #[test]
