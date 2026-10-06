@@ -11,7 +11,7 @@ pub fn targets_with_ranges(rule: &Rule) -> Vec<(String, TextRange)> {
         targets.len(),
         ranges.len(),
         "target ranges out of sync with targets in {:?}",
-        rule.syntax().text()
+        rule.to_string()
     );
     targets.into_iter().zip(ranges).collect()
 }
@@ -47,7 +47,7 @@ pub fn prerequisites_with_ranges(rule: &Rule) -> Vec<(String, TextRange)> {
         prereqs.len(),
         ranges.len(),
         "prerequisite ranges out of sync with prerequisites in {:?}",
-        rule.syntax().text()
+        rule.to_string()
     );
     prereqs.into_iter().zip(ranges).collect()
 }
