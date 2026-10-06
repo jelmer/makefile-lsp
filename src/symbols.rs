@@ -5,7 +5,6 @@ use rowan::ast::AstNode;
 use tower_lsp_server::ls_types::{DocumentSymbol, SymbolKind};
 
 use crate::position::text_range_to_lsp_range;
-use crate::targets::target_ranges;
 
 /// Generate document symbols for a Makefile.
 ///
@@ -22,8 +21,8 @@ pub fn generate_document_symbols(makefile: &Makefile, source_text: &str) -> Vec<
         }
 
         let range = text_range_to_lsp_range(source_text, rule.syntax().text_range());
-        let selection_range = target_ranges(&rule)
-            .into_iter()
+        let selection_range = rule
+            .target_ranges()
             .reduce(|a, b| a.cover(b))
             .map_or(range, |r| text_range_to_lsp_range(source_text, r));
 
