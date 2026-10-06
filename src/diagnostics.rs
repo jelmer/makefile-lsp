@@ -3,8 +3,8 @@
 use std::collections::{HashMap, HashSet};
 
 use makefile_lossless::{
-    Conditional, Makefile, MakefileItem, Parse, ParseErrorKind, PositionedParseError, Rule,
-    SyntaxKind, VariableReference,
+    Conditional, Makefile, MakefileItem, MakefileVariant, Parse, ParseErrorKind, ParsedReference,
+    PositionedParseError, Rule, SyntaxKind, VariableReference,
 };
 use rowan::ast::AstNode;
 use text_size::{TextRange, TextSize};
@@ -1548,13 +1548,12 @@ fn resolvable_target_names(
             names.insert(target.trim_start_matches("./").to_string());
             continue;
         }
-        let var = target
-            .strip_prefix("$(")
-            .and_then(|t| t.strip_suffix(')'))
-            .or_else(|| target.strip_prefix("${").and_then(|t| t.strip_suffix('}')))
-            .filter(|v| is_valid_var_name(v))?;
+        let var = ParsedReference::parse(&target, MakefileVariant::GNUMake)
+            .ok()
+            .filter(|r| r.modifiers.is_empty() && is_valid_var_name(&r.name))?
+            .name;
         let mut defined = false;
-        for def in makefile.find_variable(var) {
+        for def in makefile.find_variable(&var) {
             let value = def.raw_value()?;
             if value.contains('$') {
                 return None;
@@ -3628,6 +3627,16 @@ mod tests {
     fn test_unresolved_prerequisite_variable_target() {
         let dir = tempfile::tempdir().unwrap();
         let text = "PROG = foo bar\nall: foo bar baz\n$(PROG):\n\ttouch $@\n";
+        assert_eq!(
+            unresolved_prereq_messages(text, dir.path()),
+            vec!["no rule to make prerequisite 'baz', and no such file exists".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_unresolved_prerequisite_single_character_variable_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = "P = foo bar\nall: foo bar baz\n$P:\n\ttouch $@\n";
         assert_eq!(
             unresolved_prereq_messages(text, dir.path()),
             vec!["no rule to make prerequisite 'baz', and no such file exists".to_string()]
