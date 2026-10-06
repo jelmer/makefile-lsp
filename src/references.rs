@@ -34,20 +34,13 @@ pub fn symbol_at(makefile: &Makefile, source_text: &str, byte_offset: usize) -> 
         return Some(Symbol::Target(target));
     }
 
-    // Check if this word is a variable definition name
-    let is_var_def = makefile.variable_definitions().any(|v| {
-        if v.name().as_deref() != Some(word) {
-            return false;
+    makefile.variable_definitions().find_map(|v| {
+        let range = v.name_range()?;
+        if byte_offset < usize::from(range.start()) || byte_offset >= usize::from(range.end()) {
+            return None;
         }
-        let var_range = v.syntax().text_range();
-        let var_start: usize = var_range.start().into();
-        byte_offset >= var_start && byte_offset < var_start + word.len()
-    });
-    if is_var_def {
-        return Some(Symbol::Variable(word.to_string()));
-    }
-
-    None
+        v.name().map(Symbol::Variable)
+    })
 }
 
 /// Find all occurrences of `symbol` in one document.
@@ -227,13 +220,13 @@ fn find_variable_references(
     // Find the declaration
     if include_declaration {
         for var_def in makefile.variable_definitions() {
-            if var_def.name().as_deref() == Some(var_name) {
-                let range = text_range_to_lsp_range(source_text, var_def.syntax().text_range());
-                let start = range.start;
-                let end = Position::new(start.line, start.character + var_name.len() as u32);
+            if var_def.name().as_deref() != Some(var_name) {
+                continue;
+            }
+            if let Some(range) = var_def.name_range() {
                 locations.push(Location {
                     uri: uri.clone(),
-                    range: Range::new(start, end),
+                    range: text_range_to_lsp_range(source_text, range),
                 });
             }
         }
