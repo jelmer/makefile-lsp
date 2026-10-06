@@ -643,7 +643,7 @@ mod tests {
     #[test]
     fn test_variable_named_like_its_modifier() {
         let text = "override override = 1\n";
-        let doc = build_document("Makefile", text, None);
+        let doc = build_single("Makefile", text);
         let definitions: Vec<(&str, &Vec<i32>)> = occ_symbols(&doc)
             .into_iter()
             .filter(|(_, _, is_definition)| *is_definition)
