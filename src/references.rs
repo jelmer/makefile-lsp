@@ -1,10 +1,10 @@
 //! Find references for Makefiles.
 
 use makefile_lossless::{
-    Lang, Makefile, Recipe, SyntaxKind, TextRange, VariableDefinition, VariableReference,
+    Makefile, Recipe, RecipeVariableReference, SyntaxKind, TextRange, VariableDefinition,
+    VariableReference,
 };
 use rowan::ast::AstNode;
-use rowan::WalkEvent;
 use text_size::TextSize;
 use tower_lsp_server::ls_types::{Location, Position, Uri};
 
@@ -188,28 +188,19 @@ fn find_variable_references(
 /// recipes and define bodies, with the range of the variable name. Function
 /// calls such as `$(shell ...)` are left out, but references in their
 /// arguments are included.
-fn variable_references(makefile: &Makefile) -> Vec<(String, TextRange)> {
+pub(crate) fn variable_references(makefile: &Makefile) -> Vec<(String, TextRange)> {
+    let named = |refs: Vec<RecipeVariableReference>| {
+        refs.into_iter()
+            .map(|r| (r.name().to_string(), r.text_range()))
+    };
     let mut refs = Vec::new();
-    let mut preorder = makefile.syntax().preorder();
-    while let Some(event) = preorder.next() {
-        let WalkEvent::Enter(node) = event else {
-            continue;
-        };
-        if is_define_body(&node) {
-            // Define bodies are not parsed into nested references.
-            scan_variable_references(
-                &node.text().to_string(),
-                node.text_range().start(),
-                &mut refs,
-            );
-            preorder.skip_subtree();
-        } else if let Some(recipe) = Recipe::cast(node.clone()) {
-            refs.extend(
-                recipe
-                    .variable_references()
-                    .into_iter()
-                    .map(|r| (r.name().to_string(), r.text_range())),
-            );
+    // Recipe lines that are not part of a rule, such as those before the
+    // first rule, are visited too.
+    for node in makefile.syntax().descendants() {
+        if let Some(recipe) = Recipe::cast(node.clone()) {
+            refs.extend(named(recipe.variable_references()));
+        } else if let Some(definition) = VariableDefinition::cast(node.clone()) {
+            refs.extend(named(definition.define_variable_references()));
         } else if let Some(reference) = VariableReference::cast(node) {
             if !reference.is_function_call() {
                 refs.extend(reference_name(&reference));
@@ -217,14 +208,6 @@ fn variable_references(makefile: &Makefile) -> Vec<(String, TextRange)> {
         }
     }
     refs
-}
-
-fn is_define_body(node: &rowan::SyntaxNode<Lang>) -> bool {
-    node.kind() == SyntaxKind::EXPR
-        && node
-            .parent()
-            .and_then(VariableDefinition::cast)
-            .is_some_and(|v| v.is_define())
 }
 
 /// The name of `reference` and its range.
@@ -252,43 +235,6 @@ fn reference_name(reference: &VariableReference) -> Option<(String, TextRange)> 
         .map(|c| c.text_range())
         .reduce(|a, b| a.cover(b))?;
     Some((name, range))
-}
-
-/// Find `$(VAR)` and `${VAR}` references in `text`, which starts at `base`
-/// in the document. References whose name contains another reference, and
-/// function calls, are left out.
-fn scan_variable_references(text: &str, base: TextSize, out: &mut Vec<(String, TextRange)>) {
-    let bytes = text.as_bytes();
-    let mut i = 0;
-    while i + 1 < bytes.len() {
-        if bytes[i] != b'$' {
-            i += 1;
-            continue;
-        }
-        let close = match bytes[i + 1] {
-            b'(' => b')',
-            b'{' => b'}',
-            // `$$` is an escaped dollar sign; skip it along with `$V`.
-            _ => {
-                i += 2;
-                continue;
-            }
-        };
-        let start = i + 2;
-        let end = bytes[start..]
-            .iter()
-            .position(|&b| b == close || b":\t ,\n$".contains(&b))
-            .map(|n| start + n);
-        if let Some(end) = end.filter(|&e| e > start && (bytes[e] == close || bytes[e] == b':')) {
-            let range = TextRange::new(
-                base + TextSize::from(start as u32),
-                base + TextSize::from(end as u32),
-            );
-            out.push((text[start..end].to_string(), range));
-        }
-        // Continue inside the reference to find nested ones.
-        i = start;
-    }
 }
 
 #[cfg(test)]
@@ -492,6 +438,60 @@ mod tests {
                 range(2, 37, 40),
                 range(4, 8, 11),
             ]
+        );
+    }
+
+    #[test]
+    fn test_find_variable_references_in_orphan_recipes() {
+        // Recipe lines outside any rule are a make error, but references in
+        // them are still found.
+        let text = "FOO = 1\n\techo $(FOO)\nifdef X\n\techo $(FOO)\nendif\n";
+        assert_eq!(
+            foo_refs(text),
+            vec![range(0, 0, 3), range(1, 8, 11), range(3, 8, 11)]
+        );
+    }
+
+    #[test]
+    fn test_find_variable_references_in_vpath_and_define_names() {
+        let text = "FOO = 1\nvpath %.c $(FOO)\ndefine $(FOO)_F\nendef\n";
+        assert_eq!(
+            foo_refs(text),
+            vec![range(0, 0, 3), range(1, 12, 15), range(2, 9, 12)]
+        );
+    }
+
+    #[test]
+    fn test_symbol_at_in_define_body() {
+        let text = "define F\n$(1) $(A.${B})\nendef\n";
+        let makefile = Makefile::parse(text).tree();
+        // `$(1)` is a call parameter, not a variable.
+        assert_eq!(symbol_at(&makefile, 11), None);
+        assert_eq!(
+            symbol_at(&makefile, 16),
+            Some(Symbol::Variable("A.${B}".to_string()))
+        );
+        assert_eq!(
+            symbol_at(&makefile, 20),
+            Some(Symbol::Variable("B".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_find_variable_references_nested_in_define_body() {
+        let text = "B = 1\ndefine F\n$(A.${B}) $(B)\nendef\nX = $(A.${B})\n";
+        assert_eq!(
+            ref_ranges(text, Position::new(0, 0)),
+            vec![
+                range(0, 0, 1),
+                range(2, 6, 7),
+                range(2, 12, 13),
+                range(4, 10, 11)
+            ]
+        );
+        assert_eq!(
+            ref_ranges(text, Position::new(2, 2)),
+            vec![range(2, 2, 8), range(4, 6, 12)]
         );
     }
 
