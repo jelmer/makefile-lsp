@@ -118,13 +118,33 @@ pub fn space_indent_range(source_text: &str, error: &PositionedParseError) -> Op
     if error.kind() != ParseErrorKind::MissingSeparator {
         return None;
     }
-    let line = line_range(source_text, error.range.start());
+    // The error is reported at the end of the line, which may be a
+    // continuation line.
+    let line = line_range(
+        source_text,
+        logical_line_start(source_text, error.range.start()),
+    );
     let line_text = &source_text[line];
     let spaces = line_text.len() - line_text.trim_start_matches(' ').len();
     if spaces == 0 {
         return None;
     }
     Some(TextRange::at(line.start(), TextSize::from(spaces as u32)))
+}
+
+/// The start of the logical line containing `offset`, i.e. the first of the
+/// physical lines joined to it by backslash continuations.
+fn logical_line_start(source_text: &str, offset: TextSize) -> TextSize {
+    let mut start = line_range(source_text, offset).start();
+    while let Some(prev) = source_text[..usize::from(start)].strip_suffix('\n') {
+        let prev = prev.strip_suffix('\r').unwrap_or(prev);
+        let backslashes = prev.len() - prev.trim_end_matches('\\').len();
+        if backslashes % 2 == 0 {
+            break;
+        }
+        start = line_range(source_text, TextSize::from(prev.len() as u32)).start();
+    }
+    start
 }
 
 /// The range of the line containing `offset`, excluding its line ending.
@@ -2260,6 +2280,21 @@ mod tests {
     #[test]
     fn test_spaces_instead_of_tab_range() {
         let diags = get_diags("all:\n    echo done\n");
+        assert_eq!(
+            diags
+                .iter()
+                .filter(
+                    |d| d.code == Some(NumberOrString::String("spaces-instead-of-tab".to_string()))
+                )
+                .map(|d| d.range)
+                .collect::<Vec<_>>(),
+            vec![Range::new(Position::new(1, 0), Position::new(1, 4))]
+        );
+    }
+
+    #[test]
+    fn test_spaces_instead_of_tab_range_continued_line() {
+        let diags = get_diags("all:\n    echo a \\\n      b \\\n  c\n");
         assert_eq!(
             diags
                 .iter()
