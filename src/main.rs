@@ -708,15 +708,9 @@ impl LanguageServer for Backend {
             return Ok(None);
         };
 
-        let prev_line_idx = (position.line - 1) as usize;
-        let prev_line = doc.text().lines().nth(prev_line_idx).unwrap_or("");
-
-        // If the previous line is a rule header (has : but not =, and doesn't start with tab),
-        // insert a tab at the cursor position
-        let is_rule_header =
-            !prev_line.starts_with('\t') && prev_line.contains(':') && !prev_line.contains('=');
-
-        if is_rule_header {
+        // After a rule header, start a recipe line
+        let prev_line = (position.line - 1) as usize;
+        if formatting::is_rule_header(&doc.makefile(), prev_line) {
             Ok(Some(vec![TextEdit {
                 range: Range::new(position, position),
                 new_text: "\t".to_string(),
