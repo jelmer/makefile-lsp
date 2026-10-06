@@ -408,6 +408,9 @@ pub struct FileSet {
     editable: Vec<bool>,
     /// The include directives of the current document.
     includes: Vec<ResolvedInclude>,
+    /// Whether every include directive in the documents was resolved to a
+    /// file that could be loaded.
+    complete: bool,
 }
 
 impl FileSet {
@@ -418,6 +421,7 @@ impl FileSet {
             docs: vec![Arc::new(doc)],
             editable: vec![true],
             includes: Vec::new(),
+            complete: false,
         }
     }
 
@@ -450,6 +454,12 @@ impl FileSet {
         &self.includes
     }
 
+    /// Whether the set holds every makefile that its documents include, so
+    /// that nothing is defined in files it doesn't know about.
+    pub fn is_complete(&self) -> bool {
+        self.complete
+    }
+
     /// The include file name at `offset` in the current document.
     pub fn include_at(&self, offset: TextSize) -> Option<&ResolvedInclude> {
         self.includes
@@ -473,6 +483,18 @@ struct Walk {
     vars: LiteralVariables,
     includes: HashMap<Uri, Vec<ResolvedInclude>>,
     truncated: bool,
+}
+
+impl Walk {
+    /// Whether every include directive seen was followed.
+    fn is_complete(&self) -> bool {
+        !self.truncated
+            && self
+                .includes
+                .values()
+                .flatten()
+                .all(|i| matches!(i.resolution, Resolution::Found(_)))
+    }
 }
 
 /// The open documents plus everything known about the makefiles they include
@@ -533,6 +555,7 @@ impl Workspace {
             walk.seen.insert(path.to_path_buf());
         }
         self.visit(current.clone(), current.dir(), &mut walk);
+        let mut complete = walk.is_complete();
         let mut docs = walk.docs;
         let mut includes = walk.includes.remove(uri).unwrap_or_default();
 
@@ -547,6 +570,7 @@ impl Workspace {
                 if !root_walk.docs.iter().any(|d| d.path() == Some(path)) {
                     continue;
                 }
+                complete &= root_walk.is_complete();
                 for doc in root_walk.docs {
                     if !docs.iter().any(|d| d.uri() == doc.uri()) {
                         docs.push(doc);
@@ -569,6 +593,7 @@ impl Workspace {
             docs,
             editable,
             includes,
+            complete,
         })
     }
 

@@ -95,6 +95,7 @@ pub fn get_diagnostics(
         parsed,
         &ExternalSymbols::default(),
         &includes,
+        OtherMakefiles::Unknown,
         base_dir,
     )
 }
@@ -102,9 +103,10 @@ pub fn get_diagnostics(
 /// Collect diagnostics for the current document of a file set, taking the
 /// definitions and uses in the other makefiles into account.
 pub fn get_file_set_diagnostics(files: &FileSet) -> Vec<Diagnostic> {
+    let others: Vec<Makefile> = files.others().map(|doc| doc.makefile()).collect();
     let mut external = ExternalSymbols::default();
-    for doc in files.others() {
-        external.add(&doc.makefile());
+    for makefile in &others {
+        external.add(makefile);
     }
     let current = files.current();
     collect_diagnostics(
@@ -112,8 +114,24 @@ pub fn get_file_set_diagnostics(files: &FileSet) -> Vec<Diagnostic> {
         current.parsed(),
         &external,
         files.includes(),
+        if files.is_complete() {
+            OtherMakefiles::Complete(&others)
+        } else {
+            OtherMakefiles::Incomplete
+        },
         current.dir(),
     )
+}
+
+/// The other makefiles of a file set, for checks that need to know all rules.
+#[derive(Clone, Copy)]
+enum OtherMakefiles<'a> {
+    /// Includes weren't followed.
+    Unknown,
+    /// Every include in the file set was followed.
+    Complete(&'a [Makefile]),
+    /// Some include in the file set couldn't be followed.
+    Incomplete,
 }
 
 fn collect_diagnostics(
@@ -121,6 +139,7 @@ fn collect_diagnostics(
     parsed: &Parse<makefile_lossless::Makefile>,
     external: &ExternalSymbols,
     includes: &[ResolvedInclude],
+    others: OtherMakefiles,
     base_dir: Option<&std::path::Path>,
 ) -> Vec<Diagnostic> {
     let mut diagnostics: Vec<Diagnostic> = parsed
@@ -166,6 +185,12 @@ fn collect_diagnostics(
     diagnostics.extend(check_include_files(source_text, includes));
     if let Some(dir) = base_dir {
         diagnostics.extend(check_missing_phony(source_text, &makefile, external, dir));
+        diagnostics.extend(check_unresolved_prerequisites(
+            source_text,
+            &makefile,
+            others,
+            dir,
+        ));
     }
 
     diagnostics
@@ -1481,6 +1506,197 @@ fn check_missing_phony(
         }
     }
     diagnostics
+}
+
+/// Check for prerequisites that are neither a target nor an existing file.
+///
+/// make fails with "No rule to make target" for these. Since the makefile
+/// is never evaluated, only clear cases are flagged:
+///
+/// - Prerequisites containing `$`, `%`, glob characters, backslashes or
+///   archive members are skipped, as are prerequisites of special targets.
+/// - A prerequisite is resolved if it is an explicit target, matches a
+///   pattern rule target or is declared `.PHONY` (in this makefile or in
+///   `others`), or exists relative to the makefile's directory.
+/// - GNU make's built-in rules can make a file from another one with the
+///   same stem (`foo.o` or `foo` from `foo.c`), so a prerequisite is also
+///   resolved if any file with its stem and some extension exists.
+/// - `-lNAME` prerequisites are skipped, as make looks them up as
+///   libraries, and so are `~` paths.
+/// - The check is skipped entirely when any of the makefiles could get
+///   rules or files from elsewhere: `include` (unless `others` is complete),
+///   `vpath`/`VPATH`, `$(eval)` or a line that expands to makefile text, a
+///   `.DEFAULT` rule, or a target name that isn't a plain variable with a
+///   literal value.
+///
+/// TODO: a fragment that is included from, or run with `make -f` from,
+/// another directory resolves its paths relative to that directory, and a
+/// fragment opened without its includer may rely on targets defined there.
+/// Resolve paths relative to the top-level makefile and only check fragments
+/// whose includer is known.
+fn check_unresolved_prerequisites(
+    source_text: &str,
+    makefile: &Makefile,
+    others: OtherMakefiles,
+    base_dir: &std::path::Path,
+) -> Vec<Diagnostic> {
+    let (includes_followed, others) = match others {
+        OtherMakefiles::Unknown => (false, &[][..]),
+        OtherMakefiles::Complete(others) => (true, others),
+        OtherMakefiles::Incomplete => return Vec::new(),
+    };
+    let Some(mut targets) = resolvable_target_names(makefile, includes_followed) else {
+        return Vec::new();
+    };
+    for other in others {
+        let Some(names) = resolvable_target_names(other, true) else {
+            return Vec::new();
+        };
+        targets.extend(names);
+    }
+    let makefiles: Vec<&Makefile> = std::iter::once(makefile).chain(others).collect();
+
+    let mut diagnostics = Vec::new();
+    for rule in makefile.rules() {
+        // Special targets and suffix rules; `.stamp/foo` style paths are fine.
+        if rule
+            .targets()
+            .any(|t| t.starts_with('.') && !t.contains('/'))
+        {
+            continue;
+        }
+        let Some(prereqs) = rule
+            .syntax()
+            .children()
+            .find(|c| c.kind() == SyntaxKind::PREREQUISITES)
+        else {
+            continue;
+        };
+        for prereq in prereqs
+            .children()
+            .filter(|c| c.kind() == SyntaxKind::PREREQUISITE)
+        {
+            let name = prereq.text().to_string();
+            let name = name.trim().trim_start_matches("./");
+            // `-lNAME` is searched for in the linker's library path, and
+            // `~` is expanded to a home directory.
+            if name.is_empty()
+                || name.starts_with("-l")
+                || name.starts_with('~')
+                || name.contains(['$', '%', '*', '?', '[', '\\', '('])
+                || targets.contains(name)
+                || makefiles
+                    .iter()
+                    .any(|m| m.find_rule_by_target_pattern(name).is_some() || m.is_phony(name))
+                || base_dir.join(name).exists()
+                || has_file_with_same_stem(&base_dir.join(name))
+            {
+                continue;
+            }
+            diagnostics.push(make_diagnostic(
+                text_range_to_lsp_range(source_text, prereq.text_range()),
+                DiagnosticSeverity::WARNING,
+                "unresolved-prerequisite",
+                format!(
+                    "no rule to make prerequisite '{}', and no such file exists",
+                    name
+                ),
+            ));
+        }
+    }
+    diagnostics
+}
+
+/// The names of all explicit targets in `makefile`, or `None` if rules or
+/// files may come from somewhere we can't see. Include directives are only
+/// taken to hide rules if `includes_followed` is false.
+///
+/// Targets that are a single reference to a variable whose values are
+/// literal, like `$(PROG)`, are expanded.
+fn resolvable_target_names(
+    makefile: &Makefile,
+    includes_followed: bool,
+) -> Option<HashSet<String>> {
+    let defers_elsewhere = makefile.syntax().descendants().any(|n| match n.kind() {
+        SyntaxKind::INCLUDE => !includes_followed,
+        SyntaxKind::VPATH => true,
+        // A line of only references is parsed as makefile text once expanded.
+        SyntaxKind::EXPRESSION_STATEMENT => !n
+            .descendants()
+            .filter_map(VariableReference::cast)
+            .next()
+            .and_then(|r| r.name())
+            .is_some_and(|name| matches!(name.as_str(), "info" | "warning" | "error")),
+        _ => VariableReference::cast(n).is_some_and(|r| r.name().as_deref() == Some("eval")),
+    });
+    if defers_elsewhere
+        || makefile.find_variable("VPATH").next().is_some()
+        || makefile.rules_by_target(".DEFAULT").next().is_some()
+    {
+        return None;
+    }
+
+    let mut names = HashSet::new();
+    for target in makefile
+        .rules()
+        .flat_map(|r| r.targets().collect::<Vec<_>>())
+    {
+        if !target.contains('$') {
+            names.insert(target.trim_start_matches("./").to_string());
+            continue;
+        }
+        let var = target
+            .strip_prefix("$(")
+            .and_then(|t| t.strip_suffix(')'))
+            .or_else(|| target.strip_prefix("${").and_then(|t| t.strip_suffix('}')))
+            .filter(|v| is_valid_var_name(v))?;
+        let mut defined = false;
+        for def in makefile.find_variable(var) {
+            let value = def.raw_value()?;
+            if value.contains('$') {
+                return None;
+            }
+            names.extend(
+                value
+                    .split_whitespace()
+                    .map(|v| v.trim_start_matches("./").to_string()),
+            );
+            defined = true;
+        }
+        if !defined {
+            return None;
+        }
+    }
+    Some(names)
+}
+
+/// Does a file with the same stem as `path` but some extension exist?
+fn has_file_with_same_stem(path: &std::path::Path) -> bool {
+    let (Some(dir), Some(stem)) = (path.parent(), path.file_stem()) else {
+        return false;
+    };
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return false,
+        Err(e) => {
+            // Err on the side of not flagging anything.
+            tracing::warn!("unable to list {}: {}", dir.display(), e);
+            return true;
+        }
+    };
+    for entry in entries {
+        let entry_path = match entry {
+            Ok(entry) => entry.path(),
+            Err(e) => {
+                tracing::warn!("unable to list {}: {}", dir.display(), e);
+                return true;
+            }
+        };
+        if entry_path.file_stem() == Some(stem) && entry_path.extension().is_some() {
+            return true;
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -3217,6 +3433,280 @@ mod tests {
                 "included file '{}' could not be read: stream did not contain valid UTF-8",
                 fx.path("bad.mk").display()
             )]
+        );
+    }
+
+    fn unresolved_prereq_messages(text: &str, dir: &std::path::Path) -> Vec<String> {
+        diags_with_dir(text, dir)
+            .into_iter()
+            .filter(|d| {
+                d.code
+                    == Some(NumberOrString::String(
+                        "unresolved-prerequisite".to_string(),
+                    ))
+            })
+            .map(|d| d.message)
+            .collect()
+    }
+
+    #[test]
+    fn test_unresolved_prerequisite() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = "prog: main.o helper\n\tcc -o $@ $^\n";
+        let diags: Vec<_> = diags_with_dir(text, dir.path())
+            .into_iter()
+            .filter(|d| {
+                d.code
+                    == Some(NumberOrString::String(
+                        "unresolved-prerequisite".to_string(),
+                    ))
+            })
+            .collect();
+        assert_eq!(diags.len(), 2);
+        assert_eq!(
+            diags[0].message,
+            "no rule to make prerequisite 'main.o', and no such file exists"
+        );
+        assert_eq!(diags[0].severity, Some(DiagnosticSeverity::WARNING));
+        assert_eq!(
+            diags[0].range,
+            Range::new(Position::new(0, 6), Position::new(0, 12))
+        );
+        assert_eq!(
+            diags[1].range,
+            Range::new(Position::new(0, 13), Position::new(0, 19))
+        );
+    }
+
+    #[test]
+    fn test_unresolved_order_only_prerequisite() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            unresolved_prereq_messages("out: | builddir\n\ttouch out\n", dir.path()),
+            vec!["no rule to make prerequisite 'builddir', and no such file exists".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_unresolved_prerequisite_resolved_by_target_or_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("input.txt"), "").unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        std::fs::write(dir.path().join("sub/data"), "").unwrap();
+        let text = concat!(
+            ".PHONY: check\n",
+            "all: gen input.txt ./input.txt sub/data sub check | sub\n",
+            "gen:\n\ttouch gen\n",
+            "check:\n",
+        );
+        assert_eq!(
+            unresolved_prereq_messages(text, dir.path()),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn test_unresolved_prerequisite_resolved_by_pattern_rule() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = "prog: main.o\n\tcc -o $@ $^\n%.o: %.c\n\tcc -c $<\n";
+        assert_eq!(
+            unresolved_prereq_messages(text, dir.path()),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn test_unresolved_prerequisite_resolved_by_builtin_rule() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.c"), "").unwrap();
+        std::fs::write(dir.path().join("tool.c"), "").unwrap();
+        let text = "prog: main.o tool\n\tcc -o $@ main.o\n";
+        assert_eq!(
+            unresolved_prereq_messages(text, dir.path()),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn test_unresolved_prerequisite_variable_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = "PROG = foo bar\nall: foo bar baz\n$(PROG):\n\ttouch $@\n";
+        assert_eq!(
+            unresolved_prereq_messages(text, dir.path()),
+            vec!["no rule to make prerequisite 'baz', and no such file exists".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_unresolved_prerequisite_skipped_for_unresolvable_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = "PROG = $(NAME)$(EXT)\nall: foo\n$(PROG):\n\ttouch $@\n";
+        assert_eq!(
+            unresolved_prereq_messages(text, dir.path()),
+            Vec::<String>::new()
+        );
+        let text = "all: foo\n$(UNDEFINED):\n\ttouch $@\n";
+        assert_eq!(
+            unresolved_prereq_messages(text, dir.path()),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn test_unresolved_prerequisite_skipped_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = concat!(
+            "all: $(OBJS) *.c foo?.c [ab].c -lm ~/x lib.a(x.o) a\\#b\n",
+            "\ttouch all\n",
+            "%.o: %.h\n",
+            ".SUFFIXES: .x\n",
+            ".PRECIOUS: missing\n",
+            ".c.o:\n\tcc -c $<\n",
+        );
+        assert_eq!(
+            unresolved_prereq_messages(text, dir.path()),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn test_unresolved_prerequisite_dot_directory_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = ".stamp/done: missing\n\ttouch $@\n";
+        assert_eq!(
+            unresolved_prereq_messages(text, dir.path()),
+            vec!["no rule to make prerequisite 'missing', and no such file exists".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_unresolved_prerequisite_skipped_when_rules_may_come_from_elsewhere() {
+        let dir = tempfile::tempdir().unwrap();
+        for text in [
+            "-include deps.mk\nall: missing\n",
+            "ifdef X\ninclude deps.mk\nendif\nall: missing\n",
+            "vpath %.c src\nall: missing.c\n",
+            "VPATH = src\nall: missing.c\n",
+            "$(eval $(call rules))\nall: missing\n",
+            "$(foreach t,a b,$(call rule,$(t)))\nall: missing\n",
+            ".DEFAULT:\n\t@echo $@\nall: missing\n",
+            "%:\n\ttouch $@\nall: missing\n",
+        ] {
+            assert_eq!(
+                unresolved_prereq_messages(text, dir.path()),
+                Vec::<String>::new(),
+                "{}",
+                text
+            );
+        }
+    }
+
+    #[test]
+    fn test_unresolved_prerequisite_info_does_not_skip() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            unresolved_prereq_messages("$(info hello)\nall: missing\n", dir.path()).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_unresolved_prerequisite_needs_base_dir() {
+        let codes = diag_codes("all: missing\n");
+        assert!(!codes.contains(&"unresolved-prerequisite".to_string()));
+    }
+
+    fn file_set_unresolved_prereqs(files: &[(&str, &str)], name: &str) -> Vec<String> {
+        let fx = crate::workspace::tests::Fixture::new(files);
+        let (mut ws, makefile) = fx.open("Makefile");
+        ws.file_set(&makefile).unwrap();
+        let uri = if name == "Makefile" {
+            makefile
+        } else {
+            fx.open_in(&mut ws, name)
+        };
+        get_file_set_diagnostics(&ws.file_set(&uri).unwrap())
+            .into_iter()
+            .filter(|d| {
+                d.code
+                    == Some(NumberOrString::String(
+                        "unresolved-prerequisite".to_string(),
+                    ))
+            })
+            .map(|d| d.message)
+            .collect()
+    }
+
+    #[test]
+    fn test_unresolved_prerequisite_across_includes() {
+        let files = [
+            (
+                "Makefile",
+                "include rules.mk\nall: build lint missing\n\techo\n",
+            ),
+            (
+                "rules.mk",
+                ".PHONY: lint\nbuild: gen\n\techo\nlint:\ngen: all\n\techo\n",
+            ),
+        ];
+        assert_eq!(
+            file_set_unresolved_prereqs(&files, "Makefile"),
+            vec!["no rule to make prerequisite 'missing', and no such file exists".to_string()]
+        );
+        // `all` is defined by the including makefile.
+        assert_eq!(
+            file_set_unresolved_prereqs(&files, "rules.mk"),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn test_unresolved_prerequisite_pattern_rule_in_included_file() {
+        let files = [
+            (
+                "Makefile",
+                "include rules.mk\nprog: main.o\n\tcc -o $@ $^\n",
+            ),
+            ("rules.mk", "%.o: %.c\n\tcc -c $<\n"),
+        ];
+        assert_eq!(
+            file_set_unresolved_prereqs(&files, "Makefile"),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn test_unresolved_prerequisite_skipped_with_unfollowed_include() {
+        for files in [
+            &[("Makefile", "-include deps.mk\nall: missing\n")][..],
+            &[
+                ("Makefile", "include rules.mk\nall: missing\n"),
+                ("rules.mk", "-include deps.mk\n"),
+            ][..],
+            &[
+                ("Makefile", "include rules.mk\nall: missing\n"),
+                ("rules.mk", "vpath %.c src\n"),
+            ][..],
+            &[
+                ("Makefile", "include $(shell echo rules.mk)\nall: missing\n"),
+                ("rules.mk", ""),
+            ][..],
+        ] {
+            assert_eq!(
+                file_set_unresolved_prereqs(files, "Makefile"),
+                Vec::<String>::new(),
+                "{:?}",
+                files
+            );
+        }
+        // An includer that includes a file that wasn't found.
+        let files = [
+            ("Makefile", "include rules.mk\n-include deps.mk\n"),
+            ("rules.mk", "all: missing\n"),
+        ];
+        assert_eq!(
+            file_set_unresolved_prereqs(&files, "rules.mk"),
+            Vec::<String>::new()
         );
     }
 }

@@ -63,6 +63,7 @@ Each diagnostic carries a code, so it can be identified in editors:
 | `circular-dependency` | warning | cycle between targets |
 | `duplicate-prerequisite` | warning | prerequisite listed more than once in the same rule |
 | `redundant-prerequisite` | hint | prerequisite already reached through another prerequisite |
+| `unresolved-prerequisite` | warning | prerequisite that is not a target, not phony and not an existing file (skipped when rules or files may come from elsewhere, e.g. with an `include` that can't be followed or `vpath`) |
 | `undefined-phony-target` | warning | `.PHONY` entry without a matching rule |
 | `unused-phony-target` | warning | phony target with no recipe that nothing depends on |
 | `unreferenced-phony-target` | hint | phony target that nothing depends on, other than conventional ones like `all` or `install` |
