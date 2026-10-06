@@ -108,6 +108,37 @@ fn origin_note(files: &FileSet, doc: &Document) -> String {
     format!("\n\nDefined in `{}`", name)
 }
 
+/// Return the directive named `word` (found at `byte_offset`) if it is used as a
+/// directive: at the start of a non-recipe line, optionally after modifiers
+/// such as `override` or `else`, and not itself a target or variable name.
+fn directive_at(
+    source_text: &str,
+    byte_offset: usize,
+    word: &str,
+) -> Option<&'static builtins::Directive> {
+    let directive = builtins::find_directive(word)?;
+    let is_word_char = |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-');
+    let word_start = source_text[..byte_offset]
+        .rfind(|c: char| !is_word_char(c))
+        .map_or(0, |i| i + 1);
+    let word_end = word_start + word.len();
+    let line_start = source_text[..word_start].rfind('\n').map_or(0, |i| i + 1);
+    let line_end = source_text[word_end..]
+        .find('\n')
+        .map_or(source_text.len(), |i| word_end + i);
+
+    if source_text[line_start..].starts_with('\t') {
+        return None;
+    }
+    let modifiers_only = source_text[line_start..word_start]
+        .split_whitespace()
+        .all(|w| matches!(w, "else" | "override" | "export" | "private"));
+    let after = source_text[word_end..line_end].trim_start();
+    let is_definition =
+        after.starts_with([':', '=']) || ["+=", "?=", "!="].iter().any(|op| after.starts_with(op));
+    (modifiers_only && !is_definition).then_some(directive)
+}
+
 /// Get hover information for the symbol at the given position.
 ///
 /// Variables and targets defined in included or including makefiles are
@@ -164,6 +195,13 @@ pub fn get_hover(files: &FileSet, position: Position) -> Option<Hover> {
 
     // Word in prerequisites area or at start of line (target name)
     if let Some(word) = word_at_offset(source_text, byte_offset) {
+        if let Some(d) = directive_at(source_text, byte_offset, word) {
+            return Some(markdown_hover(format!(
+                "```makefile\n{}\n```\n\n{}",
+                d.syntax, d.doc
+            )));
+        }
+
         // Check special targets
         if let Some(doc) = builtins::find_special_target(word) {
             return Some(markdown_hover(format!("**`{}`**: {}", word, doc)));
@@ -366,6 +404,71 @@ mod tests {
         let content = result.unwrap();
         assert!(content.contains("CC"));
         assert!(content.contains("C compiler"));
+    }
+
+    #[test]
+    fn test_hover_directive() {
+        let text = "ifeq ($(CC),gcc)\nFOO = 1\nendif\n";
+        assert_eq!(
+            hover_text(text, Position::new(0, 1)).as_deref(),
+            Some(
+                "```makefile\nifeq (ARG1,ARG2)\n```\n\n\
+                 Process the following lines if *ARG1* and *ARG2* are equal after expansion."
+            )
+        );
+        assert_eq!(
+            hover_text(text, Position::new(2, 2)).as_deref(),
+            Some("```makefile\nendif\n```\n\nEnd a conditional.")
+        );
+    }
+
+    fn directive_hover(name: &str) -> Option<String> {
+        let d = builtins::find_directive(name).unwrap();
+        Some(format!("```makefile\n{}\n```\n\n{}", d.syntax, d.doc))
+    }
+
+    #[test]
+    fn test_hover_include_directives() {
+        let text = "include a.mk\n-include b.mk\nvpath %.c src\n";
+        assert_eq!(
+            hover_text(text, Position::new(0, 3)),
+            directive_hover("include")
+        );
+        assert_eq!(
+            hover_text(text, Position::new(1, 0)),
+            directive_hover("-include")
+        );
+        assert_eq!(
+            hover_text(text, Position::new(2, 2)),
+            directive_hover("vpath")
+        );
+    }
+
+    #[test]
+    fn test_hover_directive_after_modifier() {
+        let text = "ifdef A\nelse ifndef B\nendif\noverride define X\nendef\n";
+        assert_eq!(
+            hover_text(text, Position::new(1, 6)),
+            directive_hover("ifndef")
+        );
+        assert_eq!(
+            hover_text(text, Position::new(3, 10)),
+            directive_hover("define")
+        );
+    }
+
+    #[test]
+    fn test_hover_directive_name_used_as_target_or_variable() {
+        assert_eq!(
+            hover_text("include: foo\n", Position::new(0, 1)),
+            Some("**`include`**\n\nPrerequisites: `foo`".to_string())
+        );
+        assert_eq!(hover_text("export = 1\n", Position::new(0, 1)), None);
+        assert_eq!(
+            hover_text("all:\n\techo include\n", Position::new(1, 7)),
+            None
+        );
+        assert_eq!(hover_text("FOO = include\n", Position::new(0, 8)), None);
     }
 
     #[test]
