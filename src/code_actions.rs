@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 
 use makefile_lossless::{
-    Conditional, Makefile, Parse, ParseErrorKind, SyntaxKind, VariableReference,
+    Conditional, Include, Makefile, Parse, ParseErrorKind, SyntaxKind, VariableReference,
 };
 use rowan::ast::AstNode;
 use tower_lsp_server::ls_types::{
@@ -110,8 +110,57 @@ pub fn get_code_actions(
         byte_offset,
         uri,
     ));
+    actions.extend(make_include_optional_action(
+        &makefile,
+        source_text,
+        byte_offset,
+        uri,
+    ));
 
     actions
+}
+
+/// Offer "Change include to -include" on an `include` directive, so that
+/// make ignores included files that do not exist (see the
+/// missing-include-file diagnostic).
+fn make_include_optional_action(
+    makefile: &Makefile,
+    source_text: &str,
+    byte_offset: usize,
+    uri: &Uri,
+) -> Option<CodeAction> {
+    let offset = text_size::TextSize::from(byte_offset as u32);
+    let include = makefile
+        .syntax()
+        .descendants()
+        .filter(|n| n.text_range().contains(offset))
+        .find_map(Include::cast)?;
+    if include.is_optional() {
+        return None;
+    }
+    // BSD (`.include`) and nmake (`!include`) keywords have no `-include`
+    // spelling.
+    let keyword = include
+        .syntax()
+        .first_token()
+        .filter(|t| t.text() == "include")?;
+
+    let edit = TextEdit {
+        range: text_range_to_lsp_range(source_text, keyword.text_range()),
+        new_text: "-include".to_string(),
+    };
+    let mut changes = std::collections::HashMap::new();
+    changes.insert(uri.clone(), vec![edit]);
+
+    Some(CodeAction {
+        title: "Change include to -include".to_string(),
+        kind: Some(CodeActionKind::QUICKFIX),
+        edit: Some(WorkspaceEdit {
+            changes: Some(changes),
+            ..Default::default()
+        }),
+        ..Default::default()
+    })
 }
 
 /// Build a TextEdit that replaces `original_range` (offsets in `source_text`)
@@ -1784,5 +1833,40 @@ mod tests {
         let text = "all: only\n\t@:\nonly:\n\t@:\n";
         let actions = parse_and_actions(text, Position::new(0, 5));
         assert!(find_inline_prereq_action(&actions).is_none());
+    }
+
+    fn include_optional_action(text: &str, pos: Position) -> Option<String> {
+        parse_and_actions(text, pos)
+            .iter()
+            .find(|a| a.title == "Change include to -include")
+            .map(|a| apply_edit(text, only_edit(a)))
+    }
+
+    #[test]
+    fn test_make_include_optional_action() {
+        assert_eq!(
+            include_optional_action("include $(DIR)/x.mk\nall:\n", Position::new(0, 12)),
+            Some("-include $(DIR)/x.mk\nall:\n".to_string())
+        );
+        assert_eq!(
+            include_optional_action("ifdef X\n  include a.mk b.mk\nendif\n", Position::new(1, 3)),
+            Some("ifdef X\n  -include a.mk b.mk\nendif\n".to_string())
+        );
+    }
+
+    #[test]
+    fn test_no_make_include_optional_action() {
+        assert_eq!(
+            include_optional_action("-include a.mk\n", Position::new(0, 2)),
+            None
+        );
+        assert_eq!(
+            include_optional_action("sinclude a.mk\n", Position::new(0, 2)),
+            None
+        );
+        assert_eq!(
+            include_optional_action("include a.mk\nall:\n", Position::new(1, 0)),
+            None
+        );
     }
 }
