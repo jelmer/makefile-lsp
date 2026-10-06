@@ -26,6 +26,7 @@ mod rename;
 mod scip;
 mod selection_ranges;
 mod semantic;
+mod shell_check;
 mod signature_help;
 mod symbols;
 
@@ -37,6 +38,8 @@ struct FileInfo {
     text: String,
     /// The parsed makefile (green node for thread safety).
     parsed: makefile_lossless::Parse<makefile_lossless::Makefile>,
+    /// Diagnostics for `text`, other than shell syntax ones.
+    diagnostics: Vec<Diagnostic>,
 }
 
 struct Backend {
@@ -58,12 +61,57 @@ impl Backend {
         let diagnostics = diagnostics::get_diagnostics(&text, &parsed, base_dir.as_deref());
 
         let mut files = self.files.lock().await;
-        files.insert(uri.clone(), FileInfo { text, parsed });
+        files.insert(
+            uri.clone(),
+            FileInfo {
+                text,
+                parsed,
+                diagnostics: diagnostics.clone(),
+            },
+        );
         drop(files);
 
         self.client
             .publish_diagnostics(uri, diagnostics, None)
             .await;
+    }
+
+    /// Check the recipes of an open file for shell syntax errors in the
+    /// background, as this spawns processes, and publish the results
+    /// alongside its other diagnostics.
+    fn spawn_shell_syntax_check(&self, uri: Uri) {
+        let client = self.client.clone();
+        let files = self.files.clone();
+        tokio::spawn(async move {
+            let Some(text) = files.lock().await.get(&uri).map(|f| f.text.clone()) else {
+                return;
+            };
+
+            let checked_text = text.clone();
+            let shell_diagnostics = match tokio::task::spawn_blocking(move || {
+                let parsed = makefile_lossless::Makefile::parse(&checked_text);
+                shell_check::check_shell_syntax(&checked_text, &parsed.tree())
+            })
+            .await
+            {
+                Ok(diagnostics) => diagnostics,
+                Err(e) => {
+                    tracing::error!("shell syntax check failed: {}", e);
+                    return;
+                }
+            };
+
+            let files = files.lock().await;
+            // If the file changed while checking, the next save checks again.
+            let Some(file_info) = files.get(&uri).filter(|f| f.text == text) else {
+                return;
+            };
+            let mut all = file_info.diagnostics.clone();
+            all.extend(shell_diagnostics);
+            drop(files);
+
+            client.publish_diagnostics(uri, all, None).await;
+        });
     }
 }
 
@@ -82,8 +130,13 @@ impl LanguageServer for Backend {
     async fn initialize(&self, _: InitializeParams) -> Result<InitializeResult> {
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
-                text_document_sync: Some(TextDocumentSyncCapability::Kind(
-                    TextDocumentSyncKind::INCREMENTAL,
+                text_document_sync: Some(TextDocumentSyncCapability::Options(
+                    TextDocumentSyncOptions {
+                        open_close: Some(true),
+                        change: Some(TextDocumentSyncKind::INCREMENTAL),
+                        save: Some(TextDocumentSyncSaveOptions::Supported(true)),
+                        ..Default::default()
+                    },
                 )),
                 completion_provider: Some(CompletionOptions {
                     resolve_provider: None,
@@ -166,8 +219,14 @@ impl LanguageServer for Backend {
     }
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
-        self.update_file(params.text_document.uri, params.text_document.text)
+        let uri = params.text_document.uri;
+        self.update_file(uri.clone(), params.text_document.text)
             .await;
+        self.spawn_shell_syntax_check(uri);
+    }
+
+    async fn did_save(&self, params: DidSaveTextDocumentParams) {
+        self.spawn_shell_syntax_check(params.text_document.uri);
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
