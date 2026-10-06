@@ -1,6 +1,6 @@
 //! Semantic token generation for Makefile syntax highlighting.
 
-use makefile_lossless::{Makefile, SyntaxKind};
+use makefile_lossless::{Lang, Makefile, SyntaxKind, TextRange, VariableDefinition};
 use rowan::ast::AstNode;
 use tower_lsp_server::ls_types::SemanticToken;
 
@@ -81,6 +81,20 @@ impl SemanticTokensBuilder {
     }
 }
 
+/// Whether `range` in the variable definition `node` is part of a name
+/// rather than a keyword such as `export`, `define` or `endef`.
+fn is_variable_name(node: &rowan::SyntaxNode<Lang>, range: TextRange) -> bool {
+    let Some(def) = VariableDefinition::cast(node.clone()) else {
+        return false;
+    };
+    let Some(name) = def.name_range() else {
+        return false;
+    };
+    // Keywords precede the name, except for `endef`. A bare `export` or
+    // `unexport` can list more names after the first.
+    range.start() >= name.start() && (!def.is_define() || range.end() <= name.end())
+}
+
 /// Generate semantic tokens for a Makefile.
 pub fn generate_semantic_tokens(makefile: &Makefile, source_text: &str) -> Vec<SemanticToken> {
     let mut builder = SemanticTokensBuilder::new();
@@ -118,7 +132,7 @@ pub fn generate_semantic_tokens(makefile: &Makefile, source_text: &str) -> Vec<S
                                     mods,
                                 );
                             }
-                            SyntaxKind::VARIABLE => {
+                            SyntaxKind::VARIABLE if is_variable_name(&parent, range) => {
                                 let mut mods = TokenModifier::Definition.bitmask();
                                 if builtins::find_builtin_variable(text).is_some() {
                                     mods |= TokenModifier::DefaultLibrary.bitmask();
@@ -273,6 +287,38 @@ mod tests {
         assert_ne!(
             var_token.token_modifiers_bitset & TokenModifier::Definition.bitmask(),
             0
+        );
+    }
+
+    /// The variable tokens in `text`, as (line, start, length).
+    fn variable_tokens(text: &str) -> Vec<(u32, u32, u32)> {
+        let makefile = Makefile::parse(text).tree();
+        let mut line = 0;
+        let mut start = 0;
+        let mut out = Vec::new();
+        for token in generate_semantic_tokens(&makefile, text) {
+            if token.delta_line > 0 {
+                line += token.delta_line;
+                start = 0;
+            }
+            start += token.delta_start;
+            if token.token_type == TokenType::Variable as u32 {
+                out.push((line, start, token.length));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn test_variable_keywords_not_highlighted() {
+        assert_eq!(variable_tokens("export CC = gcc\n"), vec![(0, 7, 2)]);
+        assert_eq!(
+            variable_tokens("override define BODY\nx\nendef\n"),
+            vec![(0, 16, 4)]
+        );
+        assert_eq!(
+            variable_tokens("unexport A B\n"),
+            vec![(0, 9, 1), (0, 11, 1)]
         );
     }
 }
