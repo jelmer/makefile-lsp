@@ -2,12 +2,11 @@
 
 use std::collections::HashMap;
 
-use makefile_lossless::{variable_at_offset, Makefile};
-use tower_lsp_server::ls_types::{
-    Position, PrepareRenameResponse, Range, TextEdit, Uri, WorkspaceEdit,
-};
+use makefile_lossless::Makefile;
+use text_size::TextRange;
+use tower_lsp_server::ls_types::{Position, PrepareRenameResponse, TextEdit, Uri, WorkspaceEdit};
 
-use crate::position::{offset_to_position, try_position_to_offset};
+use crate::position::try_position_to_offset;
 use crate::references::{symbol_at, symbol_locations, Symbol};
 use crate::workspace::FileSet;
 
@@ -60,10 +59,7 @@ fn symbol_name(symbol: &Symbol) -> &str {
 /// Variables must be defined in one of the files. Prerequisites that aren't
 /// defined as targets anywhere (usually plain files) may be renamed. A symbol
 /// defined only in files outside the workspace can't be renamed.
-fn renameable_symbol(
-    files: &FileSet,
-    position: Position,
-) -> Option<Result<(Symbol, usize), RenameError>> {
+fn renameable_symbol(files: &FileSet, position: Position) -> Option<Result<Symbol, RenameError>> {
     let current = files.current();
     let byte_offset: usize = try_position_to_offset(current.text(), position)?.into();
     let symbol = symbol_at(&current.makefile(), current.text(), byte_offset)?;
@@ -82,30 +78,43 @@ fn renameable_symbol(
             defining[0].clone(),
         )));
     }
-    Some(Ok((symbol, byte_offset)))
+    Some(Ok(symbol))
 }
 
-/// Check if renaming is possible at the given position and return the current name and range.
+/// Check if renaming is possible at the given position and return the range
+/// of the occurrence there, with its text as placeholder.
+///
+/// The range is one of those that [`rename`] edits, so it covers the name
+/// as written, e.g. `a\#b` for the target `a#b`.
 pub fn prepare_rename(
     files: &FileSet,
     position: Position,
 ) -> Option<Result<PrepareRenameResponse, RenameError>> {
-    let (symbol, byte_offset) = match renameable_symbol(files, position)? {
+    let symbol = match renameable_symbol(files, position)? {
         Ok(found) => found,
         Err(e) => return Some(Err(e)),
     };
-    let source_text = files.current().text();
-    let name = symbol_name(&symbol);
-    let start = if variable_at_offset(source_text, byte_offset).is_some() {
-        find_var_name_start_in_ref(source_text, byte_offset)?
-    } else {
-        find_word_start(source_text, byte_offset)
-    };
-    let start_pos = offset_to_position(source_text, text_size::TextSize::from(start as u32));
-    let end_pos = Position::new(start_pos.line, start_pos.character + name.len() as u32);
+    let current = files.current();
+    let source_text = current.text();
+    // TODO: some occurrences, such as prerequisites written with escapes,
+    // are not found by symbol_locations, so can't be renamed from.
+    let range = symbol_locations(
+        &current.makefile(),
+        source_text,
+        current.uri(),
+        &symbol,
+        true,
+    )
+    .into_iter()
+    .map(|loc| loc.range)
+    .find(|r| r.start <= position && position <= r.end)?;
+    let offset =
+        |pos| try_position_to_offset(source_text, pos).expect("symbol location outside document");
+    let start = offset(range.start);
+    let end = offset(range.end);
     Some(Ok(PrepareRenameResponse::RangeWithPlaceholder {
-        range: Range::new(start_pos, end_pos),
-        placeholder: name.to_string(),
+        range,
+        placeholder: source_text[TextRange::new(start, end)].to_string(),
     }))
 }
 
@@ -116,7 +125,7 @@ pub fn rename(
     position: Position,
     new_name: &str,
 ) -> Option<Result<WorkspaceEdit, RenameError>> {
-    let (symbol, _) = match renameable_symbol(files, position)? {
+    let symbol = match renameable_symbol(files, position)? {
         Ok(found) => found,
         Err(e) => return Some(Err(e)),
     };
@@ -150,38 +159,12 @@ pub fn rename(
     }))
 }
 
-/// Find the byte offset of the start of the word at the given offset.
-fn find_word_start(text: &str, offset: usize) -> usize {
-    let bytes = text.as_bytes();
-    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'.' || b == b'-';
-    (0..offset)
-        .rev()
-        .take_while(|&i| is_ident(bytes[i]))
-        .last()
-        .unwrap_or(offset)
-}
-
-/// Find the start offset of the variable name within a $() or ${} reference.
-fn find_var_name_start_in_ref(text: &str, offset: usize) -> Option<usize> {
-    let bytes = text.as_bytes();
-    let mut i = offset;
-    while i >= 2 {
-        i -= 1;
-        if i > 0 && (bytes[i] == b'(' || bytes[i] == b'{') && bytes[i - 1] == b'$' {
-            return Some(i + 1);
-        }
-        if bytes[i] == b')' || bytes[i] == b'}' || bytes[i] == b'\n' {
-            return None;
-        }
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::workspace::tests::Fixture;
     use crate::workspace::{Document, Workspace};
+    use tower_lsp_server::ls_types::Range;
 
     fn test_uri() -> Uri {
         "file:///test/Makefile".parse().unwrap()
@@ -268,6 +251,64 @@ mod tests {
             }
             _ => panic!("Expected RangeWithPlaceholder"),
         }
+    }
+
+    fn prepared(text: &str, pos: Position) -> Option<(Range, String)> {
+        match prepare_rename(&single(text), pos)?.unwrap() {
+            PrepareRenameResponse::RangeWithPlaceholder { range, placeholder } => {
+                Some((range, placeholder))
+            }
+            other => panic!("Expected RangeWithPlaceholder, got {:?}", other),
+        }
+    }
+
+    fn range(line: u32, start: u32, end: u32) -> Range {
+        Range::new(Position::new(line, start), Position::new(line, end))
+    }
+
+    #[test]
+    fn test_prepare_rename_escaped_target() {
+        let text = "a\\#b:\n\techo\n";
+        let expected = Some((range(0, 0, 4), "a\\#b".to_string()));
+        assert_eq!(prepared(text, Position::new(0, 0)), expected);
+        assert_eq!(prepared(text, Position::new(0, 3)), expected);
+        assert_eq!(
+            get_edits(text, Position::new(0, 3), "x"),
+            vec![TextEdit {
+                range: range(0, 0, 4),
+                new_text: "x".to_string()
+            }]
+        );
+    }
+
+    #[test]
+    fn test_prepare_rename_variable_references() {
+        let text = "FOO = 1\nX = $(FOO) ${FOO}\n";
+        assert_eq!(
+            prepared(text, Position::new(1, 7)),
+            Some((range(1, 6, 9), "FOO".to_string()))
+        );
+        assert_eq!(
+            prepared(text, Position::new(1, 13)),
+            Some((range(1, 13, 16), "FOO".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_prepare_rename_exported_variable() {
+        let text = "export FOO = 1\nall:\n\techo $(FOO)\n";
+        assert_eq!(
+            prepared(text, Position::new(0, 7)),
+            Some((range(0, 7, 10), "FOO".to_string()))
+        );
+        let edit = |line, start, end| TextEdit {
+            range: range(line, start, end),
+            new_text: "BAR".to_string(),
+        };
+        assert_eq!(
+            get_edits(text, Position::new(2, 8), "BAR"),
+            vec![edit(0, 7, 10), edit(2, 8, 11)]
+        );
     }
 
     #[test]
