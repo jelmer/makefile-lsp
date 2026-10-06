@@ -351,12 +351,14 @@ fn separated_rules(makefile: &Makefile) -> impl Iterator<Item = Rule> + '_ {
 /// In GNU Make, when the same target appears in multiple single-colon rules,
 /// only the last one's recipe is used, which is almost always a mistake.
 /// Double-colon rules (`::`) are intentionally excluded since they allow
-/// multiple recipe blocks.
+/// multiple recipe blocks, as are rules in different branches of a
+/// conditional, since only one of those takes effect.
 fn check_duplicate_targets(source_text: &str, makefile: &Makefile) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
-    let mut seen: HashMap<String, Range> = HashMap::new();
+    let mut seen: HashMap<String, Vec<(Range, Branches)>> = HashMap::new();
 
     for rule in separated_rules(makefile) {
+        let branches = conditional_branches(rule.syntax());
         for (target, range) in targets_with_ranges(&rule) {
             // Skip pattern rules (contain %)
             if target.contains('%') {
@@ -373,7 +375,11 @@ fn check_duplicate_targets(source_text: &str, makefile: &Makefile) -> Vec<Diagno
 
             let target_range = text_range_to_lsp_range(source_text, range);
 
-            if let Some(first_range) = seen.get(&target) {
+            let previous = seen.entry(target.clone()).or_default();
+            let first = previous
+                .iter()
+                .find(|(_, b)| !mutually_exclusive(b, &branches));
+            if let Some((first_range, _)) = first {
                 diagnostics.push(make_diagnostic(
                     target_range,
                     DiagnosticSeverity::WARNING,
@@ -385,7 +391,7 @@ fn check_duplicate_targets(source_text: &str, makefile: &Makefile) -> Vec<Diagno
                     ),
                 ));
             } else {
-                seen.insert(target, target_range);
+                previous.push((target_range, branches.clone()));
             }
         }
     }
@@ -1221,11 +1227,11 @@ fn target_range(rule: &Rule, target: &str) -> TextRange {
     targets.text_range()
 }
 
-/// For each conditional enclosing `node`, its range and the index of the
-/// branch `node` is in.
-fn conditional_branches(
-    node: &rowan::SyntaxNode<makefile_lossless::Lang>,
-) -> Vec<(TextRange, usize)> {
+/// For each conditional enclosing a node, its range and the index of the
+/// branch the node is in.
+type Branches = Vec<(TextRange, usize)>;
+
+fn conditional_branches(node: &rowan::SyntaxNode<makefile_lossless::Lang>) -> Branches {
     node.ancestors()
         .zip(node.ancestors().skip(1))
         .filter(|(_, parent)| parent.kind() == SyntaxKind::CONDITIONAL)
@@ -1674,6 +1680,64 @@ mod tests {
         assert_eq!(dups.len(), 1);
         assert!(dups[0].message.contains("all"));
         assert!(dups[0].message.contains("line 1"));
+    }
+
+    fn duplicate_target_diags(text: &str) -> Vec<(Range, String)> {
+        get_diags(text)
+            .into_iter()
+            .filter(|d| d.code == Some(NumberOrString::String("duplicate-target".to_string())))
+            .map(|d| (d.range, d.message))
+            .collect()
+    }
+
+    #[test]
+    fn test_duplicate_target_in_conditional_branches_ok() {
+        assert_eq!(
+            duplicate_target_diags("ifdef X\nfoo:\n\techo a\nelse\nfoo:\n\techo b\nendif\n"),
+            vec![]
+        );
+        assert_eq!(
+            duplicate_target_diags(
+                "ifdef A\nfoo:\n\techo a\nelse ifdef B\nfoo:\n\techo b\nelse\nfoo:\n\techo c\nendif\n"
+            ),
+            vec![]
+        );
+    }
+
+    #[test]
+    fn test_duplicate_target_same_conditional_branch() {
+        assert_eq!(
+            duplicate_target_diags("ifdef X\nfoo:\n\techo a\nfoo:\n\techo b\nendif\n"),
+            vec![(
+                Range::new(Position::new(3, 0), Position::new(3, 3)),
+                "target 'foo' already defined on line 2".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn test_duplicate_target_inside_and_outside_conditional() {
+        assert_eq!(
+            duplicate_target_diags("foo:\n\techo a\nifdef X\nfoo:\n\techo b\nendif\n"),
+            vec![(
+                Range::new(Position::new(3, 0), Position::new(3, 3)),
+                "target 'foo' already defined on line 1".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn test_duplicate_target_after_conditional_branches() {
+        // The later definition clashes with whichever branch was taken.
+        assert_eq!(
+            duplicate_target_diags(
+                "ifdef X\nfoo:\n\techo a\nelse\nfoo:\n\techo b\nendif\nfoo:\n\techo c\n"
+            ),
+            vec![(
+                Range::new(Position::new(7, 0), Position::new(7, 3)),
+                "target 'foo' already defined on line 2".to_string()
+            )]
+        );
     }
 
     #[test]
