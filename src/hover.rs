@@ -10,6 +10,7 @@ use tower_lsp_server::ls_types::{Hover, HoverContents, MarkupContent, MarkupKind
 
 use crate::builtins;
 use crate::position::try_position_to_offset;
+use crate::targets::target_at_offset;
 use crate::workspace::{Document, FileSet};
 
 fn markdown_hover(text: String) -> Hover {
@@ -22,12 +23,15 @@ fn markdown_hover(text: String) -> Hover {
     }
 }
 
-/// Check whether `offset` lies within the target list of a rule head.
+/// Check whether `offset` lies on a target name in a rule head, outside of
+/// any variable reference in it.
 fn in_rule_targets(makefile: &Makefile, offset: TextSize) -> bool {
     makefile
-        .syntax()
-        .token_at_offset(offset)
-        .any(|t| t.parent().is_some_and(|p| p.kind() == SyntaxKind::TARGETS))
+        .rules()
+        .any(|rule| target_at_offset(&rule, offset.into()).is_some())
+        && !makefile
+            .variable_references()
+            .any(|r| r.text_range().contains(offset))
 }
 
 /// Describe the first rule defining `target`: its doc comment, prerequisites
@@ -318,6 +322,16 @@ mod tests {
         assert_eq!(
             hover_text(text, Position::new(0, 1)).as_deref(),
             Some("**`all`**\n\nPrerequisites: `build`")
+        );
+    }
+
+    #[test]
+    fn test_hover_word_in_target_reference() {
+        let text = "$(addprefix $(D)/, foo):\n\nfoo:\n\techo ok\n";
+        assert_eq!(hover_text(text, Position::new(0, 19)), None);
+        assert_eq!(
+            hover_text(text, Position::new(2, 1)).as_deref(),
+            Some("**`foo`**\n\n```makefile\n\techo ok\n```")
         );
     }
 
