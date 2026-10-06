@@ -9,6 +9,7 @@ use tower_lsp_server::ls_types::{
 };
 
 use crate::position::{offset_to_position, text_range_to_lsp_range, try_position_to_offset};
+use crate::targets::target_at_offset;
 
 /// Generate code actions for the given range.
 pub fn get_code_actions(
@@ -120,12 +121,9 @@ fn add_phony_action(
     uri: &Uri,
 ) -> Option<CodeAction> {
     // Find if cursor is on a target name at the start of a rule
-    let target = makefile.rules().find_map(|rule| {
-        let rule_range = rule.syntax().text_range();
-        let rule_start: usize = rule_range.start().into();
-        rule.targets()
-            .find(|target| byte_offset >= rule_start && byte_offset < rule_start + target.len())
-    })?;
+    let (target, _) = makefile
+        .rules()
+        .find_map(|rule| target_at_offset(&rule, byte_offset))?;
 
     // Skip if already phony
     if makefile.is_phony(&target) {
@@ -720,11 +718,9 @@ fn attach_to_default_goal_action(
     let makefile = parsed.tree();
 
     // Cursor must be on a target name at the head of some rule.
-    let target = makefile.rules().find_map(|rule| {
-        let rule_start: usize = rule.syntax().text_range().start().into();
-        rule.targets()
-            .find(|t| byte_offset >= rule_start && byte_offset < rule_start + t.len())
-    })?;
+    let (target, _) = makefile
+        .rules()
+        .find_map(|rule| target_at_offset(&rule, byte_offset))?;
 
     if !crate::dep_graph::is_graph_target(&target) {
         return None;
@@ -883,6 +879,17 @@ mod tests {
         let text = "all: build\n\techo done\n";
         let actions = parse_and_actions(text, Position::new(0, 0));
         assert!(actions.iter().any(|a| a.title.contains(".PHONY")));
+    }
+
+    #[test]
+    fn test_add_phony_action_second_target() {
+        let text = "a b:\n\techo done\n";
+        let titles: Vec<String> = parse_and_actions(text, Position::new(0, 2))
+            .into_iter()
+            .map(|a| a.title)
+            .filter(|t| t.contains(".PHONY"))
+            .collect();
+        assert_eq!(titles, vec!["Add 'b' to .PHONY"]);
     }
 
     #[test]
@@ -1465,6 +1472,14 @@ mod tests {
             result,
             "all: build helper\n\t@:\nbuild:\n\t@:\nhelper:\n\techo hi\n"
         );
+    }
+
+    #[test]
+    fn test_attach_second_target_of_rule() {
+        let text = "all: build\n\t@:\nbuild:\n\t@:\nx helper:\n\techo hi\n";
+        let actions = parse_and_actions(text, Position::new(4, 7));
+        let action = find_attach_action(&actions).expect("expected attach action");
+        assert_eq!(action.title, "Add 'helper' as prerequisite of 'all'");
     }
 
     #[test]

@@ -5,6 +5,7 @@ use rowan::ast::AstNode;
 use tower_lsp_server::ls_types::{Location, Position, Range, Uri};
 
 use crate::position::{text_range_to_lsp_range, try_position_to_offset};
+use crate::targets::{target_at_offset, targets_with_ranges};
 use crate::workspace::FileSet;
 
 /// A target or variable name.
@@ -26,20 +27,11 @@ pub fn symbol_at(makefile: &Makefile, source_text: &str, byte_offset: usize) -> 
         return Some(Symbol::Target(word.to_string()));
     }
 
-    // Check if this word is a target in a rule definition
-    let is_target = makefile.rules().any(|r| {
-        r.targets().any(|t| {
-            if t != word {
-                return false;
-            }
-            let rule_range = r.syntax().text_range();
-            let rule_start: usize = rule_range.start().into();
-            // The target should be near the start of the rule
-            byte_offset >= rule_start && byte_offset < rule_start + t.len()
-        })
-    });
-    if is_target {
-        return Some(Symbol::Target(word.to_string()));
+    if let Some((target, _)) = makefile
+        .rules()
+        .find_map(|r| target_at_offset(&r, byte_offset))
+    {
+        return Some(Symbol::Target(target));
     }
 
     // Check if this word is a variable definition name
@@ -135,15 +127,11 @@ fn find_target_references(
     for rule in makefile.rules() {
         // Target definitions
         if include_declaration {
-            for target in rule.targets() {
+            for (target, range) in targets_with_ranges(&rule) {
                 if target == target_name {
-                    let range = text_range_to_lsp_range(source_text, rule.syntax().text_range());
-                    // Narrow to just the target name at the start
-                    let start = range.start;
-                    let end = Position::new(start.line, start.character + target.len() as u32);
                     locations.push(Location {
                         uri: uri.clone(),
-                        range: Range::new(start, end),
+                        range: text_range_to_lsp_range(source_text, range),
                     });
                 }
             }
@@ -313,6 +301,24 @@ mod tests {
         let refs =
             find_document_references(&makefile, text, Position::new(2, 0), &test_uri(), true);
         assert_eq!(refs.len(), 2);
+    }
+
+    #[test]
+    fn test_find_target_references_second_target_of_rule() {
+        let text = "all: b\na b: c\n";
+        let makefile = Makefile::parse(text).tree();
+        let ranges: Vec<Range> =
+            find_document_references(&makefile, text, Position::new(0, 5), &test_uri(), true)
+                .into_iter()
+                .map(|l| l.range)
+                .collect();
+        assert_eq!(
+            ranges,
+            vec![
+                Range::new(Position::new(0, 5), Position::new(0, 6)),
+                Range::new(Position::new(1, 2), Position::new(1, 3)),
+            ]
+        );
     }
 
     #[test]

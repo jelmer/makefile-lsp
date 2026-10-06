@@ -40,6 +40,7 @@ pub fn get_highlights(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tower_lsp_server::ls_types::Range;
 
     fn get_hl(text: &str, pos: Position) -> Vec<DocumentHighlight> {
         let parsed = Makefile::parse(text);
@@ -62,6 +63,22 @@ mod tests {
         let text = "all: build\n\nbuild:\n\techo ok\n";
         let highlights = get_hl(text, Position::new(0, 5));
         assert_eq!(highlights.len(), 2);
+    }
+
+    #[test]
+    fn test_highlight_second_target_of_rule() {
+        let text = "all: b\na b: c\n";
+        let ranges: Vec<Range> = get_hl(text, Position::new(1, 2))
+            .into_iter()
+            .map(|h| h.range)
+            .collect();
+        assert_eq!(
+            ranges,
+            vec![
+                Range::new(Position::new(0, 5), Position::new(0, 6)),
+                Range::new(Position::new(1, 2), Position::new(1, 3)),
+            ]
+        );
     }
 
     #[test]
