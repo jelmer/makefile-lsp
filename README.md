@@ -78,7 +78,7 @@ Each diagnostic carries a code, so it can be identified in editors:
 - Replace spaces with a tab in a recipe line, or in all recipe lines
 - Remove trailing whitespace from a variable value
 - Use `:=` for an assignment containing `$(shell ...)`
-- Add a missing `endif`
+- Add a missing `endif` or `endef`
 - Inline a variable
 - Add a target that nothing depends on as a prerequisite of the default goal
 - Remove a prerequisite that is already reached through another one
