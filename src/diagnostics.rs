@@ -1372,11 +1372,7 @@ fn check_missing_phony(
     {
         return Vec::new();
     }
-    let has_include = makefile
-        .syntax()
-        .descendants()
-        .any(|n| n.kind() == SyntaxKind::INCLUDE);
-    if phony_prereqs.is_empty() && has_include {
+    if phony_prereqs.is_empty() && makefile.includes().next().is_some() {
         return Vec::new();
     }
 
