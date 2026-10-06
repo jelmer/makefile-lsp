@@ -342,6 +342,31 @@ mod tests {
     }
 
     #[test]
+    fn test_rename_variable_in_vpath_and_define() {
+        let text = "FOO = %.c\nvpath $(FOO) src\ndefine $(FOO)_F\n\techo $(FOO)\nendef\n";
+        let edit = |line, start, end| TextEdit {
+            range: range(line, start, end),
+            new_text: "PAT".to_string(),
+        };
+        assert_eq!(
+            get_edits(text, Position::new(0, 0), "PAT"),
+            vec![
+                edit(0, 0, 3),
+                edit(1, 8, 11),
+                edit(2, 9, 12),
+                edit(3, 8, 11)
+            ]
+        );
+    }
+
+    #[test]
+    fn test_no_rename_nested_or_parameter_reference() {
+        let text = "define F\n$(1) $(A.${B})\nendef\n";
+        assert_eq!(prepared(text, Position::new(1, 2)), None);
+        assert_eq!(prepared(text, Position::new(1, 7)), None);
+    }
+
+    #[test]
     fn test_prepare_rename_exported_variable() {
         let text = "export FOO = 1\nall:\n\techo $(FOO)\n";
         assert_eq!(

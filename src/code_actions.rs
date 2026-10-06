@@ -5,7 +5,8 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use makefile_lossless::{
-    Conditional, Include, Makefile, Parse, ParseErrorKind, Rule, SyntaxKind, VariableReference,
+    Conditional, Include, Makefile, Parse, ParseErrorKind, Recipe, Rule, SyntaxKind,
+    VariableDefinition, VariableReference,
 };
 use rowan::ast::AstNode;
 use tower_lsp_server::ls_types::{
@@ -809,15 +810,13 @@ fn replace_all_spaces_with_tabs_action(
 /// Offer "Inline variable" when the cursor is on a variable definition with a
 /// simple literal value (no `$` characters in the value).
 ///
-/// Replaces every `$(NAME)` / `${NAME}` reference visible to the parser AND
-/// every such reference in recipe TEXT (byte-scanned) with the literal
-/// value, then deletes the variable definition's line.
+/// Replaces every `$(NAME)` / `${NAME}` reference, including those in
+/// recipes and define bodies, with the literal value, then deletes the
+/// variable definition's line. Not offered if a recipe or define body uses
+/// the variable with modifiers, as in `$(NAME:.c=.o)`.
 ///
 /// Only offered for plain assignments (`=`, `:=`, `::=`, `:::=`). `+=`,
 /// `?=`, and `!=` have semantics we don't want to inline silently.
-///
-/// TODO: drop the recipe byte-scan once makefile-lossless tokenizes recipes
-/// structurally.
 fn inline_variable_action(
     parsed: &Parse<Makefile>,
     source_text: &str,
@@ -868,29 +867,22 @@ fn inline_variable_action(
         });
     }
 
-    // Collect edits for references inside recipe TEXT (byte-scanned).
-    for rule in makefile.rules() {
-        for recipe in rule.recipe_nodes() {
-            for token in recipe
-                .syntax()
-                .descendants_with_tokens()
-                .filter_map(|c| c.into_token())
-            {
-                if token.kind() != SyntaxKind::TEXT {
-                    continue;
-                }
-                let base: u32 = token.text_range().start().into();
-                for (start, end) in scan_named_var_ref_offsets(token.text(), &name) {
-                    let range = text_size::TextRange::new(
-                        text_size::TextSize::from(base + start as u32),
-                        text_size::TextSize::from(base + end as u32),
-                    );
-                    edits.push(TextEdit {
-                        range: text_range_to_lsp_range(source_text, range),
-                        new_text: value.clone(),
-                    });
-                }
-            }
+    // Recipes and define bodies are raw text, so their references are not
+    // in the syntax tree. Recipe lines outside rules are included.
+    for node in makefile.syntax().descendants() {
+        let raw_refs = if let Some(recipe) = Recipe::cast(node.clone()) {
+            recipe.variable_references()
+        } else if let Some(definition) = VariableDefinition::cast(node) {
+            definition.define_variable_references()
+        } else {
+            continue;
+        };
+        for raw_ref in raw_refs.iter().filter(|r| r.name() == name) {
+            let range = plain_reference_range(source_text, raw_ref.text_range())?;
+            edits.push(TextEdit {
+                range: text_range_to_lsp_range(source_text, range),
+                new_text: value.clone(),
+            });
         }
     }
 
@@ -920,50 +912,27 @@ fn inline_variable_action(
     })
 }
 
-/// Scan recipe text for `$(NAME)` and `${NAME}` references to a specific
-/// variable, returning byte offsets covering the whole reference. `$$` is
-/// treated as an escape and skipped.
-fn scan_named_var_ref_offsets(text: &str, name: &str) -> Vec<(usize, usize)> {
-    let mut out = Vec::new();
-    let bytes = text.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] != b'$' {
-            i += 1;
-            continue;
-        }
-        if i + 1 >= bytes.len() {
-            break;
-        }
-        let next = bytes[i + 1];
-        if next == b'$' {
-            i += 2;
-            continue;
-        }
-        if next == b'(' || next == b'{' {
-            let close = if next == b'(' { b')' } else { b'}' };
-            let inner_start = i + 2;
-            let mut j = inner_start;
-            while j < bytes.len() {
-                let b = bytes[j];
-                if b == close || b == b' ' || b == b'\t' || b == b'\n' {
-                    break;
-                }
-                j += 1;
-            }
-            if j > inner_start
-                && j < bytes.len()
-                && bytes[j] == close
-                && &bytes[inner_start..j] == name.as_bytes()
-            {
-                out.push((i, j + 1));
-            }
-            i += 1;
-            continue;
-        }
-        i += 2; // single-char auto var or other special
-    }
-    out
+/// The range of the whole `$(NAME)` or `${NAME}` reference whose name is at
+/// `name_range`, or None if the name is followed by modifiers.
+// TODO: use the reference's own range if makefile-lossless provides one for
+// references in recipes and define bodies.
+fn plain_reference_range(
+    source_text: &str,
+    name_range: text_size::TextRange,
+) -> Option<text_size::TextRange> {
+    let start = usize::from(name_range.start()).checked_sub(2)?;
+    let end = usize::from(name_range.end());
+    let close = match source_text.get(start..start + 2)? {
+        "$(" => ")",
+        "${" => "}",
+        _ => return None,
+    };
+    source_text[end..].starts_with(close).then(|| {
+        text_size::TextRange::new(
+            text_size::TextSize::from(start as u32),
+            name_range.end() + text_size::TextSize::of(close),
+        )
+    })
 }
 
 /// Offer "Add '<target>' as prerequisite of '<goal>'" when the cursor is on
@@ -1778,6 +1747,40 @@ mod tests {
             .unwrap();
         let result = apply_edits(text, edits);
         assert_eq!(result, "all:\n\tcp dist/foo .\n");
+    }
+
+    fn inline_result(text: &str, name: &str) -> Option<String> {
+        parse_and_actions(text, Position::new(0, 0))
+            .iter()
+            .find(|a| a.title == format!("Inline variable '{name}'"))
+            .map(|a| {
+                let edits = a.edit.as_ref().unwrap().changes.as_ref().unwrap();
+                apply_edits(text, edits.values().next().unwrap())
+            })
+    }
+
+    #[test]
+    fn test_inline_variable_in_define_body() {
+        assert_eq!(
+            inline_result("OUT = dist\ndefine F\ncp $(OUT)/a ${OUT}\nendef\n", "OUT"),
+            Some("define F\ncp dist/a dist\nendef\n".to_string())
+        );
+    }
+
+    #[test]
+    fn test_inline_variable_in_orphan_recipe() {
+        assert_eq!(
+            inline_result("OUT = dist\nifdef X\n\tcp $(OUT) .\nendif\n", "OUT"),
+            Some("ifdef X\n\tcp dist .\nendif\n".to_string())
+        );
+    }
+
+    #[test]
+    fn test_no_inline_for_substitution_reference_in_recipe() {
+        assert_eq!(
+            inline_result("OUT = a.c\nall:\n\techo $(OUT) $(OUT:.c=.o)\n", "OUT"),
+            None
+        );
     }
 
     #[test]

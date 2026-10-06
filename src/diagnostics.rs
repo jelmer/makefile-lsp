@@ -774,13 +774,13 @@ fn scan_automatic_vars(text: &str) -> Vec<(char, usize, usize)> {
 
 /// Collect the names of all variables a makefile references.
 fn referenced_variables(makefile: &Makefile) -> HashSet<String> {
-    let mut referenced: HashSet<String> = makefile
-        .variable_references()
-        .filter_map(|v| v.name())
+    let mut referenced: HashSet<String> = crate::references::variable_references(makefile)
+        .into_iter()
+        .map(|(name, _)| name)
         .collect();
 
-    // `ifdef NAME` / `ifndef NAME` reference NAME but don't show up in
-    // `variable_references()` because the argument is a bare identifier.
+    // `ifdef NAME` / `ifndef NAME` reference NAME but don't show up as
+    // references because the argument is a bare identifier.
     for cond in makefile
         .syntax()
         .descendants()
@@ -796,35 +796,13 @@ fn referenced_variables(makefile: &Makefile) -> HashSet<String> {
         }
     }
 
-    // Recipe TEXT is a single flat token; byte-scan for $(NAME) / ${NAME}.
-    //
-    // TODO: replace with an AST walk once makefile-lossless tokenizes recipes
-    // structurally.
-    for rule in makefile.rules() {
-        for recipe in rule.recipe_nodes() {
-            for token in recipe
-                .syntax()
-                .descendants_with_tokens()
-                .filter_map(|c| c.into_token())
-            {
-                if token.kind() != SyntaxKind::TEXT {
-                    continue;
-                }
-                for name in scan_variable_ref_names(token.text()) {
-                    referenced.insert(name);
-                }
-            }
-        }
-    }
-
     referenced
 }
 
 /// Check for variables that are defined but never referenced.
 ///
 /// Emits a hint (not a warning) to keep the noise low: the check has known
-/// false-positive sources (recipes are byte-scanned because makefile-lossless
-/// tokenizes them flatly; `$(eval)` and `$(call)` can reference variables in
+/// false-positive sources (`$(eval)` and `$(call)` can reference variables in
 /// ways we can't see statically) and many makefiles intentionally export
 /// variables for sub-makes or external tooling.
 ///
@@ -876,63 +854,6 @@ fn check_unused_variables(
     }
 
     diagnostics
-}
-
-/// Scan a snippet of recipe text for `$(NAME)` and `${NAME}` references and
-/// return the names. `$$` is treated as an escape and skipped.
-///
-/// TODO: drop in favour of structured tokenization in makefile-lossless.
-fn scan_variable_ref_names(text: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let bytes = text.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] != b'$' {
-            i += 1;
-            continue;
-        }
-        if i + 1 >= bytes.len() {
-            break;
-        }
-        let next = bytes[i + 1];
-        if next == b'$' {
-            i += 2;
-            continue;
-        }
-        if next == b'(' || next == b'{' {
-            let close = if next == b'(' { b')' } else { b'}' };
-            // Find a matching close on the same line. The name is the
-            // unbroken identifier-character run between `(` and either the
-            // close or a space (since `$(foo bar)` is a function call, not a
-            // variable ref to `foo bar`).
-            let name_start = i + 2;
-            let mut j = name_start;
-            while j < bytes.len() {
-                let b = bytes[j];
-                if b == close || b == b' ' || b == b'\t' || b == b'\n' {
-                    break;
-                }
-                j += 1;
-            }
-            if j > name_start && j < bytes.len() && bytes[j] == close {
-                // `$(NAME)` form — pure variable reference.
-                if let Ok(s) = std::str::from_utf8(&bytes[name_start..j]) {
-                    if is_valid_var_name(s) {
-                        out.push(s.to_string());
-                    }
-                }
-            } else if j > name_start && j < bytes.len() && bytes[j] == b' ' {
-                // `$(func args...)` — function call. The first argument may
-                // contain variable refs; rely on recursion into the rest of
-                // the line below (we'll re-enter on the inner `$`).
-            }
-            i += 1;
-            continue;
-        }
-        // Single-char automatic var like `$<` — not a user variable name.
-        i += 2;
-    }
-    out
 }
 
 fn is_valid_var_name(s: &str) -> bool {
@@ -2949,6 +2870,20 @@ mod tests {
         let codes = diag_codes(text);
         // FOO is unused — `$$FOO` is the shell's FOO, not make's.
         assert!(codes.contains(&"unused-variable".to_string()));
+    }
+
+    #[test]
+    fn test_used_in_define_body_ok() {
+        let text = "FOO = bar\ndefine F\necho $(FOO)\nendef\nall:\n\t$(F)\n";
+        let codes = diag_codes(text);
+        assert!(!codes.contains(&"unused-variable".to_string()), "{codes:?}");
+    }
+
+    #[test]
+    fn test_used_in_orphan_recipe_ok() {
+        let text = "FOO = bar\nifdef X\n\techo $(FOO)\nendif\n";
+        let codes = diag_codes(text);
+        assert!(!codes.contains(&"unused-variable".to_string()), "{codes:?}");
     }
 
     // Missing include file tests
