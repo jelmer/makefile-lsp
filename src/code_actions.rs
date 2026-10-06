@@ -2,8 +2,10 @@
 
 use std::collections::HashSet;
 
+use std::path::Path;
+
 use makefile_lossless::{
-    Conditional, Include, Makefile, Parse, ParseErrorKind, SyntaxKind, VariableReference,
+    Conditional, Include, Makefile, Parse, ParseErrorKind, Rule, SyntaxKind, VariableReference,
 };
 use rowan::ast::AstNode;
 use tower_lsp_server::ls_types::{
@@ -13,19 +15,24 @@ use tower_lsp_server::ls_types::{
 
 use crate::position::{offset_to_position, text_range_to_lsp_range, try_position_to_offset};
 use crate::targets::target_at_offset;
+use crate::workspace::FileSet;
 
 /// Generate code actions for the given range.
 ///
 /// `diagnostics` are the diagnostics the client sent along with the request;
-/// quick fixes that resolve one of them are linked to it.
+/// quick fixes that resolve one of them are linked to it. Actions are only
+/// offered for the current document of `files`; the other makefiles are
+/// consulted for what they define.
 pub fn get_code_actions(
-    parsed: &Parse<Makefile>,
-    source_text: &str,
+    files: &FileSet,
     range: Range,
-    uri: &Uri,
     diagnostics: &[Diagnostic],
 ) -> Vec<CodeAction> {
     let mut actions = Vec::new();
+    let current = files.current();
+    let parsed = current.parsed();
+    let source_text = current.text();
+    let uri = current.uri();
 
     let Some(offset) = try_position_to_offset(source_text, range.start) else {
         return actions;
@@ -117,8 +124,115 @@ pub fn get_code_actions(
         byte_offset,
         uri,
     ));
+    // Whether a file exists can only be checked for documents on disk.
+    if let Some(dir) = current.dir() {
+        actions.extend(create_target_action(
+            files,
+            &makefile,
+            source_text,
+            byte_offset,
+            uri,
+            dir,
+        ));
+    }
 
     actions
+}
+
+/// Offer "Create target for X" on a prerequisite that no rule in the file
+/// set builds and that is not an existing file, appending an empty `X:`
+/// rule at the end of the file.
+fn create_target_action(
+    files: &FileSet,
+    makefile: &Makefile,
+    source_text: &str,
+    byte_offset: usize,
+    uri: &Uri,
+    base_dir: &Path,
+) -> Option<CodeAction> {
+    let offset = text_size::TextSize::from(byte_offset as u32);
+    let prerequisite = makefile
+        .syntax()
+        .descendants()
+        .filter(|n| n.kind() == SyntaxKind::PREREQUISITE)
+        .find(|n| n.text_range().contains(offset))?;
+    let rule = prerequisite.ancestors().find_map(Rule::cast)?;
+    // Prerequisites of special targets such as .SUFFIXES are not files to
+    // build, except for .PHONY, whose entries should have a rule.
+    if rule.targets().any(|t| t.starts_with('.') && t != ".PHONY") {
+        return None;
+    }
+
+    // Look the name up as the parser reads it, e.g. with `\#` unescaped.
+    let index = prerequisite
+        .parent()?
+        .children()
+        .filter(|n| n.kind() == SyntaxKind::PREREQUISITE)
+        .position(|n| n == prerequisite)?;
+    let name = rule
+        .prerequisites()
+        .chain(rule.order_only_prerequisites())
+        .nth(index)?;
+    if name.contains(['$', '%'])
+        || files
+            .docs()
+            .any(|doc| is_built_by_rule(&doc.makefile(), &name))
+    {
+        return None;
+    }
+    if base_dir.join(&name).exists() {
+        return None;
+    }
+
+    let eol = if source_text.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
+    let separator = if source_text.is_empty() || source_text.ends_with(&format!("{eol}{eol}")) {
+        String::new()
+    } else if source_text.ends_with('\n') {
+        eol.to_string()
+    } else {
+        format!("{eol}{eol}")
+    };
+    let end = offset_to_position(source_text, text_size::TextSize::of(source_text));
+    let edit = TextEdit {
+        range: Range::new(end, end),
+        new_text: format!(
+            "{separator}{}:{eol}",
+            prerequisite.text().to_string().trim()
+        ),
+    };
+
+    let mut changes = std::collections::HashMap::new();
+    changes.insert(uri.clone(), vec![edit]);
+
+    Some(CodeAction {
+        title: format!("Create target for '{}'", name),
+        kind: Some(CodeActionKind::QUICKFIX),
+        edit: Some(WorkspaceEdit {
+            changes: Some(changes),
+            ..Default::default()
+        }),
+        ..Default::default()
+    })
+}
+
+/// Whether some explicit or pattern rule builds `name`.
+fn is_built_by_rule(makefile: &Makefile, name: &str) -> bool {
+    makefile
+        .rules()
+        .filter(|rule| rule.operator().is_some())
+        .flat_map(|rule| rule.targets().collect::<Vec<_>>())
+        .any(|target| match target.split_once('%') {
+            Some((prefix, suffix)) => {
+                name.len() > prefix.len() + suffix.len()
+                    && name.starts_with(prefix)
+                    && name.ends_with(suffix)
+            }
+            None => target == name,
+        })
 }
 
 /// Offer "Change include to -include" on an `include` directive, so that
@@ -1018,11 +1132,18 @@ fn inline_prerequisite_action(
 mod tests {
     use super::*;
 
+    fn actions_at(
+        uri: &str,
+        text: &str,
+        range: Range,
+        diagnostics: &[Diagnostic],
+    ) -> Vec<CodeAction> {
+        let doc = crate::workspace::Document::new(uri.parse().unwrap(), text.to_string());
+        get_code_actions(&FileSet::single(doc), range, diagnostics)
+    }
+
     fn parse_and_actions(text: &str, pos: Position) -> Vec<CodeAction> {
-        let parsed = Makefile::parse(text);
-        let uri: Uri = "file:///test/Makefile".parse().unwrap();
-        let range = Range::new(pos, pos);
-        get_code_actions(&parsed, text, range, &uri, &[])
+        actions_at("file:///test/Makefile", text, Range::new(pos, pos), &[])
     }
 
     #[test]
@@ -1073,7 +1194,6 @@ mod tests {
     fn test_add_phony_action_linked_to_missing_phony() {
         let text = "all: foo\n\ttouch foo\n";
         let parsed = Makefile::parse(text);
-        let uri: Uri = "file:///test/Makefile".parse().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let diagnostics: Vec<_> =
             crate::diagnostics::get_diagnostics(text, &parsed, Some(dir.path()))
@@ -1081,7 +1201,12 @@ mod tests {
                 .filter(|d| d.code == Some(NumberOrString::String("missing-phony".to_string())))
                 .collect();
         assert_eq!(diagnostics.len(), 1);
-        let actions = get_code_actions(&parsed, text, diagnostics[0].range, &uri, &diagnostics);
+        let actions = actions_at(
+            "file:///test/Makefile",
+            text,
+            diagnostics[0].range,
+            &diagnostics,
+        );
         let action = actions
             .iter()
             .find(|a| a.title == "Add 'all' to .PHONY")
@@ -1885,6 +2010,124 @@ mod tests {
         assert_eq!(
             include_optional_action("include a.mk\nall:\n", Position::new(1, 0)),
             None
+        );
+    }
+
+    fn create_target_action(text: &str, pos: Position, dir: &Path) -> Option<(String, String)> {
+        let uri = Uri::from_file_path(dir.join("Makefile")).unwrap();
+        actions_at(uri.as_str(), text, Range::new(pos, pos), &[])
+            .iter()
+            .find(|a| a.title.starts_with("Create target"))
+            .map(|a| (a.title.clone(), apply_edit(text, only_edit(a))))
+    }
+
+    #[test]
+    fn test_create_target_action() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            create_target_action("all: foo\n\techo\n", Position::new(0, 6), dir.path()),
+            Some((
+                "Create target for 'foo'".to_string(),
+                "all: foo\n\techo\n\nfoo:\n".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn test_create_target_action_without_trailing_newline() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            create_target_action("CC = gcc\nall: foo | bar", Position::new(1, 12), dir.path()),
+            Some((
+                "Create target for 'bar'".to_string(),
+                "CC = gcc\nall: foo | bar\n\nbar:\n".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn test_create_target_action_escaped() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            create_target_action("all: a\\#b\n\n", Position::new(0, 6), dir.path()),
+            Some((
+                "Create target for 'a#b'".to_string(),
+                "all: a\\#b\n\na\\#b:\n".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn test_no_create_target_action() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.c"), "").unwrap();
+        for (text, pos) in [
+            // Already a target.
+            ("all: foo\nfoo:\n", Position::new(0, 6)),
+            // Built by a pattern rule.
+            ("all: foo.o\n%.o: %.c\n", Position::new(0, 6)),
+            // An existing file.
+            ("app: main.c\n", Position::new(0, 7)),
+            // Not a file name.
+            ("all: $(OBJS)\n", Position::new(0, 7)),
+            (".SUFFIXES: .c\n", Position::new(0, 12)),
+            // Not on a prerequisite.
+            ("all: foo\n", Position::new(0, 1)),
+        ] {
+            assert_eq!(
+                create_target_action(text, pos, dir.path()),
+                None,
+                "{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_no_create_target_action_without_base_dir() {
+        let pos = Position::new(0, 6);
+        let actions = actions_at("untitled:Makefile", "all: foo\n", Range::new(pos, pos), &[]);
+        assert!(!actions.iter().any(|a| a.title.starts_with("Create target")));
+    }
+
+    fn file_set_create_target_titles(
+        files: &[(&str, &str)],
+        name: &str,
+        pos: Position,
+    ) -> Vec<String> {
+        let fx = crate::workspace::tests::Fixture::new(files);
+        let (mut ws, makefile) = fx.open("Makefile");
+        ws.file_set(&makefile).unwrap();
+        let uri = if name == "Makefile" {
+            makefile
+        } else {
+            fx.open_in(&mut ws, name)
+        };
+        get_code_actions(&ws.file_set(&uri).unwrap(), Range::new(pos, pos), &[])
+            .into_iter()
+            .map(|a| a.title)
+            .filter(|t| t.starts_with("Create target"))
+            .collect()
+    }
+
+    #[test]
+    fn test_no_create_target_action_for_target_in_other_file() {
+        let files = [
+            ("Makefile", "include rules.mk\nall: foo bar\n"),
+            ("rules.mk", "foo:\n\techo\nlint: all\n"),
+        ];
+        let empty: Vec<String> = vec![];
+        assert_eq!(
+            file_set_create_target_titles(&files, "Makefile", Position::new(1, 5)),
+            empty
+        );
+        assert_eq!(
+            file_set_create_target_titles(&files, "Makefile", Position::new(1, 9)),
+            vec!["Create target for 'bar'".to_string()]
+        );
+        // `all` is defined by the including makefile.
+        assert_eq!(
+            file_set_create_target_titles(&files, "rules.mk", Position::new(2, 7)),
+            empty
         );
     }
 }

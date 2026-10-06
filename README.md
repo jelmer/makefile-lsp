@@ -86,6 +86,8 @@ Each diagnostic carries a code, so it can be identified in editors:
 - Inline a variable
 - Add a target that nothing depends on as a prerequisite of the default goal
 - Remove a prerequisite that is already reached through another one
+- Add an empty rule for a prerequisite that is neither a target nor an
+  existing file
 
 ### Included makefiles
 

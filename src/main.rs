@@ -518,17 +518,11 @@ impl LanguageServer for Backend {
         let uri = &params.text_document.uri;
         let range = params.range;
 
-        let Some(doc) = self.document(uri).await else {
+        let Some(files) = self.file_set(uri).await else {
             return Ok(None);
         };
 
-        let actions = code_actions::get_code_actions(
-            doc.parsed(),
-            doc.text(),
-            range,
-            uri,
-            &params.context.diagnostics,
-        );
+        let actions = code_actions::get_code_actions(&files, range, &params.context.diagnostics);
 
         if actions.is_empty() {
             Ok(None)
