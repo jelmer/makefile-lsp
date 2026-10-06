@@ -5,17 +5,22 @@ use std::collections::HashSet;
 use makefile_lossless::{Conditional, Makefile, Parse, SyntaxKind, VariableReference};
 use rowan::ast::AstNode;
 use tower_lsp_server::ls_types::{
-    CodeAction, CodeActionKind, Position, Range, TextEdit, Uri, WorkspaceEdit,
+    CodeAction, CodeActionKind, Diagnostic, NumberOrString, Position, Range, TextEdit, Uri,
+    WorkspaceEdit,
 };
 
 use crate::position::{offset_to_position, text_range_to_lsp_range, try_position_to_offset};
 
 /// Generate code actions for the given range.
+///
+/// `diagnostics` are the diagnostics the client sent along with the request;
+/// quick fixes that resolve one of them are linked to it.
 pub fn get_code_actions(
     parsed: &Parse<Makefile>,
     source_text: &str,
     range: Range,
     uri: &Uri,
+    diagnostics: &[Diagnostic],
 ) -> Vec<CodeAction> {
     let mut actions = Vec::new();
 
@@ -25,7 +30,13 @@ pub fn get_code_actions(
     let byte_offset: usize = offset.into();
 
     let makefile = parsed.tree();
-    actions.extend(add_phony_action(&makefile, source_text, byte_offset, uri));
+    actions.extend(add_phony_action(
+        &makefile,
+        source_text,
+        byte_offset,
+        uri,
+        diagnostics,
+    ));
     actions.extend(define_variable_action(
         &makefile,
         source_text,
@@ -113,18 +124,20 @@ fn edit_for_node_change(
 }
 
 /// Offer "Add to .PHONY" for a target name.
+///
+/// Linked to any `missing-phony` diagnostic for that target.
 fn add_phony_action(
     makefile: &Makefile,
     source_text: &str,
     byte_offset: usize,
     uri: &Uri,
+    diagnostics: &[Diagnostic],
 ) -> Option<CodeAction> {
-    // Find if cursor is on a target name at the start of a rule
-    let target = makefile.rules().find_map(|rule| {
-        let rule_range = rule.syntax().text_range();
-        let rule_start: usize = rule_range.start().into();
-        rule.targets()
-            .find(|target| byte_offset >= rule_start && byte_offset < rule_start + target.len())
+    let offset = text_size::TextSize::from(byte_offset as u32);
+    let (target, target_range) = makefile.rules().find_map(|rule| {
+        crate::diagnostics::target_name_ranges(&rule)
+            .into_iter()
+            .find(|(_, range)| range.contains_inclusive(offset))
     })?;
 
     // Skip if already phony
@@ -136,6 +149,16 @@ fn add_phony_action(
     if target.starts_with('.') || target.contains('%') {
         return None;
     }
+
+    let target_lsp_range = text_range_to_lsp_range(source_text, target_range);
+    let fixes: Vec<Diagnostic> = diagnostics
+        .iter()
+        .filter(|d| {
+            d.code == Some(NumberOrString::String("missing-phony".to_string()))
+                && d.range == target_lsp_range
+        })
+        .cloned()
+        .collect();
 
     // Find the insert position: after the last .PHONY line, or at the top of the file
     let edit = if let Some(last_phony) = makefile.rules_by_target(".PHONY").last() {
@@ -165,6 +188,8 @@ fn add_phony_action(
     Some(CodeAction {
         title: format!("Add '{}' to .PHONY", target),
         kind: Some(CodeActionKind::QUICKFIX),
+        is_preferred: (!fixes.is_empty()).then_some(true),
+        diagnostics: (!fixes.is_empty()).then_some(fixes),
         edit: Some(WorkspaceEdit {
             changes: Some(changes),
             ..Default::default()
@@ -875,7 +900,7 @@ mod tests {
         let parsed = Makefile::parse(text);
         let uri: Uri = "file:///test/Makefile".parse().unwrap();
         let range = Range::new(pos, pos);
-        get_code_actions(&parsed, text, range, &uri)
+        get_code_actions(&parsed, text, range, &uri, &[])
     }
 
     #[test]
@@ -897,6 +922,55 @@ mod tests {
         let text = "%.o: %.c\n\t$(CC) -c $<\n";
         let actions = parse_and_actions(text, Position::new(0, 0));
         assert!(!actions.iter().any(|a| a.title.contains(".PHONY")));
+    }
+
+    #[test]
+    fn test_add_phony_action_on_second_target() {
+        let text = "clean distclean:\n\trm -f x\n";
+        let actions = parse_and_actions(text, Position::new(0, 8));
+        let titles: Vec<_> = actions
+            .iter()
+            .filter(|a| a.title.contains(".PHONY"))
+            .map(|a| a.title.as_str())
+            .collect();
+        assert_eq!(titles, vec!["Add 'distclean' to .PHONY"]);
+    }
+
+    #[test]
+    fn test_add_phony_action_linked_to_missing_phony() {
+        let text = "all: foo\n\ttouch foo\n";
+        let parsed = Makefile::parse(text);
+        let uri: Uri = "file:///test/Makefile".parse().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let diagnostics: Vec<_> =
+            crate::diagnostics::get_diagnostics(text, &parsed, Some(dir.path()))
+                .into_iter()
+                .filter(|d| d.code == Some(NumberOrString::String("missing-phony".to_string())))
+                .collect();
+        assert_eq!(diagnostics.len(), 1);
+        let actions = get_code_actions(&parsed, text, diagnostics[0].range, &uri, &diagnostics);
+        let action = actions
+            .iter()
+            .find(|a| a.title == "Add 'all' to .PHONY")
+            .unwrap();
+        assert_eq!(action.diagnostics, Some(diagnostics.clone()));
+        assert_eq!(action.is_preferred, Some(true));
+        assert_eq!(
+            apply_edit(text, only_edit(action)),
+            ".PHONY: all\nall: foo\n\ttouch foo\n"
+        );
+    }
+
+    #[test]
+    fn test_add_phony_action_unlinked_without_diagnostic() {
+        let text = "all: foo\n\ttouch foo\n";
+        let actions = parse_and_actions(text, Position::new(0, 0));
+        let action = actions
+            .iter()
+            .find(|a| a.title == "Add 'all' to .PHONY")
+            .unwrap();
+        assert_eq!(action.diagnostics, None);
+        assert_eq!(action.is_preferred, None);
     }
 
     #[test]

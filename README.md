@@ -62,6 +62,7 @@ Each diagnostic carries a code, so it can be identified in editors:
 | `unused-phony-target` | warning | phony target with no recipe that nothing depends on |
 | `unreferenced-phony-target` | hint | phony target that nothing depends on, other than conventional ones like `all` or `install` |
 | `empty-rule-probably-phony` | hint | rule without prerequisites or recipe that should probably be phony |
+| `missing-phony` | hint | conventional non-file target like `clean` or `install` that is not declared `.PHONY` |
 | `spaces-instead-of-tab` | error | recipe line indented with spaces |
 | `orphan-recipe-line` | error | recipe line outside of any rule |
 | `unterminated-conditional` | error | `ifdef`/`ifeq` without a matching `endif` |
