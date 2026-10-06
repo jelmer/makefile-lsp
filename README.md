@@ -32,6 +32,8 @@ Makefile is never executed.
   enclosing rule, variable or conditional, and the whole file
 - **Semantic tokens** - highlighting for targets, variables, prerequisites,
   recipes and comments
+- **Formatting** - converts space-indented recipes to tabs, trims trailing
+  whitespace where make ignores it, and normalizes the final newline
 - **On-type formatting** - inserts a tab after pressing enter on a rule line
 - **SCIP indexing** - generate a [SCIP](https://github.com/sourcegraph/scip)
   index for code navigation (see below)

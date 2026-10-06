@@ -14,6 +14,7 @@ mod dep_graph;
 mod diagnostics;
 mod document_links;
 mod folding;
+mod formatting;
 mod goto;
 mod highlights;
 mod hover;
@@ -66,6 +67,15 @@ impl Backend {
     }
 }
 
+/// Report a formatting failure as an LSP RequestFailed error.
+fn format_error(e: formatting::FormatError) -> tower_lsp_server::jsonrpc::Error {
+    tower_lsp_server::jsonrpc::Error {
+        code: tower_lsp_server::jsonrpc::ErrorCode::ServerError(-32803),
+        message: e.to_string().into(),
+        data: None,
+    }
+}
+
 /// Extract the parent directory from a `file://` URI, for resolving relative
 /// include paths. Returns None for non-file URIs or URIs without a parent.
 fn uri_to_dir(uri: &Uri) -> Option<std::path::PathBuf> {
@@ -111,6 +121,8 @@ impl LanguageServer for Backend {
                 document_highlight_provider: Some(OneOf::Left(true)),
                 references_provider: Some(OneOf::Left(true)),
                 definition_provider: Some(OneOf::Left(true)),
+                document_formatting_provider: Some(OneOf::Left(true)),
+                document_range_formatting_provider: Some(OneOf::Left(true)),
                 document_on_type_formatting_provider: Some(DocumentOnTypeFormattingOptions {
                     first_trigger_character: "\n".to_string(),
                     more_trigger_character: None,
@@ -499,6 +511,29 @@ impl LanguageServer for Backend {
         drop(files);
 
         Ok(Some(ranges))
+    }
+
+    async fn formatting(&self, params: DocumentFormattingParams) -> Result<Option<Vec<TextEdit>>> {
+        let files = self.files.lock().await;
+        let Some(file_info) = files.get(&params.text_document.uri) else {
+            return Ok(None);
+        };
+        formatting::format_document(&file_info.parsed, &file_info.text)
+            .map(Some)
+            .map_err(format_error)
+    }
+
+    async fn range_formatting(
+        &self,
+        params: DocumentRangeFormattingParams,
+    ) -> Result<Option<Vec<TextEdit>>> {
+        let files = self.files.lock().await;
+        let Some(file_info) = files.get(&params.text_document.uri) else {
+            return Ok(None);
+        };
+        formatting::format_range(&file_info.parsed, &file_info.text, params.range)
+            .map(Some)
+            .map_err(format_error)
     }
 
     async fn on_type_formatting(
