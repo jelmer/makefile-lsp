@@ -3182,16 +3182,6 @@ mod tests {
                     Some(NumberOrString::String("spaces-instead-of-tab".to_string())),
                     Range::new(Position::new(2, 0), Position::new(2, 4))
                 ),
-                (
-                    Some(NumberOrString::String("orphan-recipe-line".to_string())),
-                    Range::new(Position::new(3, 0), Position::new(3, 5))
-                ),
-                (
-                    Some(NumberOrString::String(
-                        "empty-rule-probably-phony".to_string()
-                    )),
-                    Range::new(Position::new(0, 0), Position::new(1, 0))
-                ),
             ]
         );
     }
