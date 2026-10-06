@@ -290,7 +290,7 @@ fn parse_shell_error(stderr: &str) -> (usize, String) {
 /// The range of the `line`th physical line of `recipe`, clamped to its last
 /// line, excluding the leading tab and line ending.
 fn recipe_line_range(source_text: &str, recipe: &Recipe, line: usize) -> Range {
-    let range = recipe.syntax().text_range();
+    let range = recipe.text_range();
     let recipe_text = &source_text[range];
     let lines: Vec<&str> = recipe_text
         .trim_end_matches(['\n', '\r'])
