@@ -1122,11 +1122,11 @@ fn check_mixed_rule_separators(source_text: &str, makefile: &Makefile) -> Vec<Di
     for rule in makefile.rules().filter(|r| r.operator().is_some()) {
         let double_colon = rule.is_double_colon();
         let branches = conditional_branches(rule.syntax());
-        for target in rule.targets() {
+        for (target, range) in targets_with_ranges(&rule) {
             if target.contains('%') {
                 continue;
             }
-            let range = text_range_to_lsp_range(source_text, target_range(&rule, &target));
+            let range = text_range_to_lsp_range(source_text, range);
             let previous = seen.entry(target.clone()).or_default();
             let conflict = previous.iter().find(|p| {
                 p.double_colon != double_colon && !mutually_exclusive(&p.branches, &branches)
@@ -1154,28 +1154,6 @@ fn check_mixed_rule_separators(source_text: &str, makefile: &Makefile) -> Vec<Di
     }
 
     diagnostics
-}
-
-/// The range of `target` in the head of `rule`, or of all its targets if it
-/// is not written literally (e.g. because of a line continuation).
-fn target_range(rule: &Rule, target: &str) -> TextRange {
-    let Some(targets) = rule
-        .syntax()
-        .children()
-        .find(|c| c.kind() == SyntaxKind::TARGETS)
-    else {
-        return rule.syntax().text_range();
-    };
-    let text = targets.text().to_string();
-    let mut offset = 0;
-    for word in text.split(|c: char| c.is_whitespace()) {
-        if word == target {
-            let start = targets.text_range().start() + TextSize::from(offset as u32);
-            return TextRange::at(start, TextSize::of(word));
-        }
-        offset += word.len() + 1;
-    }
-    targets.text_range()
 }
 
 /// Check for duplicate prerequisites within a single rule.
@@ -1308,18 +1286,9 @@ fn check_trailing_whitespace_in_value(source_text: &str, makefile: &Makefile) ->
 /// The names of the plain (non-expression) targets of `rule`, with their
 /// ranges.
 pub fn target_name_ranges(rule: &makefile_lossless::Rule) -> Vec<(String, TextRange)> {
-    let Some(targets) = rule
-        .syntax()
-        .children()
-        .find(|c| c.kind() == SyntaxKind::TARGETS)
-    else {
-        return Vec::new();
-    };
-    targets
-        .children_with_tokens()
-        .filter_map(|c| c.into_token())
-        .filter(|t| t.kind() == SyntaxKind::IDENTIFIER)
-        .map(|t| (t.text().to_string(), t.text_range()))
+    targets_with_ranges(rule)
+        .into_iter()
+        .filter(|(name, _)| !name.contains('$'))
         .collect()
 }
 
@@ -2516,6 +2485,25 @@ mod tests {
     }
 
     #[test]
+    fn test_mixed_rule_separator_target_with_spaces() {
+        assert_eq!(
+            mixed_separator_diags("$(call f, a) b: x\n$(call f, a) b:: y\n"),
+            vec![
+                (
+                    Range::new(Position::new(1, 0), Position::new(1, 12)),
+                    "target '$(call f, a)' has both : and :: rules (first defined with ':' on line 1)"
+                        .to_string()
+                ),
+                (
+                    Range::new(Position::new(1, 13), Position::new(1, 14)),
+                    "target 'b' has both : and :: rules (first defined with ':' on line 1)"
+                        .to_string()
+                )
+            ]
+        );
+    }
+
+    #[test]
     fn test_mixed_rule_separator_pattern_rule_ok() {
         assert_eq!(mixed_separator_diags("%.o: %.c\n%.o:: %.s\n"), vec![]);
     }
@@ -3384,6 +3372,13 @@ mod tests {
             diags[0].range,
             Range::new(Position::new(1, 6), Position::new(1, 15))
         );
+    }
+
+    #[test]
+    fn test_missing_phony_variable_in_target_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = "check$(EXEEXT): foo\n\ttouch $@\n";
+        assert_eq!(missing_phony_diags(text, dir.path()).len(), 0);
     }
 
     #[test]
