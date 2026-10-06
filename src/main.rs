@@ -216,12 +216,13 @@ impl LanguageServer for Backend {
         let uri = &params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
 
-        let Some(doc) = self.document(uri).await else {
+        let Some(files) = self.file_set(uri).await else {
             return Ok(None);
         };
-
-        let makefile = doc.makefile();
-        let completions = completion::get_completions(&makefile, doc.text(), position, doc.dir());
+        let doc = files.current();
+        let makefiles: Vec<makefile_lossless::Makefile> =
+            files.docs().map(|d| d.makefile()).collect();
+        let completions = completion::get_completions(&makefiles, doc.text(), position, doc.dir());
 
         if completions.is_empty() {
             Ok(None)
@@ -282,14 +283,10 @@ impl LanguageServer for Backend {
         let uri = &params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
 
-        let Some(doc) = self.document(uri).await else {
+        let Some(files) = self.file_set(uri).await else {
             return Ok(None);
         };
-
-        let makefile = doc.makefile();
-        let result = hover::get_hover(&makefile, doc.text(), position);
-
-        Ok(result)
+        Ok(hover::get_hover(&files, position))
     }
 
     async fn signature_help(&self, params: SignatureHelpParams) -> Result<Option<SignatureHelp>> {
