@@ -1089,9 +1089,12 @@ fn inline_prerequisite_action(
     }
 
     let graph = crate::dep_graph::DependencyGraph::from_makefile(&makefile);
+    let branches = crate::conditionals::conditional_branches(rule.syntax());
     let via = prereqs.iter().find(|other| {
         other.as_str() != cursor_prereq.as_str()
-            && graph.reachable_from(other).contains(&cursor_prereq)
+            && graph
+                .reachable_from(other, &branches)
+                .contains(&cursor_prereq)
     })?;
     let via = via.clone();
 
@@ -1969,6 +1972,26 @@ mod tests {
         let text = "all: lib main\n\t@:\nmain: lib\n\t@:\nlib:\n\t@:\n";
         let actions = parse_and_actions(text, Position::new(0, 9));
         assert!(find_inline_prereq_action(&actions).is_none());
+    }
+
+    #[test]
+    fn test_inline_prereq_silenced_across_exclusive_branches() {
+        let text = "ifdef X\nb: c\nelse\nall: b c\nendif\nc:\n";
+        let actions = parse_and_actions(text, Position::new(3, 7));
+        assert_eq!(
+            find_inline_prereq_action(&actions).map(|a| a.title.as_str()),
+            None
+        );
+    }
+
+    #[test]
+    fn test_inline_prereq_within_one_branch() {
+        let text = "ifdef X\nb: c\nall: b c\nendif\nc:\n";
+        let actions = parse_and_actions(text, Position::new(2, 7));
+        assert_eq!(
+            find_inline_prereq_action(&actions).map(|a| a.title.as_str()),
+            Some("Inline prerequisite 'c' (already via 'b')")
+        );
     }
 
     #[test]

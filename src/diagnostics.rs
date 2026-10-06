@@ -11,6 +11,7 @@ use text_size::{TextRange, TextSize};
 use tower_lsp_server::ls_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Range};
 
 use crate::builtins;
+use crate::conditionals::{conditional_branches, mutually_exclusive, Branches};
 use crate::position::text_range_to_lsp_range;
 use crate::targets::targets_with_ranges;
 use crate::workspace::{FileSet, Resolution, ResolvedInclude};
@@ -1256,31 +1257,6 @@ fn target_range(rule: &Rule, target: &str) -> TextRange {
     targets.text_range()
 }
 
-/// For each conditional enclosing a node, its range and the index of the
-/// branch the node is in.
-type Branches = Vec<(TextRange, usize)>;
-
-fn conditional_branches(node: &rowan::SyntaxNode<makefile_lossless::Lang>) -> Branches {
-    node.ancestors()
-        .zip(node.ancestors().skip(1))
-        .filter(|(_, parent)| parent.kind() == SyntaxKind::CONDITIONAL)
-        .map(|(child, conditional)| {
-            let branch = conditional
-                .children()
-                .take_while(|c| c != &child)
-                .filter(|c| c.kind() == SyntaxKind::CONDITIONAL_ELSE)
-                .count();
-            (conditional.text_range(), branch)
-        })
-        .collect()
-}
-
-/// Whether two sets of conditional branches can never be taken together.
-fn mutually_exclusive(a: &[(TextRange, usize)], b: &[(TextRange, usize)]) -> bool {
-    a.iter()
-        .any(|(cond, branch)| b.iter().any(|(c, br)| c == cond && br != branch))
-}
-
 /// Check for duplicate prerequisites within a single rule.
 ///
 /// `foo: a b a` is harmless but always a mistake — the duplicate adds no
@@ -1335,6 +1311,7 @@ fn check_redundant_transitive_prerequisites(
             continue;
         }
         let prereq_set: HashSet<&str> = prereqs.iter().map(String::as_str).collect();
+        let branches = conditional_branches(rule.syntax());
 
         let mut reported: HashSet<&str> = HashSet::new();
         for prereq in &prereqs {
@@ -1343,7 +1320,8 @@ fn check_redundant_transitive_prerequisites(
             }
             // Reachable via any *other* prereq in this rule?
             let via = prereq_set.iter().find(|other| {
-                **other != prereq.as_str() && graph.reachable_from(other).contains(prereq)
+                **other != prereq.as_str()
+                    && graph.reachable_from(other, &branches).contains(prereq)
             });
             if let Some(via) = via {
                 let rule_range = text_range_to_lsp_range(source_text, rule.syntax().text_range());
@@ -2173,6 +2151,38 @@ mod tests {
         assert_eq!(diags[0].message, "circular dependency: a -> b -> a");
     }
 
+    fn circular_messages(text: &str) -> Vec<String> {
+        circular_diags(text)
+            .into_iter()
+            .map(|d| d.message)
+            .collect()
+    }
+
+    #[test]
+    fn test_no_circular_dependency_across_exclusive_branches() {
+        let text = "ifdef X\na: b\nelse\nb: a\nendif\n";
+        assert_eq!(circular_messages(text), Vec::<String>::new());
+    }
+
+    #[test]
+    fn test_circular_dependency_within_one_branch() {
+        let text = "ifdef X\na: b\nb: a\nendif\n";
+        assert_eq!(
+            circular_messages(text),
+            vec!["circular dependency: a -> b -> a".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_circular_dependency_behind_exclusive_one() {
+        // a -> b -> a mixes branches, but a -> c -> b -> a does not.
+        let text = "ifdef X\na: b\nelse\nb: a\nendif\na: c\nc: b\n";
+        assert_eq!(
+            circular_messages(text),
+            vec!["circular dependency: a -> c -> b -> a".to_string()]
+        );
+    }
+
     #[test]
     fn test_circular_dependency_ignores_undefined_prereq() {
         // `missing` is a file on disk (or just an error), not a target —
@@ -2416,6 +2426,28 @@ mod tests {
         let text = "all: lib main\n\t@:\nmain:\n\t@:\n";
         let diags = redundant_diags(text);
         assert!(diags.is_empty());
+    }
+
+    fn redundant_messages(text: &str) -> Vec<String> {
+        redundant_diags(text)
+            .into_iter()
+            .map(|d| d.message)
+            .collect()
+    }
+
+    #[test]
+    fn test_redundant_prereq_silenced_across_exclusive_branches() {
+        let text = "ifdef X\nb: c\nelse\nall: b c\nendif\nc:\n";
+        assert_eq!(redundant_messages(text), Vec::<String>::new());
+    }
+
+    #[test]
+    fn test_redundant_prereq_within_one_branch() {
+        let text = "ifdef X\nb: c\nall: b c\nendif\nc:\n";
+        assert_eq!(
+            redundant_messages(text),
+            vec!["prerequisite 'c' is already pulled in transitively via 'b'".to_string()]
+        );
     }
 
     #[test]

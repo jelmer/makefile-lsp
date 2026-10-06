@@ -14,6 +14,10 @@
 use std::collections::{HashMap, HashSet};
 
 use makefile_lossless::Makefile;
+use rowan::ast::AstNode;
+use text_size::TextRange;
+
+use crate::conditionals::{combine, conditional_branches, Branches};
 
 /// Special targets where multiple definitions accumulate prerequisites rather
 /// than redefining the rule.
@@ -64,10 +68,23 @@ pub fn is_conventional_entry_point(name: &str) -> bool {
     CONVENTIONAL_ENTRY_POINTS.contains(&name)
 }
 
+/// A prerequisite edge, with the conditional branches of the rule that
+/// added it.
+#[derive(Debug, Clone, PartialEq)]
+struct Edge {
+    to: String,
+    branches: Branches,
+}
+
 /// Directed graph of target → prerequisites built from a parsed Makefile.
+///
+/// Rules inside conditionals only add edges in their branch. Paths that
+/// would need edges from mutually exclusive branches of a conditional (e.g.
+/// one from an `ifdef` and one from its `else`) are never followed, since
+/// make can never see both rules.
 #[derive(Debug, Default, Clone)]
 pub struct DependencyGraph {
-    edges: HashMap<String, HashSet<String>>,
+    edges: HashMap<String, Vec<Edge>>,
 }
 
 impl DependencyGraph {
@@ -83,20 +100,31 @@ impl DependencyGraph {
             }
         }
 
-        let mut edges: HashMap<String, HashSet<String>> = HashMap::new();
+        let mut edges: HashMap<String, Vec<Edge>> = HashMap::new();
         for rule in makefile.rules() {
             let prereqs: Vec<String> = rule.prerequisites().collect();
+            let branches = conditional_branches(rule.syntax());
             for target in rule.targets() {
                 if !is_graph_target(&target) {
                     continue;
                 }
                 let entry = edges.entry(target.clone()).or_default();
                 for prereq in &prereqs {
-                    if prereq != &target && defined_targets.contains(prereq) {
-                        entry.insert(prereq.clone());
+                    if prereq == &target || !defined_targets.contains(prereq) {
+                        continue;
+                    }
+                    let edge = Edge {
+                        to: prereq.clone(),
+                        branches: branches.clone(),
+                    };
+                    if !entry.contains(&edge) {
+                        entry.push(edge);
                     }
                 }
             }
+        }
+        for entry in edges.values_mut() {
+            entry.sort_by(|a, b| a.to.cmp(&b.to));
         }
 
         Self { edges }
@@ -110,43 +138,46 @@ impl DependencyGraph {
         names.into_iter()
     }
 
-    /// Direct prerequisites of `target` that are themselves targets, in sorted
-    /// order. Returns an empty iterator for unknown or leaf targets.
-    pub fn prerequisites(&self, target: &str) -> impl Iterator<Item = &str> {
-        let mut names: Vec<&str> = self
-            .edges
-            .get(target)
-            .map(|s| s.iter().map(String::as_str).collect())
-            .unwrap_or_default();
-        names.sort();
-        names.into_iter()
-    }
-
     /// Targets that list `target` as a prerequisite, in sorted order. Useful
     /// for reverse-reachability queries (e.g. "is anything depending on me?").
     pub fn referrers(&self, target: &str) -> impl Iterator<Item = &str> {
         let mut names: Vec<&str> = self
             .edges
             .iter()
-            .filter_map(|(k, v)| v.contains(target).then_some(k.as_str()))
+            .filter_map(|(k, v)| v.iter().any(|e| e.to == target).then_some(k.as_str()))
             .collect();
         names.sort();
         names.into_iter()
     }
 
-    /// Targets reachable from `start` by following prerequisite edges, not
-    /// including `start` itself. Returns an empty set if `start` isn't a
-    /// target. Cycle-safe.
-    pub fn reachable_from(&self, start: &str) -> HashSet<String> {
-        let mut seen: HashSet<String> = HashSet::new();
-        let mut stack: Vec<&str> = self.prerequisites(start).collect();
-        while let Some(node) = stack.pop() {
-            if !seen.insert(node.to_string()) {
+    /// Edges out of `node` that can be followed when the conditional
+    /// branches in `context` are taken, sorted by prerequisite, each with the
+    /// branches taken after following it.
+    fn successors(&self, node: &str, context: &[(TextRange, usize)]) -> Vec<(&str, Branches)> {
+        self.edges
+            .get(node)
+            .into_iter()
+            .flatten()
+            .filter_map(|e| Some((e.to.as_str(), combine(context, &e.branches)?)))
+            .collect()
+    }
+
+    /// Targets reachable from `start` by following prerequisite edges that
+    /// can be taken together with the conditional branches in `context`
+    /// (e.g. those of the rule asking), not including `start` itself.
+    /// Returns an empty set if `start` isn't a target. Cycle-safe.
+    pub fn reachable_from(&self, start: &str, context: &[(TextRange, usize)]) -> HashSet<String> {
+        let mut reached: HashSet<String> = HashSet::new();
+        let mut visited: HashSet<(&str, Branches)> = HashSet::new();
+        let mut stack = self.successors(start, context);
+        while let Some((node, branches)) = stack.pop() {
+            if !visited.insert((node, branches.clone())) {
                 continue;
             }
-            stack.extend(self.prerequisites(node));
+            reached.insert(node.to_string());
+            stack.extend(self.successors(node, &branches));
         }
-        seen
+        reached
     }
 
     /// Length of the longest path from `target` down through the dependency
@@ -156,99 +187,81 @@ impl DependencyGraph {
     /// Cycle-safe: a back-edge into a node already on the DFS stack contributes
     /// nothing, so the result is well-defined even for malformed graphs.
     pub fn longest_path_length(&self, target: &str) -> usize {
-        let mut memo: HashMap<&str, usize> = HashMap::new();
+        let mut memo: HashMap<(&str, Branches), usize> = HashMap::new();
         let mut on_stack: HashSet<&str> = HashSet::new();
-        self.longest_from(target, &mut memo, &mut on_stack)
+        self.longest_from(target, Vec::new(), &mut memo, &mut on_stack)
     }
 
     fn longest_from<'a>(
         &'a self,
         node: &'a str,
-        memo: &mut HashMap<&'a str, usize>,
+        context: Branches,
+        memo: &mut HashMap<(&'a str, Branches), usize>,
         on_stack: &mut HashSet<&'a str>,
     ) -> usize {
-        if let Some(&d) = memo.get(node) {
+        if let Some(&d) = memo.get(&(node, context.clone())) {
             return d;
         }
         if !on_stack.insert(node) {
             return 0;
         }
-        let mut best = 0;
-        if let Some(edges) = self.edges.get(node) {
-            for next in edges {
-                let d = 1 + self.longest_from(next, memo, on_stack);
-                if d > best {
-                    best = d;
-                }
-            }
-        }
+        let best = self
+            .successors(node, &context)
+            .into_iter()
+            .map(|(next, branches)| 1 + self.longest_from(next, branches, memo, on_stack))
+            .max()
+            .unwrap_or(0);
         on_stack.remove(node);
-        memo.insert(node, best);
+        memo.insert((node, context), best);
         best
     }
 
-    /// Find all simple cycles of length ≥ 2 in the graph.
+    /// Find simple cycles of length ≥ 2 in the graph.
     ///
     /// Each cycle is returned as the list of target names visited, with the
     /// smallest name first (canonical rotation) so equivalent rotations dedupe.
     /// Self-loops are not returned — callers that care about them should check
     /// for `prereq == target` separately. Cycles are returned in the order a
     /// depth-first walk over sorted nodes discovers them.
+    ///
+    /// The walk visits each target once per set of conditional branches it
+    /// can be reached with, so a cycle is only found along edges that can be
+    /// taken together.
     pub fn find_cycles(&self) -> Vec<Vec<String>> {
-        #[derive(Clone, Copy, PartialEq)]
-        enum State {
-            Unvisited,
-            OnStack,
-            Done,
-        }
-
-        let mut state: HashMap<&str, State> = self
-            .edges
-            .keys()
-            .map(|k| (k.as_str(), State::Unvisited))
-            .collect();
+        let mut done: HashSet<(&str, Branches)> = HashSet::new();
         let mut reported: HashSet<Vec<String>> = HashSet::new();
         let mut cycles: Vec<Vec<String>> = Vec::new();
 
-        let nodes: Vec<&str> = self.targets().collect();
-
-        for start in nodes {
-            if state.get(start).copied() != Some(State::Unvisited) {
+        for start in self.targets() {
+            if done.contains(&(start, Vec::new())) {
                 continue;
             }
             let mut path: Vec<&str> = vec![start];
-            let mut stack: Vec<(&str, std::vec::IntoIter<&str>)> = Vec::new();
-            let succs: Vec<&str> = self.prerequisites(start).collect();
-            state.insert(start, State::OnStack);
-            stack.push((start, succs.into_iter()));
+            let mut stack = vec![(
+                start,
+                Branches::new(),
+                self.successors(start, &[]).into_iter(),
+            )];
 
-            while let Some((_node, iter)) = stack.last_mut() {
-                if let Some(next) = iter.next() {
-                    match state.get(next).copied().unwrap_or(State::Done) {
-                        State::Unvisited => {
-                            let next_succs: Vec<&str> = self.prerequisites(next).collect();
-                            state.insert(next, State::OnStack);
-                            path.push(next);
-                            stack.push((next, next_succs.into_iter()));
-                        }
-                        State::OnStack => {
-                            let idx = path.iter().position(|n| *n == next).unwrap();
-                            let cycle: Vec<String> =
-                                path[idx..].iter().map(|s| s.to_string()).collect();
-                            let min_pos =
-                                cycle.iter().enumerate().min_by_key(|(_, n)| *n).unwrap().0;
-                            let mut canon: Vec<String> = cycle[min_pos..].to_vec();
-                            canon.extend_from_slice(&cycle[..min_pos]);
-                            if reported.insert(canon.clone()) {
-                                cycles.push(canon);
-                            }
-                        }
-                        State::Done => {}
-                    }
-                } else {
-                    let (node, _) = stack.pop().unwrap();
-                    state.insert(node, State::Done);
+            while let Some((_, _, iter)) = stack.last_mut() {
+                let Some((next, branches)) = iter.next() else {
+                    let (node, context, _) = stack.pop().unwrap();
+                    done.insert((node, context));
                     path.pop();
+                    continue;
+                };
+                if let Some(idx) = path.iter().position(|n| *n == next) {
+                    let cycle: Vec<String> = path[idx..].iter().map(|s| s.to_string()).collect();
+                    let min_pos = cycle.iter().enumerate().min_by_key(|(_, n)| *n).unwrap().0;
+                    let mut canon: Vec<String> = cycle[min_pos..].to_vec();
+                    canon.extend_from_slice(&cycle[..min_pos]);
+                    if reported.insert(canon.clone()) {
+                        cycles.push(canon);
+                    }
+                } else if !done.contains(&(next, branches.clone())) {
+                    let succs = self.successors(next, &branches);
+                    path.push(next);
+                    stack.push((next, branches, succs.into_iter()));
                 }
             }
         }
@@ -267,6 +280,13 @@ mod tests {
         DependencyGraph::from_makefile(&parsed.tree())
     }
 
+    fn prereqs<'a>(g: &'a DependencyGraph, target: &str) -> Vec<&'a str> {
+        g.successors(target, &[])
+            .into_iter()
+            .map(|(p, _)| p)
+            .collect()
+    }
+
     #[test]
     fn empty_makefile_has_no_edges() {
         let g = graph("");
@@ -277,16 +297,13 @@ mod tests {
     #[test]
     fn prerequisites_only_include_defined_targets() {
         let g = graph("a: b missing\n\t@:\nb:\n\t@:\n");
-        let prereqs: Vec<&str> = g.prerequisites("a").collect();
-        assert_eq!(prereqs, vec!["b"]);
+        assert_eq!(prereqs(&g, "a"), vec!["b"]);
     }
 
     #[test]
     fn accumulates_prereqs_across_rules() {
         let g = graph("a: b\n\t@:\nb:\n\t@:\na: c\nc:\n\t@:\n");
-        let mut prereqs: Vec<&str> = g.prerequisites("a").collect();
-        prereqs.sort();
-        assert_eq!(prereqs, vec!["b", "c"]);
+        assert_eq!(prereqs(&g, "a"), vec!["b", "c"]);
     }
 
     #[test]
@@ -316,19 +333,58 @@ mod tests {
     #[test]
     fn reachable_from_returns_transitive_closure() {
         let g = graph("a: b\n\t@:\nb: c d\n\t@:\nc:\n\t@:\nd:\n\t@:\n");
-        let mut reached: Vec<String> = g.reachable_from("a").into_iter().collect();
+        let mut reached: Vec<String> = g.reachable_from("a", &[]).into_iter().collect();
         reached.sort();
         assert_eq!(reached, vec!["b", "c", "d"]);
-        assert!(g.reachable_from("c").is_empty());
-        assert!(g.reachable_from("missing").is_empty());
+        assert!(g.reachable_from("c", &[]).is_empty());
+        assert!(g.reachable_from("missing", &[]).is_empty());
     }
 
     #[test]
     fn reachable_from_handles_cycles() {
         let g = graph("a: b\n\t@:\nb: a\n\t@:\n");
-        let reached = g.reachable_from("a");
+        let reached = g.reachable_from("a", &[]);
         assert!(reached.contains("a"));
         assert!(reached.contains("b"));
+    }
+
+    #[test]
+    fn reachable_from_respects_context() {
+        let text = "ifdef X\nb: c\nelse\nall: b\nendif\nc:\n";
+        let parsed: Parse<Makefile> = Makefile::parse(text);
+        let makefile = parsed.tree();
+        let g = DependencyGraph::from_makefile(&makefile);
+        let all_rule = makefile.rules_by_target("all").next().unwrap();
+        let else_branch = conditional_branches(all_rule.syntax());
+        assert_eq!(g.reachable_from("b", &[]), HashSet::from(["c".to_string()]));
+        assert_eq!(g.reachable_from("b", &else_branch), HashSet::new());
+    }
+
+    #[test]
+    fn reachable_from_skips_paths_across_branches() {
+        let g = graph("ifdef X\na: b\nelse\nb: c\nendif\nc:\n");
+        assert_eq!(g.reachable_from("a", &[]), HashSet::from(["b".to_string()]));
+    }
+
+    #[test]
+    fn no_cycle_across_nested_exclusive_branches() {
+        let g = graph("ifdef X\nifdef Y\na: b\nendif\nelse\nb: a\nendif\n");
+        assert_eq!(g.find_cycles(), Vec::<Vec<String>>::new());
+    }
+
+    #[test]
+    fn cycle_across_unrelated_conditionals() {
+        let g = graph("ifdef X\na: b\nendif\nifdef Y\nb: a\nendif\n");
+        assert_eq!(
+            g.find_cycles(),
+            vec![vec!["a".to_string(), "b".to_string()]]
+        );
+    }
+
+    #[test]
+    fn referrers_include_all_branches() {
+        let g = graph("ifdef X\na: c\nelse\nb: c\nendif\nc:\n");
+        assert_eq!(g.referrers("c").collect::<Vec<_>>(), vec!["a", "b"]);
     }
 
     #[test]
