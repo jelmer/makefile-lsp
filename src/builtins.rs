@@ -587,3 +587,8 @@ pub const DIRECTIVES: &[Directive] = &[
 
 /// Directives that open a conditional, valid after `else`.
 pub const CONDITIONAL_DIRECTIVES: &[&str] = &["ifeq", "ifneq", "ifdef", "ifndef"];
+
+/// Find a directive by name.
+pub fn find_directive(name: &str) -> Option<&'static Directive> {
+    DIRECTIVES.iter().find(|d| d.name == name)
+}
