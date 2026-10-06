@@ -1,6 +1,5 @@
 //! Makefile Language Server Protocol implementation.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tower_lsp_server::jsonrpc::Result;
@@ -27,38 +26,35 @@ mod selection_ranges;
 mod semantic;
 mod signature_help;
 mod symbols;
+mod workspace;
 
 use position::try_lsp_range_to_text_range;
-
-/// Information about an open file.
-struct FileInfo {
-    /// The current source text.
-    text: String,
-    /// The parsed makefile (green node for thread safety).
-    parsed: makefile_lossless::Parse<makefile_lossless::Makefile>,
-}
+use workspace::{Document, FileSet, Workspace};
 
 struct Backend {
     client: Client,
-    files: Arc<Mutex<HashMap<Uri, FileInfo>>>,
+    workspace: Arc<Mutex<Workspace>>,
 }
 
 impl Backend {
     fn new(client: Client) -> Self {
         Self {
             client,
-            files: Arc::new(Mutex::new(HashMap::new())),
+            workspace: Arc::new(Mutex::new(Workspace::new())),
         }
     }
 
-    async fn update_file(&self, uri: Uri, text: String) {
-        let parsed = makefile_lossless::Makefile::parse(&text);
-        let base_dir = uri_to_dir(&uri);
-        let diagnostics = diagnostics::get_diagnostics(&text, &parsed, base_dir.as_deref());
+    async fn document(&self, uri: &Uri) -> Option<Arc<Document>> {
+        self.workspace.lock().await.document(uri)
+    }
 
-        let mut files = self.files.lock().await;
-        files.insert(uri.clone(), FileInfo { text, parsed });
-        drop(files);
+    async fn file_set(&self, uri: &Uri) -> Option<FileSet> {
+        self.workspace.lock().await.file_set(uri)
+    }
+
+    async fn update_file(&self, uri: Uri, text: String) {
+        let doc = self.workspace.lock().await.open(uri.clone(), text);
+        let diagnostics = diagnostics::get_diagnostics(doc.text(), doc.parsed(), doc.dir());
 
         self.client
             .publish_diagnostics(uri, diagnostics, None)
@@ -66,19 +62,22 @@ impl Backend {
     }
 }
 
-/// Extract the parent directory from a `file://` URI, for resolving relative
-/// include paths. Returns None for non-file URIs or URIs without a parent.
-fn uri_to_dir(uri: &Uri) -> Option<std::path::PathBuf> {
-    if uri.scheme().as_str() != "file" {
-        return None;
-    }
-    let path = uri.path();
-    let pb = std::path::PathBuf::from(path.as_str());
-    pb.parent().map(|p| p.to_path_buf())
-}
-
 impl LanguageServer for Backend {
-    async fn initialize(&self, _: InitializeParams) -> Result<InitializeResult> {
+    async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
+        #[allow(deprecated)]
+        let root_uri = params.root_uri.as_ref();
+        let roots = match &params.workspace_folders {
+            Some(folders) => folders
+                .iter()
+                .filter_map(|f| workspace::file_path(&f.uri))
+                .collect(),
+            None => root_uri
+                .and_then(workspace::file_path)
+                .into_iter()
+                .collect(),
+        };
+        self.workspace.lock().await.set_roots(roots);
+
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
                 text_document_sync: Some(TextDocumentSyncCapability::Kind(
@@ -169,6 +168,10 @@ impl LanguageServer for Backend {
             .await;
     }
 
+    async fn did_close(&self, params: DidCloseTextDocumentParams) {
+        self.workspace.lock().await.close(&params.text_document.uri);
+    }
+
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
         let uri = params.text_document.uri;
 
@@ -176,9 +179,11 @@ impl LanguageServer for Backend {
             return;
         }
 
-        let files = self.files.lock().await;
-        let mut text = files.get(&uri).map(|f| f.text.clone()).unwrap_or_default();
-        drop(files);
+        let mut text = self
+            .document(&uri)
+            .await
+            .map(|d| d.text().to_string())
+            .unwrap_or_default();
 
         let mut _changed_range: Option<text_size::TextRange> = None;
 
@@ -211,16 +216,12 @@ impl LanguageServer for Backend {
         let uri = &params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
 
-        let files = self.files.lock().await;
-        let Some(file_info) = files.get(uri) else {
+        let Some(doc) = self.document(uri).await else {
             return Ok(None);
         };
 
-        let makefile = file_info.parsed.tree();
-        let base_dir = uri_to_dir(uri);
-        let completions =
-            completion::get_completions(&makefile, &file_info.text, position, base_dir.as_deref());
-        drop(files);
+        let makefile = doc.makefile();
+        let completions = completion::get_completions(&makefile, doc.text(), position, doc.dir());
 
         if completions.is_empty() {
             Ok(None)
@@ -236,14 +237,12 @@ impl LanguageServer for Backend {
         let uri = &params.text_document.uri;
         let position = params.position;
 
-        let files = self.files.lock().await;
-        let Some(file_info) = files.get(uri) else {
+        let Some(doc) = self.document(uri).await else {
             return Ok(None);
         };
 
-        let makefile = file_info.parsed.tree();
-        let result = rename::prepare_rename(&makefile, &file_info.text, position);
-        drop(files);
+        let makefile = doc.makefile();
+        let result = rename::prepare_rename(&makefile, doc.text(), position);
 
         Ok(result)
     }
@@ -252,14 +251,12 @@ impl LanguageServer for Backend {
         let uri = &params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
 
-        let files = self.files.lock().await;
-        let Some(file_info) = files.get(uri) else {
+        let Some(doc) = self.document(uri).await else {
             return Ok(None);
         };
 
-        let makefile = file_info.parsed.tree();
-        let result = rename::rename(&makefile, &file_info.text, position, &params.new_name, uri);
-        drop(files);
+        let makefile = doc.makefile();
+        let result = rename::rename(&makefile, doc.text(), position, &params.new_name, uri);
 
         Ok(result)
     }
@@ -268,20 +265,18 @@ impl LanguageServer for Backend {
         let uri = &params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
 
-        let files = self.files.lock().await;
-        let Some(file_info) = files.get(uri) else {
+        let Some(doc) = self.document(uri).await else {
             return Ok(None);
         };
 
-        let makefile = file_info.parsed.tree();
+        let makefile = doc.makefile();
         let refs = references::find_references(
             &makefile,
-            &file_info.text,
+            doc.text(),
             position,
             uri,
             params.context.include_declaration,
         );
-        drop(files);
 
         if refs.is_empty() {
             Ok(None)
@@ -294,14 +289,12 @@ impl LanguageServer for Backend {
         let uri = &params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
 
-        let files = self.files.lock().await;
-        let Some(file_info) = files.get(uri) else {
+        let Some(doc) = self.document(uri).await else {
             return Ok(None);
         };
 
-        let makefile = file_info.parsed.tree();
-        let result = hover::get_hover(&makefile, &file_info.text, position);
-        drop(files);
+        let makefile = doc.makefile();
+        let result = hover::get_hover(&makefile, doc.text(), position);
 
         Ok(result)
     }
@@ -310,14 +303,12 @@ impl LanguageServer for Backend {
         let uri = &params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
 
-        let files = self.files.lock().await;
-        let Some(file_info) = files.get(uri) else {
+        let Some(doc) = self.document(uri).await else {
             return Ok(None);
         };
 
-        let makefile = file_info.parsed.tree();
-        let result = signature_help::get_signature_help(&makefile, &file_info.text, position);
-        drop(files);
+        let makefile = doc.makefile();
+        let result = signature_help::get_signature_help(&makefile, doc.text(), position);
 
         Ok(result)
     }
@@ -329,14 +320,12 @@ impl LanguageServer for Backend {
         let uri = &params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
 
-        let files = self.files.lock().await;
-        let Some(file_info) = files.get(uri) else {
+        let Some(doc) = self.document(uri).await else {
             return Ok(None);
         };
 
-        let makefile = file_info.parsed.tree();
-        let result = goto::goto_definition(&makefile, &file_info.text, position, uri);
-        drop(files);
+        let makefile = doc.makefile();
+        let result = goto::goto_definition(&makefile, doc.text(), position, uri);
 
         Ok(result)
     }
@@ -345,14 +334,11 @@ impl LanguageServer for Backend {
         let uri = &params.text_document.uri;
         let range = params.range;
 
-        let files = self.files.lock().await;
-        let Some(file_info) = files.get(uri) else {
+        let Some(doc) = self.document(uri).await else {
             return Ok(None);
         };
 
-        let actions =
-            code_actions::get_code_actions(&file_info.parsed, &file_info.text, range, uri);
-        drop(files);
+        let actions = code_actions::get_code_actions(doc.parsed(), doc.text(), range, uri);
 
         if actions.is_empty() {
             Ok(None)
@@ -367,16 +353,10 @@ impl LanguageServer for Backend {
     }
 
     async fn document_link(&self, params: DocumentLinkParams) -> Result<Option<Vec<DocumentLink>>> {
-        let uri = &params.text_document.uri;
-
-        let files = self.files.lock().await;
-        let Some(file_info) = files.get(uri) else {
+        let Some(files) = self.file_set(&params.text_document.uri).await else {
             return Ok(None);
         };
-
-        let makefile = file_info.parsed.tree();
-        let links = document_links::get_document_links(&makefile, &file_info.text, uri);
-        drop(files);
+        let links = document_links::get_document_links(&files);
 
         if links.is_empty() {
             Ok(None)
@@ -392,14 +372,12 @@ impl LanguageServer for Backend {
         let uri = &params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
 
-        let files = self.files.lock().await;
-        let Some(file_info) = files.get(uri) else {
+        let Some(doc) = self.document(uri).await else {
             return Ok(None);
         };
 
-        let makefile = file_info.parsed.tree();
-        let hl = highlights::get_highlights(&makefile, &file_info.text, position, uri);
-        drop(files);
+        let makefile = doc.makefile();
+        let hl = highlights::get_highlights(&makefile, doc.text(), position, uri);
 
         if hl.is_empty() {
             Ok(None)
@@ -412,14 +390,12 @@ impl LanguageServer for Backend {
         let uri = &params.text_document.uri;
         let range = params.range;
 
-        let files = self.files.lock().await;
-        let Some(file_info) = files.get(uri) else {
+        let Some(doc) = self.document(uri).await else {
             return Ok(None);
         };
 
-        let makefile = file_info.parsed.tree();
-        let hints = inlay_hints::get_inlay_hints(&makefile, &file_info.text, range);
-        drop(files);
+        let makefile = doc.makefile();
+        let hints = inlay_hints::get_inlay_hints(&makefile, doc.text(), range);
 
         if hints.is_empty() {
             Ok(None)
@@ -434,14 +410,12 @@ impl LanguageServer for Backend {
     ) -> Result<Option<SemanticTokensResult>> {
         let uri = &params.text_document.uri;
 
-        let files = self.files.lock().await;
-        let Some(file_info) = files.get(uri) else {
+        let Some(doc) = self.document(uri).await else {
             return Ok(None);
         };
 
-        let makefile = file_info.parsed.tree();
-        let tokens = semantic::generate_semantic_tokens(&makefile, &file_info.text);
-        drop(files);
+        let makefile = doc.makefile();
+        let tokens = semantic::generate_semantic_tokens(&makefile, doc.text());
 
         Ok(Some(SemanticTokensResult::Tokens(SemanticTokens {
             result_id: None,
@@ -455,14 +429,12 @@ impl LanguageServer for Backend {
     ) -> Result<Option<DocumentSymbolResponse>> {
         let uri = &params.text_document.uri;
 
-        let files = self.files.lock().await;
-        let Some(file_info) = files.get(uri) else {
+        let Some(doc) = self.document(uri).await else {
             return Ok(None);
         };
 
-        let makefile = file_info.parsed.tree();
-        let symbols = symbols::generate_document_symbols(&makefile, &file_info.text);
-        drop(files);
+        let makefile = doc.makefile();
+        let symbols = symbols::generate_document_symbols(&makefile, doc.text());
 
         Ok(Some(DocumentSymbolResponse::Nested(symbols)))
     }
@@ -470,14 +442,12 @@ impl LanguageServer for Backend {
     async fn folding_range(&self, params: FoldingRangeParams) -> Result<Option<Vec<FoldingRange>>> {
         let uri = &params.text_document.uri;
 
-        let files = self.files.lock().await;
-        let Some(file_info) = files.get(uri) else {
+        let Some(doc) = self.document(uri).await else {
             return Ok(None);
         };
 
-        let makefile = file_info.parsed.tree();
-        let ranges = folding::generate_folding_ranges(&makefile, &file_info.text);
-        drop(files);
+        let makefile = doc.makefile();
+        let ranges = folding::generate_folding_ranges(&makefile, doc.text());
 
         Ok(Some(ranges))
     }
@@ -488,15 +458,13 @@ impl LanguageServer for Backend {
     ) -> Result<Option<Vec<SelectionRange>>> {
         let uri = &params.text_document.uri;
 
-        let files = self.files.lock().await;
-        let Some(file_info) = files.get(uri) else {
+        let Some(doc) = self.document(uri).await else {
             return Ok(None);
         };
 
-        let makefile = file_info.parsed.tree();
+        let makefile = doc.makefile();
         let ranges =
-            selection_ranges::get_selection_ranges(&makefile, &file_info.text, &params.positions);
-        drop(files);
+            selection_ranges::get_selection_ranges(&makefile, doc.text(), &params.positions);
 
         Ok(Some(ranges))
     }
@@ -518,20 +486,17 @@ impl LanguageServer for Backend {
             return Ok(None);
         }
 
-        let files = self.files.lock().await;
-        let Some(file_info) = files.get(uri) else {
+        let Some(doc) = self.document(uri).await else {
             return Ok(None);
         };
 
         let prev_line_idx = (position.line - 1) as usize;
-        let prev_line = file_info.text.lines().nth(prev_line_idx).unwrap_or("");
+        let prev_line = doc.text().lines().nth(prev_line_idx).unwrap_or("");
 
         // If the previous line is a rule header (has : but not =, and doesn't start with tab),
         // insert a tab at the cursor position
         let is_rule_header =
             !prev_line.starts_with('\t') && prev_line.contains(':') && !prev_line.contains('=');
-
-        drop(files);
 
         if is_rule_header {
             Ok(Some(vec![TextEdit {
