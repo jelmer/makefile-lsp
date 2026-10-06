@@ -2,29 +2,48 @@
 
 use makefile_lossless::{is_in_prerequisites, variable_at_offset, word_at_offset, Makefile};
 use rowan::ast::AstNode;
-use tower_lsp_server::ls_types::{GotoDefinitionResponse, Location, Position, Uri};
+use tower_lsp_server::ls_types::{GotoDefinitionResponse, Location, Position, Range, Uri};
 
 use crate::position::{text_range_to_lsp_range, try_position_to_offset};
+use crate::workspace::{FileSet, Resolution};
 
 /// Find the definition of the symbol at the given position.
-pub fn goto_definition(
-    makefile: &Makefile,
-    source_text: &str,
-    position: Position,
-    uri: &Uri,
-) -> Option<GotoDefinitionResponse> {
+///
+/// Definitions in the current document win; otherwise the first definition
+/// in the other documents, in the order make reads them, is used. On an
+/// include file name this jumps to the included file.
+pub fn goto_definition(files: &FileSet, position: Position) -> Option<GotoDefinitionResponse> {
+    let source_text = files.current().text();
     let offset = try_position_to_offset(source_text, position)?;
     let byte_offset: usize = offset.into();
 
     // Check if cursor is inside a variable reference $(VAR) or ${VAR}
     if let Some(var_name) = variable_at_offset(source_text, byte_offset) {
-        return find_variable_definition(makefile, source_text, var_name, uri);
+        return files.docs().find_map(|doc| {
+            find_variable_definition(&doc.makefile(), doc.text(), var_name, doc.uri())
+        });
+    }
+
+    if let Some(inc) = files.include_at(offset) {
+        let (Resolution::Found(path) | Resolution::Unreadable(path, _)) = &inc.resolution else {
+            return None;
+        };
+        let Some(uri) = Uri::from_file_path(path) else {
+            tracing::warn!("unable to convert {} to a URI", path.display());
+            return None;
+        };
+        return Some(GotoDefinitionResponse::Scalar(Location {
+            uri,
+            range: Range::default(),
+        }));
     }
 
     // Check if cursor is on a word in the prerequisites area
     if is_in_prerequisites(source_text, byte_offset) {
         if let Some(word) = word_at_offset(source_text, byte_offset) {
-            return find_target_definition(makefile, source_text, word, uri);
+            return files.docs().find_map(|doc| {
+                find_target_definition(&doc.makefile(), doc.text(), word, doc.uri())
+            });
         }
     }
 
@@ -72,15 +91,19 @@ fn find_variable_definition(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::workspace::tests::Fixture;
+    use crate::workspace::Document;
 
     fn test_uri() -> Uri {
         "file:///test/Makefile".parse().unwrap()
     }
 
+    fn single(text: &str) -> FileSet {
+        FileSet::single(Document::new(test_uri(), text.to_string()))
+    }
+
     fn assert_goto_line(text: &str, pos: Position, expected_line: u32) {
-        let parsed = Makefile::parse(text);
-        let makefile = parsed.tree();
-        let result = goto_definition(&makefile, text, pos, &test_uri());
+        let result = goto_definition(&single(text), pos);
         match result {
             Some(GotoDefinitionResponse::Scalar(loc)) => {
                 assert_eq!(loc.range.start.line, expected_line);
@@ -91,9 +114,7 @@ mod tests {
     }
 
     fn assert_goto_none(text: &str, pos: Position) {
-        let parsed = Makefile::parse(text);
-        let makefile = parsed.tree();
-        let result = goto_definition(&makefile, text, pos, &test_uri());
+        let result = goto_definition(&single(text), pos);
         assert!(result.is_none(), "Expected None, got {:?}", result);
     }
 
@@ -125,5 +146,83 @@ mod tests {
     #[test]
     fn test_goto_undefined_variable() {
         assert_goto_none("all:\n\t$(UNDEFINED) foo\n", Position::new(1, 3));
+    }
+
+    fn goto(fx: &Fixture, name: &str, pos: Position) -> Option<Location> {
+        match goto_definition(&fx.file_set(name), pos) {
+            Some(GotoDefinitionResponse::Scalar(loc)) => Some(loc),
+            Some(other) => panic!("Expected scalar response, got {:?}", other),
+            None => None,
+        }
+    }
+
+    #[test]
+    fn test_goto_variable_in_included_file() {
+        let fx = Fixture::new(&[
+            ("Makefile", "include rules.mk\nall:\n\t$(CC) x\n"),
+            ("rules.mk", "\nCC = gcc\n"),
+        ]);
+        assert_eq!(
+            goto(&fx, "Makefile", Position::new(2, 3)),
+            Some(Location {
+                uri: fx.uri("rules.mk"),
+                range: Range::new(Position::new(1, 0), Position::new(2, 0)),
+            })
+        );
+    }
+
+    #[test]
+    fn test_goto_prefers_current_file() {
+        let fx = Fixture::new(&[
+            (
+                "Makefile",
+                "include rules.mk\nCC = clang\nall:\n\t$(CC) x\n",
+            ),
+            ("rules.mk", "CC = gcc\n"),
+        ]);
+        let loc = goto(&fx, "Makefile", Position::new(3, 3)).unwrap();
+        assert_eq!((loc.uri, loc.range.start.line), (fx.uri("Makefile"), 1));
+    }
+
+    #[test]
+    fn test_goto_target_in_included_file() {
+        let fx = Fixture::new(&[
+            ("Makefile", "include sub/rules.mk\nall: build\n"),
+            ("sub/rules.mk", "build:\n\techo\n"),
+        ]);
+        let loc = goto(&fx, "Makefile", Position::new(1, 6)).unwrap();
+        assert_eq!((loc.uri, loc.range.start.line), (fx.uri("sub/rules.mk"), 0));
+    }
+
+    #[test]
+    fn test_goto_include_path() {
+        let fx = Fixture::new(&[("Makefile", "include a.mk b.mk\n"), ("b.mk", "")]);
+        assert_eq!(
+            goto(&fx, "Makefile", Position::new(0, 14)),
+            Some(Location {
+                uri: fx.uri("b.mk"),
+                range: Range::default(),
+            })
+        );
+        // a.mk doesn't exist.
+        assert_eq!(goto(&fx, "Makefile", Position::new(0, 9)), None);
+    }
+
+    #[test]
+    fn test_goto_from_included_file_to_includer() {
+        let fx = Fixture::new(&[
+            ("Makefile", "CC = gcc\ninclude rules.mk\n"),
+            ("rules.mk", "all:\n\t$(CC) x\n"),
+        ]);
+        let (mut ws, makefile) = fx.open("Makefile");
+        ws.file_set(&makefile).unwrap();
+        let rules = fx.open_in(&mut ws, "rules.mk");
+        let set = ws.file_set(&rules).unwrap();
+        match goto_definition(&set, Position::new(1, 3)) {
+            Some(GotoDefinitionResponse::Scalar(loc)) => {
+                assert_eq!((loc.uri, loc.range.start.line), (makefile, 0));
+            }
+            other => panic!("Expected scalar response, got {:?}", other),
+        }
     }
 }

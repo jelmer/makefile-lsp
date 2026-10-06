@@ -402,13 +402,34 @@ pub struct FileSet {
 }
 
 impl FileSet {
+    /// A file set containing just `doc`, with no include information.
+    #[cfg(test)]
+    pub fn single(doc: Document) -> Self {
+        Self {
+            docs: vec![Arc::new(doc)],
+            includes: Vec::new(),
+        }
+    }
+
     pub fn current(&self) -> &Document {
         &self.docs[0]
+    }
+
+    /// All documents, starting with the current one.
+    pub fn docs(&self) -> impl Iterator<Item = &Document> {
+        self.docs.iter().map(|d| d.as_ref())
     }
 
     /// The include directives of the current document.
     pub fn includes(&self) -> &[ResolvedInclude] {
         &self.includes
+    }
+
+    /// The include file name at `offset` in the current document.
+    pub fn include_at(&self, offset: TextSize) -> Option<&ResolvedInclude> {
+        self.includes
+            .iter()
+            .find(|i| i.path.range.contains_inclusive(offset))
     }
 }
 

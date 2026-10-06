@@ -348,18 +348,11 @@ impl LanguageServer for Backend {
         let uri = &params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
 
-        let Some(doc) = self.document(uri).await else {
+        let Some(files) = self.file_set(uri).await else {
             return Ok(None);
         };
-
-        let makefile = doc.makefile();
-        let refs = references::find_references(
-            &makefile,
-            doc.text(),
-            position,
-            uri,
-            params.context.include_declaration,
-        );
+        let refs =
+            references::find_references(&files, position, params.context.include_declaration);
 
         if refs.is_empty() {
             Ok(None)
@@ -403,14 +396,10 @@ impl LanguageServer for Backend {
         let uri = &params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
 
-        let Some(doc) = self.document(uri).await else {
+        let Some(files) = self.file_set(uri).await else {
             return Ok(None);
         };
-
-        let makefile = doc.makefile();
-        let result = goto::goto_definition(&makefile, doc.text(), position, uri);
-
-        Ok(result)
+        Ok(goto::goto_definition(&files, position))
     }
 
     async fn code_action(&self, params: CodeActionParams) -> Result<Option<CodeActionResponse>> {

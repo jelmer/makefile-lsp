@@ -5,7 +5,7 @@
 use makefile_lossless::Makefile;
 use tower_lsp_server::ls_types::{DocumentHighlight, DocumentHighlightKind, Position, Uri};
 
-use crate::references::find_references;
+use crate::references::find_document_references;
 
 /// Find all highlights for the symbol at the given position.
 ///
@@ -17,7 +17,7 @@ pub fn get_highlights(
     position: Position,
     uri: &Uri,
 ) -> Vec<DocumentHighlight> {
-    let locations = find_references(makefile, source_text, position, uri, true);
+    let locations = find_document_references(makefile, source_text, position, uri, true);
 
     locations
         .into_iter()
