@@ -57,3 +57,44 @@ fn test_check_missing_path() {
         .unwrap();
     assert_eq!(output.status.code(), Some(2));
 }
+
+#[test]
+fn test_check_follows_includes() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("Makefile"),
+        "all: $(OBJ)\n\techo $(OBJ)\ninclude rules.mk\n",
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("rules.mk"), "OBJ = x.o\nx.o:\n\ttouch $@\n").unwrap();
+
+    let output = makefile_lsp()
+        .args(["check", "Makefile"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert_eq!(
+        (
+            output.status.code(),
+            String::from_utf8(output.stdout).unwrap()
+        ),
+        (Some(0), String::new())
+    );
+
+    let output = makefile_lsp()
+        .args(["check", "--no-follow-includes", "Makefile"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert_eq!(
+        (
+            output.status.code(),
+            String::from_utf8(output.stdout).unwrap()
+        ),
+        (
+            Some(1),
+            "Makefile:1:6: warning: variable 'OBJ' is not defined [undefined-variable]\n"
+                .to_string()
+        )
+    );
+}

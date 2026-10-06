@@ -848,20 +848,18 @@ mod scip_command {
         };
         let root = root.canonicalize().unwrap_or(root);
 
+        let mut workspace = crate::workspace::Workspace::new();
+        workspace.set_roots(vec![root.clone()]);
         let mut files = Vec::with_capacity(inputs.len());
         for input in &inputs {
-            let text =
-                std::fs::read_to_string(input).map_err(|e| format!("{}: {e}", input.display()))?;
-            let relative = relative_path(&root, input);
-            let base_dir = input
-                .canonicalize()
-                .unwrap_or_else(|_| root.join(input))
-                .parent()
-                .map(Path::to_path_buf);
+            let absolute =
+                std::path::absolute(input).map_err(|e| format!("{}: {e}", input.display()))?;
+            let file_set = workspace
+                .file_set_for_path(&absolute)
+                .map_err(|e| format!("{}: {e}", input.display()))?;
             files.push(crate::scip::SourceFile {
-                relative_path: relative,
-                text,
-                base_dir,
+                relative_path: relative_path(&root, input),
+                files: file_set,
             });
         }
 
@@ -887,7 +885,9 @@ mod scip_command {
              -o, --output FILE        Write the index to FILE (default: index.scip)\n      \
              --project-root DIR   Root directory recorded in the index (default: cwd)\n  \
              -h, --help               Show this help\n\n\
-             With no FILE, 'Makefile' in the current directory is used."
+             With no FILE, 'Makefile' in the current directory is used. Included\n\
+             makefiles, and makefiles including a FILE, are read for definitions\n\
+             and diagnostics but only the given files are indexed."
         );
     }
 

@@ -9,6 +9,7 @@ use serde_json::json;
 use tower_lsp_server::ls_types::{Diagnostic, DiagnosticSeverity, NumberOrString};
 
 use crate::position::utf16_to_char_column;
+use crate::workspace::Workspace;
 
 /// No diagnostics at or above the severity threshold.
 pub const EXIT_CLEAN: i32 = 0;
@@ -77,6 +78,9 @@ pub enum Format {
 pub struct Options {
     pub format: Format,
     pub min_severity: Severity,
+    /// Whether to take the makefiles a file includes, and those including
+    /// it, into account.
+    pub follow_includes: bool,
     pub paths: Vec<PathBuf>,
 }
 
@@ -118,6 +122,7 @@ impl Finding {
 pub fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
     let mut format = Format::Text;
     let mut min_severity = Severity::Warning;
+    let mut follow_includes = true;
     let mut paths = Vec::new();
 
     let mut iter = args.iter();
@@ -136,6 +141,7 @@ pub fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
                 min_severity =
                     Severity::parse(value).ok_or_else(|| format!("unknown severity '{value}'"))?;
             }
+            "--no-follow-includes" => follow_includes = false,
             "-h" | "--help" => return Ok(None),
             other if other.starts_with('-') => {
                 return Err(format!("unknown option '{other}'"));
@@ -151,6 +157,7 @@ pub fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
     Ok(Some(Options {
         format,
         min_severity,
+        follow_includes,
         paths,
     }))
 }
@@ -163,10 +170,14 @@ fn print_help() {
          Makefile, makefile, GNUmakefile, *.mk and *.mak. Files given explicitly\n\
          are checked regardless of their name. With no PATH, the current\n\
          directory is searched.\n\n\
+         Included makefiles, and makefiles nearby that include a checked file,\n\
+         are read so that definitions and uses in them are taken into account.\n\
+         Diagnostics are only reported for the checked files.\n\n\
          Options:\n      \
          --format FORMAT      Output format: text (default) or sarif\n      \
          --severity LEVEL     Minimum severity to report: error, warning\n                           \
-         (default), info or hint\n  \
+         (default), info or hint\n      \
+         --no-follow-includes Check each file on its own\n  \
          -h, --help               Show this help\n\n\
          Exit status: 0 if nothing was reported, 1 if diagnostics were reported,\n\
          2 on usage or I/O errors."
@@ -201,14 +212,24 @@ pub fn run(args: &[String]) -> i32 {
 }
 
 /// Check the files selected by `options`, writing the report to `out` and
-/// errors to `err`. `base` is the directory SARIF URIs are made relative to.
+/// errors to `err`. `base` is the absolute directory relative paths are
+/// resolved against and SARIF URIs are made relative to.
 pub fn check(options: &Options, base: &Path, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     let mut errors = Vec::new();
     let files = collect_files(&options.paths, &mut errors);
 
+    let mut workspace = Workspace::new();
+    // Look for makefiles including a checked file no further up than `base`.
+    workspace.set_roots(vec![base.to_path_buf()]);
+
     let mut findings = Vec::new();
     for file in &files {
-        match check_file(file) {
+        let found = if options.follow_includes {
+            check_file_with_includes(&mut workspace, file, &base.join(file))
+        } else {
+            check_file(file).map_err(|e| e.to_string())
+        };
+        match found {
             Ok(found) => findings.extend(
                 found
                     .into_iter()
@@ -241,7 +262,8 @@ pub fn check(options: &Options, base: &Path, out: &mut dyn Write, err: &mut dyn 
     }
 }
 
-/// Read and diagnose a single file, returning findings sorted by position.
+/// Read and diagnose a single file on its own, returning findings sorted by
+/// position.
 pub fn check_file(path: &Path) -> std::io::Result<Vec<Finding>> {
     let text = std::fs::read_to_string(path)?;
     let parsed = makefile_lossless::Makefile::parse(&text);
@@ -249,17 +271,46 @@ pub fn check_file(path: &Path) -> std::io::Result<Vec<Finding>> {
         Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
         _ => PathBuf::from("."),
     };
-    let mut diagnostics = crate::diagnostics::get_diagnostics(&text, &parsed, Some(&base_dir));
-    diagnostics.extend(crate::shell_check::check_shell_syntax(
-        &text,
-        &parsed.tree(),
-    ));
+    let diagnostics = crate::diagnostics::get_diagnostics(&text, &parsed, Some(&base_dir));
+    Ok(findings(path, &text, &parsed.tree(), diagnostics))
+}
+
+/// Diagnose a file together with the makefiles it includes and those that
+/// include it, like the language server does. `path` is how the file is
+/// reported, `absolute` where it is.
+pub fn check_file_with_includes(
+    workspace: &mut Workspace,
+    path: &Path,
+    absolute: &Path,
+) -> Result<Vec<Finding>, String> {
+    let files = workspace
+        .file_set_for_path(absolute)
+        .map_err(|e| e.to_string())?;
+    let diagnostics = crate::diagnostics::get_file_set_diagnostics(&files);
+    let current = files.current();
+    Ok(findings(
+        path,
+        current.text(),
+        &current.makefile(),
+        diagnostics,
+    ))
+}
+
+/// Add the shell syntax diagnostics and convert to findings sorted by
+/// position.
+fn findings(
+    path: &Path,
+    text: &str,
+    makefile: &makefile_lossless::Makefile,
+    mut diagnostics: Vec<Diagnostic>,
+) -> Vec<Finding> {
+    diagnostics.extend(crate::shell_check::check_shell_syntax(text, makefile));
     let mut findings: Vec<Finding> = diagnostics
         .iter()
-        .map(|d| Finding::from_diagnostic(path, &text, d))
+        .map(|d| Finding::from_diagnostic(path, text, d))
         .collect();
     findings.sort_by_key(|f| (f.start_line, f.start_column));
-    Ok(findings)
+    findings
 }
 
 fn is_makefile_name(name: &str) -> bool {
@@ -496,6 +547,7 @@ mod tests {
         Options {
             format,
             min_severity,
+            follow_includes: true,
             paths,
         }
     }
@@ -507,6 +559,7 @@ mod tests {
             Some(Options {
                 format: Format::Text,
                 min_severity: Severity::Warning,
+                follow_includes: true,
                 paths: vec![PathBuf::from(".")],
             })
         );
@@ -520,6 +573,7 @@ mod tests {
                 "sarif",
                 "--severity",
                 "hint",
+                "--no-follow-includes",
                 "a",
                 "b"
             ]))
@@ -527,6 +581,7 @@ mod tests {
             Some(Options {
                 format: Format::Sarif,
                 min_severity: Severity::Hint,
+                follow_includes: false,
                 paths: vec![PathBuf::from("a"), PathBuf::from("b")],
             })
         );
@@ -856,5 +911,142 @@ mod tests {
         );
         assert_eq!(code, EXIT_ERROR);
         assert!(err.starts_with(&format!("makefile-lsp check: {}: ", path.display())));
+    }
+
+    const MAKEFILE: &str =
+        "FLAGS = $(LIBS)\n\nall: build $(OBJ)\n\techo $(FLAGS)\n\ninclude rules.mk\n";
+    const RULES: &str =
+        "LIBS = -lm\nOBJ = x.o\nUNUSED = 1\n\n.PHONY: build\nbuild:\n\techo build\n";
+
+    /// Check `paths` (relative to `dir`) at hint level, with the output's
+    /// paths made relative to `dir`.
+    fn check_in(dir: &Path, paths: &[&str], follow_includes: bool) -> (i32, String, String) {
+        let mut options = options(
+            paths.iter().map(|p| dir.join(p)).collect(),
+            Severity::Hint,
+            Format::Text,
+        );
+        options.follow_includes = follow_includes;
+        let (code, out, err) = run_check(&options, dir);
+        let prefix = format!("{}/", dir.display());
+        (code, out.replace(&prefix, ""), err.replace(&prefix, ""))
+    }
+
+    fn fixture(files: &[(&str, &str)]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, text) in files {
+            std::fs::write(dir.path().join(name), text).unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn test_check_follows_includes() {
+        let dir = fixture(&[("Makefile", MAKEFILE), ("rules.mk", RULES)]);
+        assert_eq!(
+            check_in(dir.path(), &["."], true),
+            (
+                EXIT_DIAGNOSTICS,
+                "rules.mk:3:1: hint: variable 'UNUSED' is defined but never used [unused-variable]\n"
+                    .to_string(),
+                String::new()
+            )
+        );
+    }
+
+    #[test]
+    fn test_check_included_file_not_reported_unless_checked() {
+        let dir = fixture(&[("Makefile", MAKEFILE), ("rules.mk", RULES)]);
+        assert_eq!(
+            check_in(dir.path(), &["Makefile"], true),
+            (EXIT_CLEAN, String::new(), String::new())
+        );
+        // A fragment checked on its own sees the makefile including it.
+        assert_eq!(
+            check_in(dir.path(), &["rules.mk", "Makefile", "rules.mk"], true),
+            (
+                EXIT_DIAGNOSTICS,
+                "rules.mk:3:1: hint: variable 'UNUSED' is defined but never used [unused-variable]\n"
+                    .to_string(),
+                String::new()
+            )
+        );
+    }
+
+    #[test]
+    fn test_check_no_follow_includes() {
+        let dir = fixture(&[("Makefile", MAKEFILE), ("rules.mk", RULES)]);
+        assert_eq!(
+            check_in(dir.path(), &["."], false),
+            (
+                EXIT_DIAGNOSTICS,
+                "Makefile:1:9: warning: variable 'LIBS' is not defined [undefined-variable]\n\
+                 Makefile:3:12: warning: variable 'OBJ' is not defined [undefined-variable]\n\
+                 rules.mk:1:1: hint: variable 'LIBS' is defined but never used [unused-variable]\n\
+                 rules.mk:2:1: hint: variable 'OBJ' is defined but never used [unused-variable]\n\
+                 rules.mk:3:1: hint: variable 'UNUSED' is defined but never used [unused-variable]\n"
+                    .to_string(),
+                String::new()
+            )
+        );
+    }
+
+    #[test]
+    fn test_check_missing_include() {
+        let dir = fixture(&[(
+            "Makefile",
+            "X = $(Y)\n.PHONY: all\nall: gen\n\techo $(X)\ninclude nope.mk\n",
+        )]);
+        // As the include can't be followed, Y and gen may be defined there.
+        assert_eq!(
+            check_in(dir.path(), &["Makefile"], true),
+            (
+                EXIT_DIAGNOSTICS,
+                "Makefile:1:5: warning: variable 'Y' is not defined [undefined-variable]\n\
+                 Makefile:5:9: warning: included file 'nope.mk' does not exist [missing-include-file]\n"
+                    .to_string(),
+                String::new()
+            )
+        );
+    }
+
+    #[test]
+    fn test_check_include_cycle() {
+        let dir = fixture(&[
+            ("Makefile", "include a.mk\n.PHONY: all\nall: $(A)\n"),
+            ("a.mk", "include Makefile\nA = a\nB = b\n"),
+        ]);
+        assert_eq!(
+            check_in(dir.path(), &["."], true),
+            (
+                EXIT_DIAGNOSTICS,
+                "a.mk:3:1: hint: variable 'B' is defined but never used [unused-variable]\n"
+                    .to_string(),
+                String::new()
+            )
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_check_unreadable_include() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = fixture(&[("Makefile", "include a.mk\n"), ("a.mk", "")]);
+        let path = dir.path().join("a.mk");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(&path).is_ok() {
+            // Running as root; permissions are not enforced.
+            return;
+        }
+        assert_eq!(
+            check_in(dir.path(), &["Makefile"], true),
+            (
+                EXIT_DIAGNOSTICS,
+                "Makefile:1:9: warning: included file 'a.mk' could not be read: \
+                 Permission denied (os error 13) [unreadable-include-file]\n"
+                    .to_string(),
+                String::new()
+            )
+        );
     }
 }

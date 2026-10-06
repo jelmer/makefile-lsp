@@ -550,6 +550,27 @@ impl Workspace {
     /// Build the file set for an open document.
     pub fn file_set(&mut self, uri: &Uri) -> Option<FileSet> {
         let current = self.open.get(uri)?.clone();
+        let files = self.build_file_set(current);
+        self.visible.insert(
+            uri.clone(),
+            files
+                .docs()
+                .filter_map(|d| d.path().map(Path::to_path_buf))
+                .collect(),
+        );
+        Some(files)
+    }
+
+    /// Build the file set for the makefile at `path`, which must be
+    /// absolute. An open buffer for it is used if there is one, otherwise it
+    /// is read from disk.
+    pub fn file_set_for_path(&mut self, path: &Path) -> Result<FileSet, LoadError> {
+        let current = self.load(&normalize(path))?;
+        Ok(self.build_file_set(current))
+    }
+
+    fn build_file_set(&mut self, current: Arc<Document>) -> FileSet {
+        let uri = current.uri().clone();
         let mut walk = Walk::default();
         if let Some(path) = current.path() {
             walk.seen.insert(path.to_path_buf());
@@ -557,7 +578,7 @@ impl Workspace {
         self.visit(current.clone(), current.dir(), &mut walk);
         let mut complete = walk.is_complete();
         let mut docs = walk.docs;
-        let mut includes = walk.includes.remove(uri).unwrap_or_default();
+        let mut includes = walk.includes.remove(&uri).unwrap_or_default();
 
         if let Some(path) = current.path() {
             self.probe_includers(path);
@@ -576,25 +597,19 @@ impl Workspace {
                         docs.push(doc);
                     }
                 }
-                if let Some(root_includes) = root_walk.includes.get(uri) {
+                if let Some(root_includes) = root_walk.includes.get(&uri) {
                     merge_includes(&mut includes, root_includes);
                 }
             }
         }
 
-        self.visible.insert(
-            uri.clone(),
-            docs.iter()
-                .filter_map(|d| d.path().map(Path::to_path_buf))
-                .collect(),
-        );
         let editable = docs.iter().map(|d| self.is_editable(d)).collect();
-        Some(FileSet {
+        FileSet {
             docs,
             editable,
             includes,
             complete,
-        })
+        }
     }
 
     /// Open documents other than `uri` whose diagnostics may depend on it:
@@ -1060,6 +1075,24 @@ pub mod tests {
                 .collect::<Vec<_>>(),
             vec![Resolution::Found(fx.path("a.mk"))]
         );
+    }
+
+    #[test]
+    fn test_file_set_for_path() {
+        let fx = Fixture::new(&[
+            ("Makefile", "include a.mk\n"),
+            ("a.mk", "include b.mk\n"),
+            ("b.mk", ""),
+        ]);
+        let mut ws = Workspace::new();
+        ws.set_roots(vec![fx.path("")]);
+        let set = ws.file_set_for_path(&fx.path("a.mk")).unwrap();
+        assert_eq!(fx.names(&set), vec!["a.mk", "b.mk", "Makefile"]);
+        assert!(set.is_complete());
+        assert!(matches!(
+            ws.file_set_for_path(&fx.path("missing.mk")),
+            Err(LoadError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound
+        ));
     }
 
     #[test]
