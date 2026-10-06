@@ -236,6 +236,28 @@ mod tests {
     }
 
     #[test]
+    fn test_rename_second_target_of_rule() {
+        let text = "all: b\na b: c\n";
+        let edits = get_edits(text, Position::new(0, 5), "x");
+        let edit = |line, start, end| TextEdit {
+            range: Range::new(Position::new(line, start), Position::new(line, end)),
+            new_text: "x".to_string(),
+        };
+        assert_eq!(edits, vec![edit(0, 5, 6), edit(1, 2, 3)]);
+    }
+
+    #[test]
+    fn test_rename_second_target_of_rule_from_definition() {
+        let text = "all: b\na b: c\n";
+        let edits = get_edits(text, Position::new(1, 2), "x");
+        let edit = |line, start, end| TextEdit {
+            range: Range::new(Position::new(line, start), Position::new(line, end)),
+            new_text: "x".to_string(),
+        };
+        assert_eq!(edits, vec![edit(0, 5, 6), edit(1, 2, 3)]);
+    }
+
+    #[test]
     fn test_prepare_rename_variable() {
         let text = "CC = gcc\nall:\n\t$(CC) main.c\n";
         let result = prepare_rename(&single(text), Position::new(0, 0));

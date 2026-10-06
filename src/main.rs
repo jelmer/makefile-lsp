@@ -30,6 +30,7 @@ mod semantic;
 mod shell_check;
 mod signature_help;
 mod symbols;
+mod targets;
 mod workspace;
 
 use position::try_lsp_range_to_text_range;

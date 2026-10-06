@@ -5,6 +5,7 @@ use rowan::ast::AstNode;
 use tower_lsp_server::ls_types::{DocumentSymbol, SymbolKind};
 
 use crate::position::text_range_to_lsp_range;
+use crate::targets::target_ranges;
 
 /// Generate document symbols for a Makefile.
 ///
@@ -21,9 +22,10 @@ pub fn generate_document_symbols(makefile: &Makefile, source_text: &str) -> Vec<
         }
 
         let range = text_range_to_lsp_range(source_text, rule.syntax().text_range());
-
-        // Use the targets portion for the selection range
-        let selection_range = range;
+        let selection_range = target_ranges(&rule)
+            .into_iter()
+            .reduce(|a, b| a.cover(b))
+            .map_or(range, |r| text_range_to_lsp_range(source_text, r));
 
         symbols.push(DocumentSymbol {
             name,
@@ -63,6 +65,7 @@ pub fn generate_document_symbols(makefile: &Makefile, source_text: &str) -> Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tower_lsp_server::ls_types::{Position, Range};
 
     #[test]
     fn test_symbols_rules() {
@@ -74,6 +77,21 @@ mod tests {
         let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
         assert!(names.contains(&"all"));
         assert!(names.contains(&"clean"));
+    }
+
+    #[test]
+    fn test_symbols_rule_selection_range_covers_targets() {
+        let text = "a b: c\n\techo\n";
+        let makefile = Makefile::parse(text).tree();
+        let symbols = generate_document_symbols(&makefile, text);
+        let selections: Vec<(&str, Range)> = symbols
+            .iter()
+            .map(|s| (s.name.as_str(), s.selection_range))
+            .collect();
+        assert_eq!(
+            selections,
+            vec![("a, b", Range::new(Position::new(0, 0), Position::new(0, 3)))]
+        );
     }
 
     #[test]

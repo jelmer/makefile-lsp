@@ -8,10 +8,11 @@ use makefile_lossless::{
 };
 use rowan::ast::AstNode;
 use text_size::{TextRange, TextSize};
-use tower_lsp_server::ls_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Position, Range};
+use tower_lsp_server::ls_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Range};
 
 use crate::builtins;
 use crate::position::text_range_to_lsp_range;
+use crate::targets::targets_with_ranges;
 use crate::workspace::{FileSet, Resolution, ResolvedInclude};
 
 fn make_diagnostic(
@@ -356,7 +357,7 @@ fn check_duplicate_targets(source_text: &str, makefile: &Makefile) -> Vec<Diagno
     let mut seen: HashMap<String, Range> = HashMap::new();
 
     for rule in separated_rules(makefile) {
-        for target in rule.targets() {
+        for (target, range) in targets_with_ranges(&rule) {
             // Skip pattern rules (contain %)
             if target.contains('%') {
                 continue;
@@ -370,15 +371,7 @@ fn check_duplicate_targets(source_text: &str, makefile: &Makefile) -> Vec<Diagno
                 continue;
             }
 
-            let rule_range = text_range_to_lsp_range(source_text, rule.syntax().text_range());
-            // Narrow the range to just the target name
-            let target_range = Range {
-                start: rule_range.start,
-                end: Position::new(
-                    rule_range.start.line,
-                    rule_range.start.character + target.len() as u32,
-                ),
-            };
+            let target_range = text_range_to_lsp_range(source_text, range);
 
             if let Some(first_range) = seen.get(&target) {
                 diagnostics.push(make_diagnostic(
@@ -1480,6 +1473,7 @@ fn check_missing_phony(
 mod tests {
     use super::*;
     use makefile_lossless::Makefile;
+    use tower_lsp_server::ls_types::Position;
 
     fn get_diags(text: &str) -> Vec<Diagnostic> {
         let parsed = Makefile::parse(text);
@@ -1622,6 +1616,20 @@ mod tests {
         let text = "all: build\n\techo first\n\nall: test\n\techo second\n";
         let codes = diag_codes(text);
         assert!(codes.contains(&"duplicate-target".to_string()));
+    }
+
+    #[test]
+    fn test_duplicate_target_range_in_rule_with_several_targets() {
+        let text = "b:\n\t@:\na b:\n\t@:\n";
+        let ranges: Vec<Range> = get_diags(text)
+            .into_iter()
+            .filter(|d| d.code == Some(NumberOrString::String("duplicate-target".to_string())))
+            .map(|d| d.range)
+            .collect();
+        assert_eq!(
+            ranges,
+            vec![Range::new(Position::new(2, 2), Position::new(2, 3))]
+        );
     }
 
     #[test]
