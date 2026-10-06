@@ -81,6 +81,7 @@ Each diagnostic carries a code, so it can be identified in editors:
 - Remove trailing whitespace from a variable value
 - Use `:=` for an assignment containing `$(shell ...)`
 - Add a missing `endif` or `endef`
+- Change `include` to `-include`, so make ignores a missing file
 - Inline a variable
 - Add a target that nothing depends on as a prerequisite of the default goal
 - Remove a prerequisite that is already reached through another one
