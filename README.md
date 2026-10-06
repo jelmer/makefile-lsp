@@ -4,8 +4,8 @@ A Language Server Protocol (LSP) implementation for Makefiles, built in Rust.
 
 ## Features
 
-All analysis is done on a lossless syntax tree of the current file; the
-Makefile is never executed.
+All analysis is done on a lossless syntax tree of the makefile and the
+makefiles it includes (see below); the Makefile is never executed.
 
 - **Diagnostics** - parse errors plus a set of lint checks (listed below)
 - **Code actions** - quick fixes and refactorings (listed below)
@@ -19,8 +19,8 @@ Makefile is never executed.
   referenced as a prerequisite
 - **Signature help** - parameter information inside built-in function calls
   like `$(subst from,to,text)`
-- **Go to definition** - from a variable reference to its assignment, and from
-  a prerequisite to the rule defining it
+- **Go to definition** - from a variable reference to its assignment, from a
+  prerequisite to the rule defining it, and from an include path to the file
 - **Find references** and **document highlights** - for targets and variables
 - **Rename** - targets and variables, with prepare-rename support
 - **Document links** - `include`, `-include` and `sinclude` paths are clickable
@@ -64,6 +64,7 @@ Each diagnostic carries a code, so it can be identified in editors:
 | `unterminated-conditional` | error | `ifdef`/`ifeq` without a matching `endif` |
 | `include-missing-path` | error | `include` without a path |
 | `missing-include-file` | warning | `include` of a file that does not exist |
+| `unreadable-include-file` | warning | `include` of a file that exists but cannot be read |
 
 ### Code actions
 
@@ -77,6 +78,25 @@ Each diagnostic carries a code, so it can be identified in editors:
 - Inline a variable
 - Add a target that nothing depends on as a prerequisite of the default goal
 - Remove a prerequisite that is already reached through another one
+
+### Included makefiles
+
+The server follows `include`, `-include` and `sinclude` directives, so
+definitions, references, hover, completion, rename and diagnostics see
+targets and variables from included makefiles. Paths are resolved relative
+to the directory of the top-level makefile and of the including file.
+Variable references in include paths are expanded when the variable has a
+single plain value, as in `TOPDIR := ..` followed by `include
+$(TOPDIR)/rules.mk`; other paths, wildcards and `-I` directories are not
+resolved.
+
+A fragment such as `rules.mk` opened on its own also sees the makefile that
+includes it, if that makefile is open or is the `GNUmakefile`, `makefile`
+or `Makefile` in the fragment's directory or one above it (up to the
+workspace folder).
+
+Open editor buffers take precedence over files on disk. Rename only edits
+open files and files inside the workspace folders.
 
 ## Installation
 
