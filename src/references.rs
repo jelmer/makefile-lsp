@@ -1,10 +1,6 @@
 //! Find references for Makefiles.
 
-use makefile_lossless::{
-    Makefile, Recipe, RecipeVariableReference, SyntaxKind, TextRange, VariableDefinition,
-    VariableReference,
-};
-use rowan::ast::AstNode;
+use makefile_lossless::{Makefile, ReferenceLocation, TextRange, VariableReference};
 use text_size::TextSize;
 use tower_lsp_server::ls_types::{Location, Position, Uri};
 
@@ -184,70 +180,48 @@ fn find_variable_references(
     locations
 }
 
-/// All `$(VAR)` and `${VAR}` references in the document, and `$V` outside
-/// recipes and define bodies, with the range of the variable name. Function
-/// calls such as `$(shell ...)` are left out, but references in their
-/// arguments are included.
+/// All references in the document with the range of the variable name.
+/// Function calls such as `$(shell ...)` and call parameters such as `$(1)`
+/// are left out, but references in function arguments are included.
 pub(crate) fn variable_references(makefile: &Makefile) -> Vec<(String, TextRange)> {
-    let named = |refs: Vec<RecipeVariableReference>| {
-        refs.into_iter()
-            .map(|r| (r.name().to_string(), r.text_range()))
-    };
-    let mut refs = Vec::new();
-    // Recipe lines that are not part of a rule, such as those before the
-    // first rule, are visited too.
-    for node in makefile.syntax().descendants() {
-        if let Some(recipe) = Recipe::cast(node.clone()) {
-            refs.extend(named(recipe.variable_references()));
-        } else if let Some(definition) = VariableDefinition::cast(node.clone()) {
-            refs.extend(named(definition.define_variable_references()));
-        } else if let Some(reference) = VariableReference::cast(node) {
-            if !reference.is_function_call() {
-                refs.extend(reference_name(&reference));
-            }
-        }
-    }
-    refs
+    makefile
+        .variable_references()
+        .filter(|reference| !reference.is_function_call())
+        .filter_map(|reference| Some((reference.name()?, reference.name_range()?)))
+        .filter(|(name, _)| !crate::builtins::is_call_parameter(name))
+        .collect()
 }
 
-/// The name ranges of single-character references such as `$X`, outside
-/// recipes and define bodies.
+/// Whether `reference` is in a recipe line, possibly nested in other
+/// references.
+pub(crate) fn in_recipe(reference: &VariableReference) -> bool {
+    let mut outer = reference.clone();
+    while let Some(parent) = outer.parent_reference() {
+        outer = parent;
+    }
+    matches!(outer.location(), ReferenceLocation::Recipe(_))
+}
+
+/// The name ranges of single-character references such as `$X`.
 pub(crate) fn single_char_reference_ranges(makefile: &Makefile) -> Vec<TextRange> {
     makefile
         .variable_references()
         .filter_map(|reference| {
-            let (_, range) = reference_name(&reference)?;
+            let range = reference.name_range()?;
             // The name follows the `$` directly, without a parenthesis.
             (range.start() == reference.text_range().start() + TextSize::from(1)).then_some(range)
         })
         .collect()
 }
 
-/// The name of `reference` and its range.
-fn reference_name(reference: &VariableReference) -> Option<(String, TextRange)> {
-    let name = reference.name()?;
-    let mut children = reference.syntax().children_with_tokens().skip(1);
-    let open = children.next()?;
-    if !matches!(open.kind(), SyntaxKind::LPAREN | SyntaxKind::LBRACE) {
-        return Some((name, open.text_range()));
+/// Whether `reference` is in the body of a `define`, possibly nested in
+/// other references.
+pub(crate) fn in_define_body(reference: &VariableReference) -> bool {
+    let mut outer = reference.clone();
+    while let Some(parent) = outer.parent_reference() {
+        outer = parent;
     }
-    // As in VariableReference::name, which also takes nested references
-    // into the name.
-    let range = children
-        .take_while(|c| {
-            !matches!(
-                c.kind(),
-                SyntaxKind::RPAREN
-                    | SyntaxKind::RBRACE
-                    | SyntaxKind::WHITESPACE
-                    | SyntaxKind::COMMA
-                    | SyntaxKind::OPERATOR
-                    | SyntaxKind::NEWLINE
-            )
-        })
-        .map(|c| c.text_range())
-        .reduce(|a, b| a.cover(b))?;
-    Some((name, range))
+    matches!(outer.location(), ReferenceLocation::VariableValue(def) if def.is_define())
 }
 
 #[cfg(test)]
@@ -462,6 +436,25 @@ mod tests {
         assert_eq!(
             foo_refs(text),
             vec![range(0, 0, 3), range(1, 8, 11), range(3, 8, 11)]
+        );
+    }
+
+    #[test]
+    fn test_find_single_char_reference_in_recipe() {
+        let text = "X = 1\nall:\n\techo $X\n";
+        assert_eq!(
+            ref_ranges(text, Position::new(0, 0)),
+            vec![range(0, 0, 1), range(2, 7, 8)]
+        );
+    }
+
+    #[test]
+    fn test_find_single_char_reference_range() {
+        // `$FOO` references `F`, followed by the text `OO`.
+        let text = "F = 1\nX = $FOO\n";
+        assert_eq!(
+            ref_ranges(text, Position::new(0, 0)),
+            vec![range(0, 0, 1), range(1, 5, 6)]
         );
     }
 

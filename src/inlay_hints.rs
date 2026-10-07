@@ -167,6 +167,18 @@ mod tests {
         assert!(hints.is_empty());
     }
 
+    #[test]
+    fn test_hint_in_recipe() {
+        let text = "CC := gcc\nall:\n\t$(CC) -c a.c\n";
+        let hints = get_hints(text);
+        assert_eq!(hints.len(), 1);
+        assert_eq!(
+            hints[0].position,
+            tower_lsp_server::ls_types::Position::new(2, 6)
+        );
+        assert!(matches!(&hints[0].label, InlayHintLabel::String(s) if s.contains("gcc")));
+    }
+
     fn depth_hints(text: &str) -> Vec<String> {
         get_hints(text)
             .into_iter()

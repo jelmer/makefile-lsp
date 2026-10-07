@@ -476,6 +476,11 @@ pub fn is_known_variable(name: &str) -> bool {
         || is_builtin_function(name)
 }
 
+/// Check if a name is a parameter of a `$(call)`, such as `1` in `$(1)`.
+pub fn is_call_parameter(name: &str) -> bool {
+    !name.is_empty() && name.bytes().all(|b| b.is_ascii_digit())
+}
+
 /// A GNU Make directive (a keyword that starts a line, e.g. `include`).
 pub struct Directive {
     /// Directive keyword.

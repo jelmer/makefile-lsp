@@ -5,8 +5,8 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use makefile_lossless::{
-    Conditional, Include, Makefile, MakefileVariant, Parse, ParseErrorKind, Recipe, Rule,
-    SyntaxKind, VariableDefinition, VariableReference,
+    Conditional, Include, Makefile, MakefileVariant, Parse, ParseErrorKind, ReferenceLocation,
+    Rule, SyntaxKind, VariableReference,
 };
 use rowan::ast::AstNode;
 use tower_lsp_server::ls_types::{
@@ -810,10 +810,9 @@ fn replace_all_spaces_with_tabs_action(
 /// Offer "Inline variable" when the cursor is on a variable definition with a
 /// simple literal value (no `$` characters in the value).
 ///
-/// Replaces every `$(NAME)` / `${NAME}` reference, including those in
-/// recipes and define bodies, with the literal value, then deletes the
-/// variable definition's line. Not offered if any reference uses modifiers,
-/// as in `$(NAME:.c=.o)`.
+/// Replaces every reference to it, including those in recipes and define
+/// bodies, with the literal value, then deletes the variable definition's
+/// line. Not offered if any reference uses modifiers, as in `$(NAME:.c=.o)`.
 ///
 /// Also not offered if the value is written differently from what it
 /// stores, as with `\#` or a line continuation, or if a reference sits where
@@ -885,33 +884,6 @@ fn inline_variable_action(
         });
     }
 
-    // Recipes and define bodies are raw text, so their references are not
-    // in the syntax tree. Recipe lines outside rules are included.
-    for node in makefile.syntax().descendants() {
-        let raw_refs = if let Some(recipe) = Recipe::cast(node.clone()) {
-            recipe.variable_references()
-        } else if let Some(definition) = VariableDefinition::cast(node.clone()) {
-            definition.define_variable_references()
-        } else {
-            continue;
-        };
-        let node_start = usize::from(node.text_range().start());
-        for raw_ref in raw_refs.iter().filter(|r| r.name() == name) {
-            let range = plain_reference_range(source_text, raw_ref.text_range())?;
-            let preceding = &source_text[node_start..usize::from(range.start())];
-            if !enclosing_text_references(preceding)
-                .iter()
-                .all(|context| context.accepts(&value))
-            {
-                return None;
-            }
-            edits.push(TextEdit {
-                range: text_range_to_lsp_range(source_text, range),
-                new_text: value.clone(),
-            });
-        }
-    }
-
     if edits.is_empty() {
         return None;
     }
@@ -964,119 +936,45 @@ impl InlineContext {
     }
 }
 
-/// The contexts a reference in the syntax tree is nested in.
+/// The contexts a reference is nested in.
 ///
-/// Variable values, include lines and the text around a reference in a
-/// recipe or define body take the expanded text as is, so add no context.
+/// Variable values, include lines, recipes and define bodies take the
+/// expanded text as is, so add no context.
 fn reference_contexts(var_ref: &VariableReference) -> Vec<InlineContext> {
-    let start = var_ref.text_range().start();
     let mut contexts = Vec::new();
-    for node in var_ref.syntax().ancestors().skip(1) {
-        if let Some(outer) = VariableReference::cast(node.clone()) {
-            contexts.push(if outer.is_function_call() {
-                InlineContext::FunctionArgument
-            } else {
-                InlineContext::Other
-            });
-            continue;
-        }
-        match node.kind() {
-            SyntaxKind::EXPR
-            | SyntaxKind::TARGETS
-            | SyntaxKind::PREREQUISITES
-            | SyntaxKind::PREREQUISITE => continue,
-            SyntaxKind::VARIABLE => {
-                let in_value = node
-                    .children_with_tokens()
-                    .filter_map(|it| it.into_token())
-                    .find(|t| t.kind() == SyntaxKind::OPERATOR)
-                    .is_some_and(|op| op.text_range().end() <= start);
-                if !in_value {
-                    contexts.push(InlineContext::Other);
-                } else if node.parent().is_some_and(|p| p.kind() == SyntaxKind::RULE) {
-                    contexts.push(InlineContext::RuleLine);
-                }
+    let mut current = var_ref.clone();
+    let outermost = loop {
+        match current.location() {
+            ReferenceLocation::FunctionArgument(outer) => {
+                contexts.push(InlineContext::FunctionArgument);
+                current = outer;
             }
-            SyntaxKind::RULE => contexts.push(InlineContext::RuleLine),
-            SyntaxKind::INCLUDE => {}
-            _ => contexts.push(InlineContext::Other),
+            ReferenceLocation::ReferenceName(outer) | ReferenceLocation::Modifier(outer) => {
+                contexts.push(InlineContext::Other);
+                current = outer;
+            }
+            ReferenceLocation::VariableValue(_) | ReferenceLocation::Include(_) => break None,
+            ReferenceLocation::Recipe(_) => break None,
+            ReferenceLocation::TargetSpecificValue(_) => break Some(InlineContext::RuleLine),
+            ReferenceLocation::Target(_) | ReferenceLocation::Prerequisite(_)
+                if !in_archive_members(&current) =>
+            {
+                break Some(InlineContext::RuleLine)
+            }
+            _ => break Some(InlineContext::Other),
         }
-        break;
-    }
+    };
+    contexts.extend(outermost);
     contexts
 }
 
-/// The contexts of the references left open at the end of `text`, the
-/// recipe or define body text before a reference.
-fn enclosing_text_references(text: &str) -> Vec<InlineContext> {
-    // Each open reference's body start, closing char and nested paren depth.
-    let mut open: Vec<(usize, u8, usize)> = Vec::new();
-    let bytes = text.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        let close = match (bytes[i], bytes.get(i + 1)) {
-            (b'$', Some(b'$')) => {
-                i += 2;
-                continue;
-            }
-            (b'$', Some(b'(')) => Some(b')'),
-            (b'$', Some(b'{')) => Some(b'}'),
-            _ => None,
-        };
-        if let Some(close) = close {
-            open.push((i + 2, close, 0));
-            i += 2;
-            continue;
-        }
-        if let Some((_, close, depth)) = open.last_mut() {
-            let opening = if *close == b')' { b'(' } else { b'{' };
-            if bytes[i] == opening {
-                *depth += 1;
-            } else if bytes[i] == *close && *depth > 0 {
-                *depth -= 1;
-            } else if bytes[i] == *close {
-                open.pop();
-            }
-        }
-        i += 1;
-    }
-    open.iter()
-        .map(|&(body_start, _, _)| {
-            let body = &text[body_start..];
-            let name_len = body
-                .find(|c: char| c.is_whitespace() || ",$(){}:=".contains(c))
-                .unwrap_or(body.len());
-            let after_name = &body[name_len..];
-            if name_len > 0 && after_name.starts_with(|c: char| c.is_whitespace() || c == ',') {
-                InlineContext::FunctionArgument
-            } else {
-                InlineContext::Other
-            }
-        })
-        .collect()
-}
-
-/// The range of the whole `$(NAME)` or `${NAME}` reference whose name is at
-/// `name_range`, or None if the name is followed by modifiers.
-// TODO: use the reference's own range if makefile-lossless provides one for
-// references in recipes and define bodies.
-fn plain_reference_range(
-    source_text: &str,
-    name_range: text_size::TextRange,
-) -> Option<text_size::TextRange> {
-    let start = usize::from(name_range.start()).checked_sub(2)?;
-    let end = usize::from(name_range.end());
-    let close = match source_text.get(start..start + 2)? {
-        "$(" => ")",
-        "${" => "}",
-        _ => return None,
-    };
-    source_text[end..].starts_with(close).then(|| {
-        text_size::TextRange::new(
-            text_size::TextSize::from(start as u32),
-            name_range.end() + text_size::TextSize::of(close),
-        )
-    })
+/// Whether `var_ref` is in the member list of an archive, as in
+/// `lib.a($(OBJS))`.
+fn in_archive_members(var_ref: &VariableReference) -> bool {
+    var_ref
+        .syntax()
+        .ancestors()
+        .any(|node| node.kind() == SyntaxKind::ARCHIVE_MEMBERS)
 }
 
 /// Offer "Add '<target>' as prerequisite of '<goal>'" when the cursor is on
@@ -2042,6 +1940,27 @@ mod tests {
         assert_eq!(
             inline_result("FOO = a,b\nall:\n\techo $(FOO)\n", "FOO"),
             Some("all:\n\techo a,b\n".to_string())
+        );
+    }
+
+    #[test]
+    fn test_inline_single_char_reference_in_recipe() {
+        assert_eq!(
+            inline_result("X = out\nall:\n\tmkdir $X $(X)\n", "X"),
+            Some("all:\n\tmkdir out out\n".to_string())
+        );
+    }
+
+    #[test]
+    fn test_no_inline_into_function_name() {
+        // The value would become part of the function name.
+        assert_eq!(
+            inline_result("FOO = a=b\nX = $(info$(FOO) x)\n", "FOO"),
+            None
+        );
+        assert_eq!(
+            inline_result("FOO = a=b\nall:\n\techo $(info$(FOO) x)\n", "FOO"),
+            None
         );
     }
 
