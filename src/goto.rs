@@ -1,10 +1,11 @@
 //! Go-to-definition for Makefiles.
 
-use makefile_lossless::{is_in_prerequisites, variable_at_offset, word_at_offset, Makefile};
+use makefile_lossless::Makefile;
 use rowan::ast::AstNode;
 use tower_lsp_server::ls_types::{GotoDefinitionResponse, Location, Position, Range, Uri};
 
 use crate::position::{text_range_to_lsp_range, try_position_to_offset};
+use crate::targets::prerequisite_at_offset;
 use crate::workspace::{FileSet, Resolution};
 
 /// Find the definition of the symbol at the given position.
@@ -17,10 +18,15 @@ pub fn goto_definition(files: &FileSet, position: Position) -> Option<GotoDefini
     let offset = try_position_to_offset(source_text, position)?;
     let byte_offset: usize = offset.into();
 
-    // Check if cursor is inside a variable reference $(VAR) or ${VAR}
-    if let Some(var_name) = variable_at_offset(source_text, byte_offset) {
+    let makefile = files.current().makefile();
+    if let Some(reference) = makefile.variable_reference_at(offset) {
+        // A function name such as `wildcard` is not a variable.
+        if reference.is_function_call() {
+            return None;
+        }
+        let var_name = reference.name()?;
         return files.docs().find_map(|doc| {
-            find_variable_definition(&doc.makefile(), doc.text(), var_name, doc.uri())
+            find_variable_definition(&doc.makefile(), doc.text(), &var_name, doc.uri())
         });
     }
 
@@ -38,16 +44,12 @@ pub fn goto_definition(files: &FileSet, position: Position) -> Option<GotoDefini
         }));
     }
 
-    // Check if cursor is on a word in the prerequisites area
-    if is_in_prerequisites(source_text, byte_offset) {
-        if let Some(word) = word_at_offset(source_text, byte_offset) {
-            return files.docs().find_map(|doc| {
-                find_target_definition(&doc.makefile(), doc.text(), word, doc.uri())
-            });
-        }
-    }
-
-    None
+    let (prerequisite, _) = makefile
+        .rules()
+        .find_map(|rule| prerequisite_at_offset(&rule, byte_offset))?;
+    files.docs().find_map(|doc| {
+        find_target_definition(&doc.makefile(), doc.text(), &prerequisite, doc.uri())
+    })
 }
 
 /// Find the definition of a target by name.
@@ -76,9 +78,7 @@ fn find_variable_definition(
     var_name: &str,
     uri: &Uri,
 ) -> Option<GotoDefinitionResponse> {
-    let var_def = makefile
-        .variable_definitions()
-        .find(|v| v.name().as_deref() == Some(var_name))?;
+    let var_def = makefile.variable_definitions_by_name(var_name).next()?;
 
     let range = text_range_to_lsp_range(source_text, var_def.syntax().text_range());
 
@@ -126,6 +126,29 @@ mod tests {
     #[test]
     fn test_goto_prerequisite_not_found() {
         assert_goto_none("all: build\n\nbuilder:\n\techo ok\n", Position::new(0, 5));
+    }
+
+    #[test]
+    fn test_goto_prerequisite_with_directory() {
+        assert_goto_line("all: src/foo.o\nsrc/foo.o:\n", Position::new(0, 6), 1);
+    }
+
+    #[test]
+    fn test_goto_prerequisite_on_continuation_line() {
+        assert_goto_line("all: a \\\n  b\nb:\n", Position::new(1, 2), 2);
+    }
+
+    #[test]
+    fn test_goto_target_name_in_variable_value() {
+        assert_goto_none("FOO := x\nx:\n", Position::new(0, 7));
+    }
+
+    #[test]
+    fn test_goto_function_name() {
+        assert_goto_none(
+            "wildcard = x\nFILES = $(wildcard *.c)\n",
+            Position::new(1, 11),
+        );
     }
 
     #[test]

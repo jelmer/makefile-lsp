@@ -1436,7 +1436,10 @@ fn resolvable_target_names(
         _ => VariableReference::cast(n).is_some_and(|r| r.name().as_deref() == Some("eval")),
     });
     if defers_elsewhere
-        || makefile.find_variable("VPATH").next().is_some()
+        || makefile
+            .variable_definitions_by_name("VPATH")
+            .next()
+            .is_some()
         || makefile.rules_by_target(".DEFAULT").next().is_some()
     {
         return None;
@@ -1456,7 +1459,7 @@ fn resolvable_target_names(
             .filter(|r| r.modifiers.is_empty() && is_valid_var_name(&r.name))?
             .name;
         let mut defined = false;
-        for def in makefile.find_variable(&var) {
+        for def in makefile.variable_definitions_by_name(&var) {
             let value = def.raw_value()?;
             if value.contains('$') {
                 return None;

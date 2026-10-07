@@ -6,7 +6,7 @@ use std::path::Path;
 
 use makefile_lossless::{
     Conditional, Include, Makefile, MakefileVariant, Parse, ParseErrorKind, ReferenceLocation,
-    Rule, SyntaxKind, VariableReference,
+    Rule, SyntaxKind, TextSize, VariableReference,
 };
 use rowan::ast::AstNode;
 use tower_lsp_server::ls_types::{
@@ -14,6 +14,7 @@ use tower_lsp_server::ls_types::{
     WorkspaceEdit,
 };
 
+use crate::builtins;
 use crate::position::{offset_to_position, text_range_to_lsp_range, try_position_to_offset};
 use crate::targets::target_at_offset;
 use crate::workspace::FileSet;
@@ -48,12 +49,7 @@ pub fn get_code_actions(
         uri,
         diagnostics,
     ));
-    actions.extend(define_variable_action(
-        &makefile,
-        source_text,
-        byte_offset,
-        uri,
-    ));
+    actions.extend(define_variable_action(&makefile, offset, uri));
     actions.extend(replace_spaces_with_tab_action(
         parsed,
         source_text,
@@ -193,7 +189,7 @@ fn create_target_action(
     let mut updated = parsed.tree();
     updated.try_add_rule(&name).ok()?;
     // The rule is appended, so only the new text needs to be inserted.
-    let updated_text = updated.code();
+    let updated_text = updated.to_string();
     let edit = match updated_text.strip_prefix(source_text) {
         Some(appended) => {
             let end = offset_to_position(source_text, original_range.end());
@@ -371,20 +367,24 @@ fn add_phony_action(
 }
 
 /// Offer "Define variable" for an undefined variable reference.
-fn define_variable_action(
-    makefile: &Makefile,
-    source_text: &str,
-    byte_offset: usize,
-    uri: &Uri,
-) -> Option<CodeAction> {
-    let var_name = makefile_lossless::variable_at_offset(source_text, byte_offset)?;
+fn define_variable_action(makefile: &Makefile, offset: TextSize, uri: &Uri) -> Option<CodeAction> {
+    let reference = makefile
+        .variable_reference_at(offset)
+        .filter(|r| !r.is_function_call())?;
+    let var_name = reference.name()?;
+    // Computed names, automatic variables and call parameters can't be defined.
+    if var_name.contains('$')
+        || builtins::find_automatic_variable(&var_name).is_some()
+        || builtins::is_call_parameter(&var_name)
+    {
+        return None;
+    }
 
-    // Check if the variable is already defined
-    let defined_vars: HashSet<String> = makefile
-        .variable_definitions()
-        .filter_map(|v| v.name())
-        .collect();
-    if defined_vars.contains(var_name) {
+    if makefile
+        .variable_definitions_by_name(&var_name)
+        .next()
+        .is_some()
+    {
         return None;
     }
 
@@ -713,7 +713,7 @@ fn remove_from_phony_action(
     if !removed {
         return None;
     }
-    let new_text = mutated.code();
+    let new_text = mutated.to_string();
 
     let doc_range = Range::new(
         offset_to_position(source_text, text_size::TextSize::from(0)),
@@ -845,7 +845,7 @@ fn inline_variable_action(
     // Only inline values that are plain literals: no variable references,
     // function calls, or `$$` escapes. We'd otherwise be reasoning about
     // expansion order.
-    if value.contains('$') || var_def.value(MakefileVariant::GNUMake)? != value {
+    if value.contains('$') || var_def.value_for(MakefileVariant::GNUMake)? != value {
         return None;
     }
 
@@ -1258,6 +1258,42 @@ mod tests {
         // Position on 'C' in $(CC), col 11
         let actions = parse_and_actions(text, Position::new(1, 11));
         assert!(!actions.iter().any(|a| a.title.contains("Define variable")));
+    }
+
+    fn define_titles(text: &str, pos: Position) -> Vec<String> {
+        parse_and_actions(text, pos)
+            .into_iter()
+            .map(|a| a.title)
+            .filter(|t| t.starts_with("Define variable"))
+            .collect()
+    }
+
+    #[test]
+    fn test_no_define_action_for_function_call() {
+        assert_eq!(
+            define_titles("FILES = $(wildcard *.c)\n", Position::new(0, 11)),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn test_no_define_action_for_automatic_variable_or_parameter() {
+        assert_eq!(
+            define_titles("all:\n\techo $(@D)\n", Position::new(1, 8)),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            define_titles("f = echo $(1)\n", Position::new(0, 11)),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn test_define_action_for_single_char_reference() {
+        assert_eq!(
+            define_titles("all:\n\techo $X\n", Position::new(1, 7)),
+            vec!["Define variable 'X'".to_string()]
+        );
     }
 
     #[test]

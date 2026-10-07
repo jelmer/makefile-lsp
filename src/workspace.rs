@@ -251,7 +251,7 @@ fn literal_value(def: &makefile_lossless::VariableDefinition) -> Option<String> 
     {
         return None;
     }
-    let value = def.value(MakefileVariant::GNUMake)?;
+    let value = def.value_for(MakefileVariant::GNUMake)?;
     if value.is_empty() || value.contains(['$', ' ', '\t', '\n']) {
         return None;
     }
