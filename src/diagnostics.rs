@@ -742,6 +742,11 @@ fn check_unused_variables(
         if var_def.is_unexport() {
             continue;
         }
+        // `undefine NAME` doesn't define NAME. It doesn't read it either, so
+        // it doesn't count as a use of an earlier definition.
+        if var_def.is_undefine() {
+            continue;
+        }
         if builtins::is_known_variable(&name) {
             continue;
         }
@@ -2795,6 +2800,19 @@ mod tests {
         // `unexport` removes Z from recipe environments; it doesn't read it.
         assert_eq!(
             unused_variable_messages("Z = 1\nunexport Z\n"),
+            vec!["variable 'Z' is defined but never used"]
+        );
+    }
+
+    #[test]
+    fn test_undefine_is_not_a_definition() {
+        assert_eq!(
+            unused_variable_messages("undefine Z\n"),
+            Vec::<String>::new()
+        );
+        // `undefine` doesn't read Z, so it doesn't count as a use either.
+        assert_eq!(
+            unused_variable_messages("Z = 1\nundefine Z\n"),
             vec!["variable 'Z' is defined but never used"]
         );
     }
