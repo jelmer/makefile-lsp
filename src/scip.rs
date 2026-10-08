@@ -22,7 +22,7 @@ use scip::types::{
 use tower_lsp_server::ls_types::{DiagnosticSeverity, NumberOrString};
 
 use crate::position::try_lsp_range_to_text_range;
-use crate::targets::targets_with_ranges;
+use crate::targets::{prerequisites_with_ranges, targets_with_ranges};
 use crate::workspace::FileSet;
 
 const SCHEME: &str = "scip-makefile";
@@ -105,7 +105,7 @@ fn build_document(relative_path: &str, files: &FileSet) -> Document {
         })
         .collect();
 
-    for raw in collect_targets(&makefile, text)
+    for raw in collect_targets(&makefile)
         .into_iter()
         .chain(collect_variable_definitions(&makefile, text))
         .chain(collect_variable_references(
@@ -214,18 +214,10 @@ fn make_symbol(name: &str, suffix: descriptor::Suffix) -> Symbol {
 }
 
 /// Collect target definitions and prerequisite references.
-fn collect_targets(makefile: &Makefile, text: &str) -> Vec<RawOccurrence> {
+fn collect_targets(makefile: &Makefile) -> Vec<RawOccurrence> {
     let mut out = Vec::new();
 
     for rule in makefile.rules() {
-        let rule_range = rule.text_range();
-        let rule_start: usize = rule_range.start().into();
-        let rule_text = &text[rule_start..usize::from(rule_range.end())];
-
-        let Some(colon_pos) = rule_text.find(':') else {
-            continue;
-        };
-
         for (target, range) in targets_with_ranges(&rule) {
             out.push(RawOccurrence {
                 symbol: target_symbol(&target),
@@ -236,21 +228,14 @@ fn collect_targets(makefile: &Makefile, text: &str) -> Vec<RawOccurrence> {
             });
         }
 
-        // Prerequisites appear after the colon, on the same line.
-        let after_colon = &rule_text[colon_pos + 1..];
-        let prereq_end = after_colon.find('\n').unwrap_or(after_colon.len());
-        let prereq_section = &after_colon[..prereq_end];
-        let prereq_offset = rule_start + colon_pos + 1;
-        for prereq in rule.prerequisites() {
-            for idx in find_words(prereq_section, &prereq) {
-                out.push(RawOccurrence {
-                    symbol: target_symbol(&prereq),
-                    start: prereq_offset + idx,
-                    len: prereq.len(),
-                    is_definition: false,
-                    syntax_kind: SyntaxKind::IdentifierFunction,
-                });
-            }
+        for (prereq, range) in prerequisites_with_ranges(&rule) {
+            out.push(RawOccurrence {
+                symbol: target_symbol(&prereq),
+                start: range.start().into(),
+                len: range.len().into(),
+                is_definition: false,
+                syntax_kind: SyntaxKind::IdentifierFunction,
+            });
         }
     }
 
@@ -351,28 +336,6 @@ fn collect_definitions(
         }
     }
     out
-}
-
-/// Find byte offsets of all whole-word occurrences of `word` in `haystack`.
-fn find_words(haystack: &str, word: &str) -> Vec<usize> {
-    if word.is_empty() {
-        return Vec::new();
-    }
-    let bytes = haystack.as_bytes();
-    haystack
-        .match_indices(word)
-        .filter(|(idx, _)| {
-            let before_ok = *idx == 0 || !is_word_byte(bytes[*idx - 1]);
-            let after = *idx + word.len();
-            let after_ok = after >= bytes.len() || !is_word_byte(bytes[after]);
-            before_ok && after_ok
-        })
-        .map(|(idx, _)| idx)
-        .collect()
-}
-
-fn is_word_byte(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'_'
 }
 
 /// Build symbol-less occurrences carrying the file's diagnostics.
@@ -531,6 +494,49 @@ mod tests {
                 (a_b.as_str(), &vec![0, 0, 0, 3]),
                 (b.as_str(), &vec![0, 4, 0, 5])
             ]
+        );
+    }
+
+    fn prerequisite_occurrences(text: &str) -> Vec<(String, Vec<i32>)> {
+        build_single("Makefile", text)
+            .occurrences
+            .into_iter()
+            .filter(|o| o.symbol_roles & SymbolRole::Definition as i32 == 0)
+            .map(|o| (o.symbol, o.range))
+            .collect()
+    }
+
+    #[test]
+    fn test_prerequisite_inside_other_name() {
+        assert_eq!(
+            prerequisite_occurrences(
+                "a: b-c b
+"
+            ),
+            vec![
+                (target_symbol("b-c"), vec![0, 3, 0, 6]),
+                (target_symbol("b"), vec![0, 7, 0, 8]),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_prerequisites_on_continuation_and_order_only() {
+        assert_eq!(
+            prerequisite_occurrences("a: b \\\n  c | d\n"),
+            vec![
+                (target_symbol("b"), vec![0, 3, 0, 4]),
+                (target_symbol("c"), vec![1, 2, 1, 3]),
+                (target_symbol("d"), vec![1, 6, 1, 7]),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_escaped_prerequisite() {
+        assert_eq!(
+            prerequisite_occurrences("a: b\\#c\n"),
+            vec![(target_symbol("b#c"), vec![0, 3, 0, 7])]
         );
     }
 

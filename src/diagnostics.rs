@@ -4,9 +4,8 @@ use std::collections::{HashMap, HashSet};
 
 use makefile_lossless::{
     ConditionalBranch, Makefile, MakefileItem, MakefileVariant, Parse, ParseErrorKind,
-    ParsedReference, PositionedParseError, ReferenceLocation, Rule, SyntaxKind, VariableReference,
+    ParsedReference, PositionedParseError, ReferenceLocation, Rule, VariableReference,
 };
-use rowan::ast::AstNode;
 use text_size::TextRange;
 use tower_lsp_server::ls_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Range};
 
@@ -1309,19 +1308,12 @@ fn check_unresolved_prerequisites(
         {
             continue;
         }
-        let Some(prereqs) = rule
-            .syntax()
-            .children()
-            .find(|c| c.kind() == SyntaxKind::PREREQUISITES)
-        else {
-            continue;
-        };
-        for prereq in prereqs
-            .children()
-            .filter(|c| c.kind() == SyntaxKind::PREREQUISITE)
+        for range in rule
+            .prerequisite_ranges()
+            .chain(rule.order_only_prerequisite_ranges())
         {
-            let name = prereq.text().to_string();
-            let name = name.trim().trim_start_matches("./");
+            // The name as written, so that escaped names are skipped below.
+            let name = source_text[range].trim_start_matches("./");
             // `-lNAME` is searched for in the linker's library path, and
             // `~` is expanded to a home directory.
             if name.is_empty()
@@ -1338,7 +1330,7 @@ fn check_unresolved_prerequisites(
                 continue;
             }
             diagnostics.push(make_diagnostic(
-                text_range_to_lsp_range(source_text, prereq.text_range()),
+                text_range_to_lsp_range(source_text, range),
                 DiagnosticSeverity::WARNING,
                 "unresolved-prerequisite",
                 format!(

@@ -1,7 +1,6 @@
 //! Source ranges of rule targets and prerequisites.
 
-use makefile_lossless::{Rule, SyntaxKind, TextRange};
-use rowan::ast::AstNode;
+use makefile_lossless::{Rule, TextRange};
 
 /// The targets of `rule` together with their source ranges.
 pub fn targets_with_ranges(rule: &Rule) -> Vec<(String, TextRange)> {
@@ -31,17 +30,8 @@ pub fn prerequisites_with_ranges(rule: &Rule) -> Vec<(String, TextRange)> {
         .chain(rule.order_only_prerequisites())
         .collect();
     let ranges: Vec<TextRange> = rule
-        .syntax()
-        .children_with_tokens()
-        .skip_while(|e| e.kind() != SyntaxKind::OPERATOR)
-        .find_map(|e| {
-            e.into_node()
-                .filter(|n| n.kind() == SyntaxKind::PREREQUISITES)
-        })
-        .into_iter()
-        .flat_map(|n| n.children())
-        .filter(|n| n.kind() == SyntaxKind::PREREQUISITE)
-        .map(|n| n.text_range())
+        .prerequisite_ranges()
+        .chain(rule.order_only_prerequisite_ranges())
         .collect();
     assert_eq!(
         prereqs.len(),
