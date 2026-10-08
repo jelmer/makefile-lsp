@@ -29,7 +29,7 @@ fn selection_range_at(
     source_text: &str,
     position: Position,
 ) -> SelectionRange {
-    let root_range = text_range_to_lsp_range(source_text, makefile.syntax().text_range());
+    let root_range = text_range_to_lsp_range(source_text, makefile.text_range());
     let mut result = SelectionRange {
         range: root_range,
         parent: None,
@@ -40,7 +40,7 @@ fn selection_range_at(
     };
 
     // Walk the syntax tree from root to leaf, collecting enclosing nodes
-    let mut ranges = vec![makefile.syntax().text_range()];
+    let mut ranges = vec![makefile.text_range()];
 
     let mut node = makefile.syntax().clone();
     loop {

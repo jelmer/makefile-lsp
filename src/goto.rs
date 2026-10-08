@@ -1,7 +1,6 @@
 //! Go-to-definition for Makefiles.
 
 use makefile_lossless::Makefile;
-use rowan::ast::AstNode;
 use tower_lsp_server::ls_types::{GotoDefinitionResponse, Location, Position, Range, Uri};
 
 use crate::position::{text_range_to_lsp_range, try_position_to_offset};
@@ -63,7 +62,7 @@ fn find_target_definition(
         .rules()
         .find(|r| r.targets().any(|t| t == target_name))?;
 
-    let range = text_range_to_lsp_range(source_text, rule.syntax().text_range());
+    let range = text_range_to_lsp_range(source_text, rule.text_range());
 
     Some(GotoDefinitionResponse::Scalar(Location {
         uri: uri.clone(),
@@ -80,7 +79,7 @@ fn find_variable_definition(
 ) -> Option<GotoDefinitionResponse> {
     let var_def = makefile.variable_definitions_by_name(var_name).next()?;
 
-    let range = text_range_to_lsp_range(source_text, var_def.syntax().text_range());
+    let range = text_range_to_lsp_range(source_text, var_def.text_range());
 
     Some(GotoDefinitionResponse::Scalar(Location {
         uri: uri.clone(),

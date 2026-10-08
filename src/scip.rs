@@ -14,7 +14,6 @@
 use std::collections::{BTreeMap, HashSet};
 
 use makefile_lossless::Makefile;
-use rowan::ast::AstNode;
 use scip::types::{
     descriptor, symbol_information, Descriptor, Diagnostic, Document, Index, Metadata, Occurrence,
     Package, PositionEncoding, ProtocolVersion, Severity, Symbol, SymbolInformation, SymbolRole,
@@ -219,7 +218,7 @@ fn collect_targets(makefile: &Makefile, text: &str) -> Vec<RawOccurrence> {
     let mut out = Vec::new();
 
     for rule in makefile.rules() {
-        let rule_range = rule.syntax().text_range();
+        let rule_range = rule.text_range();
         let rule_start: usize = rule_range.start().into();
         let rule_text = &text[rule_start..usize::from(rule_range.end())];
 

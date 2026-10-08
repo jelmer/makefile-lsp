@@ -1,7 +1,6 @@
 //! Folding range generation for Makefiles.
 
 use makefile_lossless::Makefile;
-use rowan::ast::AstNode;
 use tower_lsp_server::ls_types::{FoldingRange, FoldingRangeKind};
 
 use crate::position::offset_to_position;
@@ -34,7 +33,7 @@ pub fn generate_folding_ranges(makefile: &Makefile, source_text: &str) -> Vec<Fo
     for rule in makefile.rules() {
         ranges.extend(make_folding_range(
             source_text,
-            rule.syntax().text_range(),
+            rule.text_range(),
             FoldingRangeKind::Region,
         ));
     }
@@ -42,7 +41,7 @@ pub fn generate_folding_ranges(makefile: &Makefile, source_text: &str) -> Vec<Fo
     for cond in makefile.conditionals() {
         ranges.extend(make_folding_range(
             source_text,
-            cond.syntax().text_range(),
+            cond.text_range(),
             FoldingRangeKind::Region,
         ));
     }

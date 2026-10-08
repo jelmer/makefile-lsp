@@ -463,7 +463,7 @@ fn check_self_dependency(source_text: &str, makefile: &Makefile) -> Vec<Diagnost
         for prereq in rule.prerequisites() {
             if targets.contains(&prereq) {
                 // Find the prerequisite position within the PREREQUISITES node
-                let rule_range = text_range_to_lsp_range(source_text, rule.syntax().text_range());
+                let rule_range = text_range_to_lsp_range(source_text, rule.text_range());
                 diagnostics.push(make_diagnostic(
                     rule_range,
                     DiagnosticSeverity::WARNING,
@@ -491,7 +491,7 @@ fn check_circular_dependencies(source_text: &str, makefile: &Makefile) -> Vec<Di
     // Map each target in a reported cycle to a rule range to anchor on.
     let mut target_range: HashMap<String, Range> = HashMap::new();
     for rule in makefile.rules() {
-        let rule_range = text_range_to_lsp_range(source_text, rule.syntax().text_range());
+        let rule_range = text_range_to_lsp_range(source_text, rule.text_range());
         for target in rule.targets() {
             target_range.entry(target).or_insert(rule_range);
         }
@@ -528,7 +528,7 @@ fn check_missing_phony_targets(
     defined_targets.extend(external.targets.iter().cloned());
 
     for rule in makefile.rules_by_target(".PHONY") {
-        let rule_range = text_range_to_lsp_range(source_text, rule.syntax().text_range());
+        let rule_range = text_range_to_lsp_range(source_text, rule.text_range());
         for prereq in rule.prerequisites() {
             if !defined_targets.contains(&prereq) {
                 diagnostics.push(make_diagnostic(
@@ -575,7 +575,7 @@ fn check_unused_phony_targets(
     // range so the diagnostic anchors on the declaration site.
     let mut phony_decls: HashMap<String, Range> = HashMap::new();
     for rule in makefile.rules_by_target(".PHONY") {
-        let range = text_range_to_lsp_range(source_text, rule.syntax().text_range());
+        let range = text_range_to_lsp_range(source_text, rule.text_range());
         for name in rule.prerequisites() {
             phony_decls.entry(name).or_insert(range);
         }
@@ -647,7 +647,7 @@ fn check_include_missing_path(source_text: &str, makefile: &Makefile) -> Vec<Dia
         if let MakefileItem::Include(inc) = item {
             let path = inc.path().unwrap_or_default();
             if path.is_empty() {
-                let range = text_range_to_lsp_range(source_text, inc.syntax().text_range());
+                let range = text_range_to_lsp_range(source_text, inc.text_range());
                 diagnostics.push(make_diagnostic(
                     range,
                     DiagnosticSeverity::ERROR,
@@ -779,9 +779,7 @@ fn check_unused_variables(
             continue;
         }
 
-        let name_range = var_def
-            .name_range()
-            .unwrap_or_else(|| var_def.syntax().text_range());
+        let name_range = var_def.name_range().unwrap_or_else(|| var_def.text_range());
 
         let range = text_range_to_lsp_range(source_text, name_range);
         diagnostics.push(make_diagnostic(
@@ -869,7 +867,7 @@ fn check_empty_rule_probably_phony(
                 continue;
             }
 
-            let rule_range = text_range_to_lsp_range(source_text, rule.syntax().text_range());
+            let rule_range = text_range_to_lsp_range(source_text, rule.text_range());
             diagnostics.push(make_diagnostic(
                 rule_range,
                 DiagnosticSeverity::HINT,
@@ -919,7 +917,7 @@ fn check_mixed_assignment_operators(source_text: &str, makefile: &Makefile) -> V
         let Some(flavour) = classify(&op) else {
             continue;
         };
-        let range = text_range_to_lsp_range(source_text, var_def.syntax().text_range());
+        let range = text_range_to_lsp_range(source_text, var_def.text_range());
         let branches = conditional_branches(var_def.syntax());
         by_name
             .entry(name)
@@ -986,7 +984,7 @@ fn check_unterminated_conditionals(source_text: &str, makefile: &Makefile) -> Ve
             .children()
             .find(|c| c.kind() == SyntaxKind::CONDITIONAL_IF)
             .map(|c| c.text_range())
-            .unwrap_or_else(|| cond.syntax().text_range());
+            .unwrap_or_else(|| cond.text_range());
 
         let range = text_range_to_lsp_range(source_text, opener_range);
         let kind = cond.conditional_type().unwrap_or_default();
@@ -1109,7 +1107,7 @@ fn check_duplicate_prerequisites(source_text: &str, makefile: &Makefile) -> Vec<
         let mut reported: HashSet<&str> = HashSet::new();
         for prereq in &prereqs {
             if !seen.insert(prereq.as_str()) && reported.insert(prereq.as_str()) {
-                let rule_range = text_range_to_lsp_range(source_text, rule.syntax().text_range());
+                let rule_range = text_range_to_lsp_range(source_text, rule.text_range());
                 diagnostics.push(make_diagnostic(
                     rule_range,
                     DiagnosticSeverity::WARNING,
@@ -1161,7 +1159,7 @@ fn check_redundant_transitive_prerequisites(
                 *other != prereq && graph.reachable_from(other, &branches).contains(prereq)
             });
             if let Some(via) = via {
-                let rule_range = text_range_to_lsp_range(source_text, rule.syntax().text_range());
+                let rule_range = text_range_to_lsp_range(source_text, rule.text_range());
                 diagnostics.push(make_diagnostic(
                     rule_range,
                     DiagnosticSeverity::HINT,
