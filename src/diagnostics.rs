@@ -42,6 +42,7 @@ pub struct ExternalSymbols {
     /// Names used as prerequisites of ordinary (non-special) rules.
     prerequisites: HashSet<String>,
     phony: HashSet<String>,
+    exports_all_variables: bool,
 }
 
 impl ExternalSymbols {
@@ -50,6 +51,7 @@ impl ExternalSymbols {
             .extend(makefile.variable_definitions().filter_map(|v| v.name()));
         self.variables_referenced
             .extend(referenced_variables(makefile));
+        self.exports_all_variables |= exports_all_variables(makefile);
         for rule in makefile.rules() {
             let targets: Vec<String> = rule.targets().collect();
             if targets.iter().any(|t| t == ".PHONY") {
@@ -735,7 +737,24 @@ fn referenced_variables(makefile: &Makefile) -> HashSet<String> {
         }
     }
 
+    // `export NAME` passes NAME to recipe environments.
+    for var_def in makefile.variable_definitions() {
+        if var_def.is_export() {
+            referenced.extend(var_def.names());
+        }
+    }
+
     referenced
+}
+
+/// Whether a bare `export` or `.EXPORT_ALL_VARIABLES:` exports every variable.
+fn exports_all_variables(makefile: &Makefile) -> bool {
+    makefile
+        .variable_definitions()
+        .any(|v| v.is_export() && v.names().next().is_none())
+        || makefile
+            .rules()
+            .any(|r| r.targets().any(|t| t == ".EXPORT_ALL_VARIABLES"))
 }
 
 /// Check for variables that are defined but never referenced.
@@ -746,7 +765,9 @@ fn referenced_variables(makefile: &Makefile) -> HashSet<String> {
 /// variables for sub-makes or external tooling.
 ///
 /// Skipped:
-/// - Variables exported with `export` (consumed outside the makefile).
+/// - Variables exported with `export` (consumed outside the makefile),
+///   including all variables if a bare `export` or `.EXPORT_ALL_VARIABLES`
+///   is present.
 /// - Variables overriding a builtin (would change make's behaviour).
 /// - Variables defined inside conditionals (often configuration toggles).
 fn check_unused_variables(
@@ -755,6 +776,9 @@ fn check_unused_variables(
     external: &ExternalSymbols,
 ) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
+    if external.exports_all_variables || exports_all_variables(makefile) {
+        return diagnostics;
+    }
     let referenced = referenced_variables(makefile);
 
     for var_def in makefile.variable_definitions() {
@@ -764,7 +788,8 @@ fn check_unused_variables(
         if referenced.contains(&name) || external.variables_referenced.contains(&name) {
             continue;
         }
-        if var_def.is_export() {
+        // `unexport NAME` doesn't define NAME.
+        if var_def.is_unexport() {
             continue;
         }
         if builtins::is_known_variable(&name) {
@@ -2802,6 +2827,44 @@ mod tests {
         assert!(!codes.contains(&"unused-variable".to_string()));
     }
 
+    fn unused_variable_messages(text: &str) -> Vec<String> {
+        get_diags(text)
+            .into_iter()
+            .filter(|d| d.code == Some(NumberOrString::String("unused-variable".to_string())))
+            .map(|d| d.message)
+            .collect()
+    }
+
+    #[test]
+    fn test_export_directive_counts_as_use() {
+        let empty: Vec<String> = vec![];
+        assert_eq!(unused_variable_messages("Z = 1\nexport Z\n"), empty);
+        assert_eq!(unused_variable_messages("export Z\nZ = 1\n"), empty);
+        assert_eq!(
+            unused_variable_messages("Z = 1\nY = 2\nexport Z Y\n"),
+            empty
+        );
+    }
+
+    #[test]
+    fn test_unexport_does_not_count_as_use() {
+        // `unexport` removes Z from recipe environments; it doesn't read it.
+        assert_eq!(
+            unused_variable_messages("Z = 1\nunexport Z\n"),
+            vec!["variable 'Z' is defined but never used"]
+        );
+    }
+
+    #[test]
+    fn test_export_all_variables_counts_as_use() {
+        let empty: Vec<String> = vec![];
+        assert_eq!(
+            unused_variable_messages("Z = 1\n.EXPORT_ALL_VARIABLES:\n"),
+            empty
+        );
+        assert_eq!(unused_variable_messages("Z = 1\nexport\n"), empty);
+    }
+
     #[test]
     fn test_overriding_builtin_skipped() {
         let text = "CC = my-special-gcc\n";
@@ -3476,6 +3539,23 @@ mod tests {
         // TOOL and unused-variable for FROM_RULES and OUT.
         assert_eq!(file_set_codes(&fx, "Makefile"), empty);
         assert_eq!(file_set_codes(&fx, "rules.mk"), vec!["unused-variable"]);
+    }
+
+    #[test]
+    fn test_cross_file_export_directive() {
+        let fx = crate::workspace::tests::Fixture::new(&[
+            ("Makefile", "Z = 1\ninclude rules.mk\n"),
+            ("rules.mk", "export Z\n"),
+        ]);
+        let empty: Vec<String> = vec![];
+        assert_eq!(file_set_codes(&fx, "Makefile"), empty);
+        assert_eq!(file_set_codes(&fx, "rules.mk"), empty);
+
+        let fx = crate::workspace::tests::Fixture::new(&[
+            ("Makefile", "Z = 1\ninclude rules.mk\n"),
+            ("rules.mk", ".EXPORT_ALL_VARIABLES:\n"),
+        ]);
+        assert_eq!(file_set_codes(&fx, "Makefile"), empty);
     }
 
     #[test]
