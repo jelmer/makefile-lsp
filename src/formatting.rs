@@ -11,6 +11,7 @@
 //! - the file ends with exactly one newline.
 
 use std::borrow::Cow;
+use std::collections::HashSet;
 
 use makefile_lossless::{Makefile, Parse, SyntaxKind};
 use rowan::ast::AstNode;
@@ -120,6 +121,7 @@ fn compute_edits(parsed: &Parse<Makefile>, text: &str) -> Result<Vec<ByteEdit>, 
     // ignores it, so trimming it is safe. Under .ONESHELL the recipe is a
     // single script and could contain e.g. here-documents, so leave it alone.
     let oneshell = makefile.rules_by_target(".ONESHELL").next().is_some();
+    let continued = continued_line_starts(&makefile);
 
     // The conversion only changes the start of lines, so the trailing
     // whitespace of each line is the same in both texts.
@@ -141,7 +143,7 @@ fn compute_edits(parsed: &Parse<Makefile>, text: &str) -> Result<Vec<ByteEdit>, 
             && !text[..ws_start].ends_with('\\')
             && may_trim(
                 &makefile,
-                &converted,
+                &continued,
                 converted_start,
                 converted_ws_start,
                 oneshell,
@@ -156,7 +158,7 @@ fn compute_edits(parsed: &Parse<Makefile>, text: &str) -> Result<Vec<ByteEdit>, 
         converted_start += converted_line.len();
     }
 
-    edits.extend(final_newline_edit(text, tail_start));
+    edits.extend(final_newline_edit(&parsed.tree(), text, tail_start));
     edits.sort_by_key(|e| e.range.start());
     Ok(edits)
 }
@@ -178,6 +180,7 @@ fn tab_indent_edits(parsed: &Parse<Makefile>, text: &str) -> Vec<ByteEdit> {
         return Vec::new();
     }
 
+    let continued = continued_line_starts(&parsed.tree());
     let mut edits = Vec::new();
     for indent in parsed
         .positioned_errors()
@@ -192,7 +195,7 @@ fn tab_indent_edits(parsed: &Parse<Makefile>, text: &str) -> Vec<ByteEdit> {
         let mut line_start = usize::from(indent.start());
         while let Some(newline) = text[line_start..].find('\n') {
             let next_start = line_start + newline + 1;
-            if !ends_with_continuation(&text[line_start..next_start - 1]) {
+            if !continued.contains(&TextSize::from(next_start as u32)) {
                 break;
             }
             line_start = next_start;
@@ -209,26 +212,15 @@ fn tab_indent_edits(parsed: &Parse<Makefile>, text: &str) -> Vec<ByteEdit> {
     edits
 }
 
-/// Whether the line starting at `line_start` continues the previous line,
-/// i.e. the previous line ends in an odd number of backslashes.
-fn is_continuation_line(text: &str, line_start: usize) -> bool {
-    text[..line_start]
-        .strip_suffix('\n')
-        .is_some_and(ends_with_continuation)
-}
-
-/// Whether `text` ends in an odd number of backslashes (ignoring a
-/// trailing carriage return).
-fn ends_with_continuation(text: &str) -> bool {
-    let text = text.strip_suffix('\r').unwrap_or(text);
-    let backslashes = text.len() - text.trim_end_matches('\\').len();
-    backslashes % 2 == 1
+/// The start offsets of lines that continue the previous line.
+fn continued_line_starts(makefile: &Makefile) -> HashSet<TextSize> {
+    makefile.line_continuations().map(|r| r.end()).collect()
 }
 
 /// Whether the trailing whitespace at `ws_start` can be removed.
 fn may_trim(
     makefile: &Makefile,
-    text: &str,
+    continued: &HashSet<TextSize>,
     line_start: usize,
     ws_start: usize,
     oneshell: bool,
@@ -258,7 +250,7 @@ fn may_trim(
         }
     }
     // A continued line outside of a recipe may be part of a variable value.
-    !is_continuation_line(text, line_start)
+    !continued.contains(&TextSize::from(line_start as u32))
 }
 
 /// The end of the last line that has non-whitespace content.
@@ -271,7 +263,7 @@ fn content_end(text: &str) -> usize {
 }
 
 /// Replace everything after the last non-blank line with a single newline.
-fn final_newline_edit(text: &str, tail_start: usize) -> Option<ByteEdit> {
+fn final_newline_edit(makefile: &Makefile, text: &str, tail_start: usize) -> Option<ByteEdit> {
     if tail_start == 0 {
         // Nothing but whitespace.
         return (!text.is_empty()).then(|| ByteEdit {
@@ -280,7 +272,17 @@ fn final_newline_edit(text: &str, tail_start: usize) -> Option<ByteEdit> {
         });
     }
     // Blank lines after a trailing backslash are part of the continued line.
-    if ends_with_continuation(&text[..tail_start]) || &text[tail_start..] == "\n" {
+    let tail = TextSize::from(tail_start as u32);
+    let continued = makefile
+        .line_continuations()
+        .any(|r| r.start() < tail && tail < r.end());
+    // TODO: line_continuations() does not report a backslash at the very
+    // end of the input, so check the text for that case.
+    let backslash_at_eof = tail_start == text.len() && {
+        let backslashes = text.len() - text.trim_end_matches('\\').len();
+        backslashes % 2 == 1
+    };
+    if continued || backslash_at_eof || &text[tail_start..] == "\n" {
         return None;
     }
     Some(ByteEdit {
@@ -489,6 +491,39 @@ mod tests {
     fn test_keeps_blank_line_after_trailing_continuation() {
         let text = "VAR = a \\\n\n\n";
         assert_formats(text, text);
+    }
+
+    #[test]
+    fn test_keeps_continued_comment_whitespace() {
+        let text = "# a \\\n  b  \nall:\n\techo\n";
+        assert_formats(text, text);
+    }
+
+    #[test]
+    fn test_trims_line_after_escaped_backslash() {
+        assert_formats("X = a\\\\\nall: foo  \n", "X = a\\\\\nall: foo\n");
+    }
+
+    #[test]
+    fn test_keeps_trailing_backslash_without_newline() {
+        let text = "VAR = a \\";
+        assert_formats(text, text);
+    }
+
+    #[test]
+    fn test_recipe_continuation_crlf() {
+        assert_formats(
+            "all:\r\n    echo a \\\r\n      b\r\n",
+            "all:\r\n\techo a \\\r\n\t  b\r\n",
+        );
+    }
+
+    #[test]
+    fn test_recipe_continuation_stops_at_escaped_backslash() {
+        assert_formats(
+            "all:\n    echo a \\\\\n    echo b\n",
+            "all:\n\techo a \\\\\n\techo b\n",
+        );
     }
 
     #[test]
