@@ -113,9 +113,7 @@ pub fn generate_semantic_tokens(makefile: &Makefile, source_text: &str) -> Vec<S
                 .into_iter()
                 .map(|(_, range)| (range, TokenType::Keyword, 0)),
         );
-        // TODO: a bare `export A B` only gets a token for its first name;
-        // that needs ranges for VariableDefinition::names() upstream.
-        if let (Some(name), Some(range)) = (def.name(), def.name_range()) {
+        for (name, range) in def.names().zip(def.name_ranges()) {
             let mut mods = TokenModifier::Definition.bitmask();
             if builtins::find_builtin_variable(&name).is_some() {
                 mods |= TokenModifier::DefaultLibrary.bitmask();
@@ -316,7 +314,14 @@ mod tests {
             variable_tokens("override define BODY\nx\nendef\n"),
             vec![(0, 16, 4)]
         );
-        assert_eq!(variable_tokens("unexport A B\n"), vec![(0, 9, 1)]);
+        assert_eq!(
+            variable_tokens("unexport A B\n"),
+            vec![(0, 9, 1), (0, 11, 1)]
+        );
+        assert_eq!(
+            variable_tokens("export A $(B)\n"),
+            vec![(0, 7, 1), (0, 9, 4)]
+        );
     }
 
     /// All tokens in `text`, as (line, start, length, type, modifiers).
