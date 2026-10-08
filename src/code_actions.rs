@@ -564,11 +564,7 @@ fn add_missing_endif_action(
         .all_conditionals()
         .filter(|c| c.text_range().contains_inclusive(offset))
         .filter(|c| c.conditional_type().is_some())
-        .filter(|c| {
-            !c.syntax()
-                .children_with_tokens()
-                .any(|child| child.kind() == SyntaxKind::CONDITIONAL_ENDIF)
-        })
+        .filter(|c| !c.has_endif())
         .max_by_key(|c| c.text_range().start())?;
 
     let original_range = cond.text_range();
@@ -1086,7 +1082,7 @@ fn inline_prerequisite_action(
     }
 
     let graph = crate::dep_graph::DependencyGraph::from_makefile(&makefile);
-    let branches = crate::conditionals::conditional_branches(rule.syntax());
+    let branches = rule.enclosing_branches();
     let via = prereqs.iter().find(|other| {
         other.as_str() != cursor_prereq.as_str()
             && graph
