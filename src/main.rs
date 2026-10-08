@@ -306,6 +306,7 @@ impl LanguageServer for Backend {
                                     SemanticTokenType::COMMENT,
                                     SemanticTokenType::new("makefilePrerequisite"),
                                     SemanticTokenType::new("makefileRecipe"),
+                                    SemanticTokenType::KEYWORD,
                                 ],
                                 token_modifiers: vec![
                                     SemanticTokenModifier::DEFINITION,
