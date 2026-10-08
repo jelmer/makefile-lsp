@@ -10,7 +10,9 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 
-use makefile_lossless::{Makefile, Recipe, SyntaxKind};
+use makefile_lossless::{
+    split_references, Makefile, MakefileVariant, Recipe, SyntaxKind, TextPart,
+};
 use rowan::ast::AstNode;
 use tower_lsp_server::ls_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Position, Range};
 
@@ -121,67 +123,34 @@ fn shell_program(makefile: &Makefile) -> Option<String> {
 /// commands, so unless an operator follows it becomes the separate command
 /// `:;`. Elsewhere it becomes a placeholder word.
 fn shell_script(shell_text: &str) -> String {
-    let mut rest =
+    let rest =
         shell_text.trim_start_matches(|c: char| matches!(c, '@' | '-' | '+') || c.is_whitespace());
     let mut out = String::with_capacity(rest.len());
-    while let Some(i) = rest.find('$') {
-        out.push_str(&rest[..i]);
-        let after = &rest[i + 1..];
-        if after.is_empty() {
-            out.push('$');
-            rest = after;
-            break;
-        }
-        if let Some(tail) = after.strip_prefix('$') {
-            out.push('$');
-            rest = tail;
-            continue;
-        }
-        let (reference, tail) = after.split_at(reference_length(after));
-        let operator_follows = skip_blanks_forward(tail)
-            .chars()
-            .next()
-            .is_none_or(|c| matches!(c, '|' | '&' | ';' | '<' | '>' | ')'));
-        if operator_follows || !in_command_position(&out) {
-            out.push_str(PLACEHOLDER);
-        } else {
-            out.push_str(":;");
-        }
-        // Keep line numbers stable for references split over lines.
-        for _ in reference.matches('\n') {
-            out.push_str("\\\n");
-        }
-        rest = tail;
-    }
-    out.push_str(rest);
-    out
-}
-
-/// The length of the make reference at the start of `text`, which follows
-/// a `$`.
-fn reference_length(text: &str) -> usize {
-    let mut chars = text.char_indices();
-    let Some((_, open)) = chars.next() else {
-        return 0;
-    };
-    let close = match open {
-        '(' => ')',
-        '{' => '}',
-        _ => return open.len_utf8(),
-    };
-    // make only counts the bracket type the reference was opened with.
-    let mut depth = 1;
-    for (i, c) in chars {
-        if c == open {
-            depth += 1;
-        } else if c == close {
-            depth -= 1;
-            if depth == 0 {
-                return i + 1;
+    for part in split_references(rest, MakefileVariant::GNUMake) {
+        let range = part.range();
+        let text = &rest[range.clone()];
+        match part {
+            TextPart::EscapedDollar(_) => out.push('$'),
+            // A lone `$` at the end of the line is passed through.
+            TextPart::Reference { .. } if text != "$" => {
+                let operator_follows = skip_blanks_forward(&rest[range.end..])
+                    .chars()
+                    .next()
+                    .is_none_or(|c| matches!(c, '|' | '&' | ';' | '<' | '>' | ')'));
+                if operator_follows || !in_command_position(&out) {
+                    out.push_str(PLACEHOLDER);
+                } else {
+                    out.push_str(":;");
+                }
+                // Keep line numbers stable for references split over lines.
+                for _ in text.matches('\n') {
+                    out.push_str("\\\n");
+                }
             }
+            _ => out.push_str(text),
         }
     }
-    text.len()
+    out
 }
 
 /// Strip leading blanks and line continuations.
@@ -327,6 +296,14 @@ mod tests {
         assert_eq!(
             shell_script("@-$(CC) -o $@ ${SRCS} $$HOME $(call f,$(x),(y)) x$(Y)z"),
             ":; -o __make_ref__ __make_ref__ $HOME __make_ref__ x__make_ref__z"
+        );
+    }
+
+    #[test]
+    fn test_shell_script_bracket_types() {
+        assert_eq!(
+            shell_script("echo $(a ${b)} ${c $(d}) $"),
+            "echo __make_ref__} __make_ref__) $"
         );
     }
 
