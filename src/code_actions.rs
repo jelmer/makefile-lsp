@@ -417,7 +417,7 @@ fn replace_spaces_with_tab_action(
     byte_offset: usize,
     uri: &Uri,
 ) -> Option<CodeAction> {
-    let indent = space_indented_recipes(parsed, source_text).find(|range| {
+    let indent = space_indented_recipes(parsed).find(|range| {
         let start = usize::from(range.start());
         start <= byte_offset && !source_text[start..byte_offset].contains('\n')
     })?;
@@ -425,14 +425,13 @@ fn replace_spaces_with_tab_action(
 }
 
 /// Ranges of the leading spaces of recipe lines indented with spaces.
-fn space_indented_recipes<'a>(
-    parsed: &'a Parse<Makefile>,
-    source_text: &'a str,
-) -> impl Iterator<Item = text_size::TextRange> + 'a {
+fn space_indented_recipes(
+    parsed: &Parse<Makefile>,
+) -> impl Iterator<Item = text_size::TextRange> + '_ {
     parsed
         .positioned_errors()
         .iter()
-        .filter_map(|error| crate::diagnostics::space_indent_range(source_text, error))
+        .filter_map(|error| error.space_indent_range())
 }
 
 /// Build a quick fix replacing each of `ranges` with a tab.
@@ -795,7 +794,7 @@ fn replace_all_spaces_with_tabs_action(
     source_text: &str,
     uri: &Uri,
 ) -> Option<CodeAction> {
-    let ranges: Vec<_> = space_indented_recipes(parsed, source_text).collect();
+    let ranges: Vec<_> = space_indented_recipes(parsed).collect();
     if ranges.len() < 2 {
         return None;
     }

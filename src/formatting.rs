@@ -17,7 +17,6 @@ use rowan::ast::AstNode;
 use text_size::{TextRange, TextSize};
 use tower_lsp_server::ls_types::{Range, TextEdit};
 
-use crate::diagnostics::space_indent_range;
 use crate::position::text_range_to_lsp_range;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -182,7 +181,7 @@ fn tab_indent_edits(parsed: &Parse<Makefile>, text: &str) -> Vec<ByteEdit> {
     for indent in parsed
         .positioned_errors()
         .iter()
-        .filter_map(|error| space_indent_range(text, error))
+        .filter_map(|error| error.space_indent_range())
     {
         let base = &text[indent];
         edits.push(ByteEdit {

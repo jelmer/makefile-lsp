@@ -7,7 +7,7 @@ use makefile_lossless::{
     PositionedParseError, Rule, SyntaxKind, VariableReference,
 };
 use rowan::ast::AstNode;
-use text_size::{TextRange, TextSize};
+use text_size::TextRange;
 use tower_lsp_server::ls_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Range};
 
 use crate::builtins;
@@ -207,7 +207,7 @@ fn collect_diagnostics(
 /// both parse errors, but common enough mistakes to get their own codes (and
 /// quick fixes in code_actions).
 fn parse_error_diagnostic(source_text: &str, error: &PositionedParseError) -> Diagnostic {
-    if let Some(indent) = space_indent_range(source_text, error) {
+    if let Some(indent) = error.space_indent_range() {
         return make_diagnostic(
             text_range_to_lsp_range(source_text, indent),
             DiagnosticSeverity::ERROR,
@@ -217,7 +217,7 @@ fn parse_error_diagnostic(source_text: &str, error: &PositionedParseError) -> Di
     }
     if error.kind() == ParseErrorKind::RecipeBeforeFirstTarget {
         return make_diagnostic(
-            text_range_to_lsp_range(source_text, line_range(source_text, error.range.start())),
+            text_range_to_lsp_range(source_text, error.line_range()),
             DiagnosticSeverity::ERROR,
             "orphan-recipe-line",
             "recipe line is not attached to any target".to_string(),
@@ -229,56 +229,6 @@ fn parse_error_diagnostic(source_text: &str, error: &PositionedParseError) -> Di
         error.code.as_deref().unwrap_or("parse-error"),
         error.message.clone(),
     )
-}
-
-/// If `error` is a missing separator on a line indented with spaces, return
-/// the range of those spaces.
-///
-/// GNU make only accepts a tab (or `.RECIPEPREFIX`) before a recipe line, so
-/// a space-indented recipe is parsed as a rule without a `:`. A line of plain
-/// text indented with spaces is almost always a recipe that was meant to be
-/// indented with a tab.
-pub fn space_indent_range(source_text: &str, error: &PositionedParseError) -> Option<TextRange> {
-    if error.kind() != ParseErrorKind::MissingSeparator {
-        return None;
-    }
-    // The error is reported at the end of the line, which may be a
-    // continuation line.
-    let line = line_range(
-        source_text,
-        logical_line_start(source_text, error.range.start()),
-    );
-    let line_text = &source_text[line];
-    let spaces = line_text.len() - line_text.trim_start_matches(' ').len();
-    if spaces == 0 {
-        return None;
-    }
-    Some(TextRange::at(line.start(), TextSize::from(spaces as u32)))
-}
-
-/// The start of the logical line containing `offset`, i.e. the first of the
-/// physical lines joined to it by backslash continuations.
-fn logical_line_start(source_text: &str, offset: TextSize) -> TextSize {
-    let mut start = line_range(source_text, offset).start();
-    while let Some(prev) = source_text[..usize::from(start)].strip_suffix('\n') {
-        let prev = prev.strip_suffix('\r').unwrap_or(prev);
-        let backslashes = prev.len() - prev.trim_end_matches('\\').len();
-        if backslashes % 2 == 0 {
-            break;
-        }
-        start = line_range(source_text, TextSize::from(prev.len() as u32)).start();
-    }
-    start
-}
-
-/// The range of the line containing `offset`, excluding its line ending.
-fn line_range(source_text: &str, offset: TextSize) -> TextRange {
-    let offset: usize = offset.into();
-    let start = source_text[..offset].rfind('\n').map_or(0, |i| i + 1);
-    let end = source_text[offset..]
-        .find('\n')
-        .map_or(source_text.len(), |i| offset + i);
-    TextRange::new(TextSize::from(start as u32), TextSize::from(end as u32))
 }
 
 /// Check for references to undefined variables.
@@ -3148,6 +3098,53 @@ mod tests {
             "recipe line is not attached to any target"
         );
         assert_eq!(orphans[0].severity, Some(DiagnosticSeverity::ERROR));
+    }
+
+    fn orphan_ranges(text: &str) -> Vec<Range> {
+        get_diags(text)
+            .into_iter()
+            .filter(|d| d.code == Some(NumberOrString::String("orphan-recipe-line".to_string())))
+            .map(|d| d.range)
+            .collect()
+    }
+
+    #[test]
+    fn test_orphan_recipe_range() {
+        assert_eq!(
+            orphan_ranges("VAR = 1\n\techo orphan\n"),
+            vec![Range::new(Position::new(1, 0), Position::new(1, 12))]
+        );
+    }
+
+    #[test]
+    fn test_orphan_recipe_range_crlf() {
+        assert_eq!(
+            orphan_ranges("VAR = 1\r\n\techo orphan\r\n"),
+            vec![Range::new(Position::new(1, 0), Position::new(1, 12))]
+        );
+    }
+
+    #[test]
+    fn test_orphan_recipe_range_continued_line() {
+        assert_eq!(
+            orphan_ranges("VAR = 1\n\techo a \\\n\t  b\n"),
+            vec![Range::new(Position::new(1, 0), Position::new(2, 4))]
+        );
+    }
+
+    #[test]
+    fn test_spaces_instead_of_tab_range_crlf_continued_line() {
+        let diags = get_diags("all:\r\n    echo a \\\r\n  b\r\n");
+        assert_eq!(
+            diags
+                .iter()
+                .filter(
+                    |d| d.code == Some(NumberOrString::String("spaces-instead-of-tab".to_string()))
+                )
+                .map(|d| d.range)
+                .collect::<Vec<_>>(),
+            vec![Range::new(Position::new(1, 0), Position::new(1, 4))]
+        );
     }
 
     #[test]
