@@ -185,7 +185,7 @@ fn create_target_action(
         return None;
     }
 
-    let original_range = makefile.syntax().text_range();
+    let original_range = makefile.text_range();
     let mut updated = parsed.tree();
     updated.try_add_rule(&name).ok()?;
     // The rule is appended, so only the new text needs to be inserted.
@@ -331,7 +331,7 @@ fn add_phony_action(
     // Find the insert position: after the last .PHONY line, or at the top of the file
     let edit = if let Some(last_phony) = makefile.rules_by_target(".PHONY").last() {
         // Append to the last .PHONY rule's prerequisites
-        let phony_range = last_phony.syntax().text_range();
+        let phony_range = last_phony.text_range();
         let end = offset_to_position(source_text, phony_range.end());
         // Insert before the newline at end of the .PHONY line
         let insert_pos = Position::new(end.line, 0);
@@ -480,9 +480,9 @@ fn remove_trailing_whitespace_action(
     let makefile = parsed.tree();
     let mut var_def = makefile
         .variable_definitions()
-        .find(|v| v.syntax().text_range().contains(offset))?;
+        .find(|v| v.text_range().contains(offset))?;
 
-    let original_range = var_def.syntax().text_range();
+    let original_range = var_def.text_range();
     if !var_def.trim_trailing_value_whitespace() {
         return None;
     }
@@ -518,7 +518,7 @@ fn convert_to_simply_expanded_action(
     let makefile = parsed.tree();
     let mut var_def = makefile
         .variable_definitions()
-        .find(|v| v.syntax().text_range().contains(offset))?;
+        .find(|v| v.text_range().contains(offset))?;
 
     if var_def.assignment_operator().as_deref() != Some("=") {
         return None;
@@ -533,7 +533,7 @@ fn convert_to_simply_expanded_action(
         return None;
     }
 
-    let original_range = var_def.syntax().text_range();
+    let original_range = var_def.text_range();
     var_def.set_assignment_operator(":=");
     let edit = edit_for_node_change(source_text, original_range, &var_def);
 
@@ -570,16 +570,16 @@ fn add_missing_endif_action(
         .syntax()
         .descendants()
         .filter_map(Conditional::cast)
-        .filter(|c| c.syntax().text_range().contains_inclusive(offset))
+        .filter(|c| c.text_range().contains_inclusive(offset))
         .filter(|c| c.conditional_type().is_some())
         .filter(|c| {
             !c.syntax()
                 .children_with_tokens()
                 .any(|child| child.kind() == SyntaxKind::CONDITIONAL_ENDIF)
         })
-        .max_by_key(|c| c.syntax().text_range().start())?;
+        .max_by_key(|c| c.text_range().start())?;
 
-    let original_range = cond.syntax().text_range();
+    let original_range = cond.text_range();
     if !cond.add_endif().ok()? {
         return None;
     }
@@ -755,7 +755,7 @@ fn sort_phony_prerequisites_action(
     let makefile = parsed.tree();
     let mut rule = makefile
         .rules_by_target(".PHONY")
-        .find(|r| r.syntax().text_range().contains(offset))?;
+        .find(|r| r.text_range().contains(offset))?;
 
     let current: Vec<String> = rule.prerequisites().collect();
     if current.len() < 2 {
@@ -767,7 +767,7 @@ fn sort_phony_prerequisites_action(
         return None;
     }
 
-    let original_range = rule.syntax().text_range();
+    let original_range = rule.text_range();
     let sorted_refs: Vec<&str> = sorted.iter().map(|s| s.as_str()).collect();
     rule.set_prerequisites(sorted_refs).ok()?;
     let edit = edit_for_node_change(source_text, original_range, &rule);
@@ -831,7 +831,7 @@ fn inline_variable_action(
     let makefile = parsed.tree();
     let var_def = makefile
         .variable_definitions()
-        .find(|v| v.syntax().text_range().contains(offset))?;
+        .find(|v| v.text_range().contains(offset))?;
     let name = var_def.name()?;
     let op = var_def.assignment_operator()?;
     if !matches!(op.as_str(), "=" | ":=" | "::=" | ":::=") {
@@ -856,11 +856,7 @@ fn inline_variable_action(
         }
         // Skip references inside the variable's own value EXPR (shouldn't
         // happen since we required no `$` in value, but defensive).
-        if var_def
-            .syntax()
-            .text_range()
-            .contains_range(var_ref.text_range())
-        {
+        if var_def.text_range().contains_range(var_ref.text_range()) {
             continue;
         }
         // name() leaves out modifiers, so `$(NAME:.c=.o)` matches too.
@@ -889,7 +885,7 @@ fn inline_variable_action(
 
     // Remove the variable definition's line — its full text range plus any
     // trailing newline already covered by the definition node.
-    let def_range = var_def.syntax().text_range();
+    let def_range = var_def.text_range();
     edits.push(TextEdit {
         range: text_range_to_lsp_range(source_text, def_range),
         new_text: String::new(),
@@ -1026,7 +1022,7 @@ fn attach_to_default_goal_action(
         return None;
     }
 
-    let original_range = goal_rule.syntax().text_range();
+    let original_range = goal_rule.text_range();
     goal_rule.add_prerequisite(&target).ok()?;
     let edit = edit_for_node_change(source_text, original_range, &goal_rule);
 
@@ -1074,9 +1070,7 @@ fn inline_prerequisite_action(
     let offset = text_size::TextSize::from(byte_offset as u32);
     let makefile = parsed.tree();
 
-    let mut rule = makefile
-        .rules()
-        .find(|r| r.syntax().text_range().contains(offset))?;
+    let mut rule = makefile.rules().find(|r| r.text_range().contains(offset))?;
 
     // Locate the IDENTIFIER token under the cursor that lives inside a
     // PREREQUISITES node — that's the prereq we'd remove.
@@ -1120,7 +1114,7 @@ fn inline_prerequisite_action(
         new_prereqs.push(p.clone());
     }
 
-    let original_range = rule.syntax().text_range();
+    let original_range = rule.text_range();
     let refs: Vec<&str> = new_prereqs.iter().map(String::as_str).collect();
     rule.set_prerequisites(refs).ok()?;
     let edit = edit_for_node_change(source_text, original_range, &rule);

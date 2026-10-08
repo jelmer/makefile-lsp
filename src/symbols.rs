@@ -1,7 +1,6 @@
 //! Document symbol generation for Makefiles.
 
 use makefile_lossless::Makefile;
-use rowan::ast::AstNode;
 use tower_lsp_server::ls_types::{DocumentSymbol, SymbolKind};
 
 use crate::position::text_range_to_lsp_range;
@@ -20,7 +19,7 @@ pub fn generate_document_symbols(makefile: &Makefile, source_text: &str) -> Vec<
             continue;
         }
 
-        let range = text_range_to_lsp_range(source_text, rule.syntax().text_range());
+        let range = text_range_to_lsp_range(source_text, rule.text_range());
         let selection_range = rule
             .target_ranges()
             .reduce(|a, b| a.cover(b))
@@ -43,7 +42,7 @@ pub fn generate_document_symbols(makefile: &Makefile, source_text: &str) -> Vec<
             continue;
         };
 
-        let range = text_range_to_lsp_range(source_text, var.syntax().text_range());
+        let range = text_range_to_lsp_range(source_text, var.text_range());
         let selection_range = var
             .name_range()
             .map_or(range, |r| text_range_to_lsp_range(source_text, r));
