@@ -13,7 +13,9 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use makefile_lossless::{Makefile, MakefileVariant, Parse, TextRange, TextSize};
+use makefile_lossless::{
+    Include, IncludeKind, Makefile, MakefileVariant, Parse, TextRange, TextSize,
+};
 use tower_lsp_server::ls_types::Uri;
 
 /// Upper bound on the number of files visited when following includes.
@@ -116,26 +118,31 @@ pub struct IncludePath {
     pub range: TextRange,
     /// Whether this is a `-include` or `sinclude`, which tolerate missing files.
     pub optional: bool,
+    /// Whether this is a GNU make include, whose expanded name make splits
+    /// into file names, unescaping blanks.
+    pub gnu: bool,
 }
 
 /// List the file names of all include directives in a makefile, including
 /// those inside conditionals.
 ///
 /// GNU make allows several names per directive; each gets its own entry.
-///
-/// TODO: unescape backslash-escaped whitespace in names, as make does after
-/// expansion.
 pub fn include_paths(makefile: &Makefile) -> Vec<IncludePath> {
     makefile
         .includes()
         .flat_map(|inc| {
             let optional = inc.is_optional();
+            let gnu = matches!(
+                inc.include_kind(),
+                Some(IncludeKind::Include | IncludeKind::DashInclude | IncludeKind::Sinclude)
+            );
             inc.paths()
                 .zip(inc.path_ranges())
                 .map(|(name, range)| IncludePath {
                     name,
                     range,
                     optional,
+                    gnu,
                 })
                 .collect::<Vec<_>>()
         })
@@ -275,15 +282,23 @@ pub struct ResolvedInclude {
 /// TODO: try `-I` directories and make's default include directories; those
 /// aren't known to the server.
 pub fn resolve_include(
-    name: &str,
+    path: &IncludePath,
     vars: &LiteralVariables,
     cwd: Option<&Path>,
     dir: Option<&Path>,
     exists: &dyn Fn(&Path) -> bool,
 ) -> Resolution {
-    let Some(expanded) = expand(name, vars, cwd) else {
+    let Some(mut expanded) = expand(&path.name, vars, cwd) else {
         return Resolution::Unresolved;
     };
+    if path.gnu {
+        // `path` is a single name and literal values contain no blanks, so
+        // this only unescapes blanks.
+        let Ok([name]) = <[String; 1]>::try_from(Include::split_file_names(&expanded)) else {
+            return Resolution::Unresolved;
+        };
+        expanded = name;
+    }
     let expanded = Path::new(&expanded);
     let candidates: Vec<PathBuf> = if expanded.is_absolute() {
         vec![normalize(expanded)]
@@ -709,7 +724,7 @@ impl Workspace {
         let mut children = BTreeSet::new();
         for path in include_paths(&makefile) {
             let exists = |p: &Path| self.open_paths.contains_key(p) || p.is_file();
-            let mut resolution = resolve_include(&path.name, &walk.vars, cwd, doc.dir(), &exists);
+            let mut resolution = resolve_include(&path, &walk.vars, cwd, doc.dir(), &exists);
             if let Resolution::Found(target) = &resolution {
                 let target = target.clone();
                 children.insert(target.clone());
@@ -1011,13 +1026,22 @@ pub mod tests {
         assert_eq!(normalize(Path::new("a/../../b")), PathBuf::from("../b"));
     }
 
+    fn gnu_path(name: &str) -> IncludePath {
+        IncludePath {
+            name: name.to_string(),
+            range: TextRange::default(),
+            optional: false,
+            gnu: true,
+        }
+    }
+
     #[test]
     fn test_resolve_prefers_cwd() {
         let v = LiteralVariables::default();
         let exists = |p: &Path| p == Path::new("/top/x.mk") || p == Path::new("/top/sub/x.mk");
         assert_eq!(
             resolve_include(
-                "x.mk",
+                &gnu_path("x.mk"),
                 &v,
                 Some(Path::new("/top")),
                 Some(Path::new("/top/sub")),
@@ -1027,7 +1051,7 @@ pub mod tests {
         );
         assert_eq!(
             resolve_include(
-                "x.mk",
+                &gnu_path("x.mk"),
                 &v,
                 Some(Path::new("/elsewhere")),
                 Some(Path::new("/top/sub")),
@@ -1036,12 +1060,39 @@ pub mod tests {
             Resolution::Found(PathBuf::from("/top/sub/x.mk"))
         );
         assert_eq!(
-            resolve_include("y.mk", &v, Some(Path::new("/top")), None, &exists),
+            resolve_include(
+                &gnu_path("y.mk"),
+                &v,
+                Some(Path::new("/top")),
+                None,
+                &exists
+            ),
             Resolution::Missing(PathBuf::from("/top/y.mk"))
         );
         assert_eq!(
-            resolve_include("y.mk", &v, None, None, &exists),
+            resolve_include(&gnu_path("y.mk"), &v, None, None, &exists),
             Resolution::Unresolved
+        );
+    }
+
+    #[test]
+    fn test_resolve_bsd_name_not_split() {
+        let text = ".include <a b.mk>\n";
+        let makefile = Makefile::parse_with_variant(text, MakefileVariant::BSDMake).tree();
+        let paths = include_paths(&makefile);
+        let exists = |p: &Path| p == Path::new("/top/a b.mk");
+        assert_eq!(
+            paths
+                .iter()
+                .map(|p| resolve_include(
+                    p,
+                    &LiteralVariables::default(),
+                    Some(Path::new("/top")),
+                    None,
+                    &exists
+                ))
+                .collect::<Vec<_>>(),
+            vec![Resolution::Found(PathBuf::from("/top/a b.mk"))]
         );
     }
 
@@ -1061,6 +1112,16 @@ pub mod tests {
                 .collect::<Vec<_>>(),
             vec![Resolution::Found(fx.path("a.mk"))]
         );
+    }
+
+    #[test]
+    fn test_file_set_include_escaped_space() {
+        let fx = Fixture::new(&[
+            ("Makefile", "B = b\ninclude a\\ $(B).mk\n"),
+            ("a b.mk", "X = 1\n"),
+        ]);
+        let set = fx.file_set("Makefile");
+        assert_eq!(fx.names(&set), vec!["Makefile", "a b.mk"]);
     }
 
     #[test]

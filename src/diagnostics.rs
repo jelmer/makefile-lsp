@@ -86,7 +86,7 @@ pub fn get_diagnostics(
                 .into_iter()
                 .map(|path| {
                     let resolution =
-                        resolve_include(&path.name, &vars, Some(dir), Some(dir), &|p| p.is_file());
+                        resolve_include(&path, &vars, Some(dir), Some(dir), &|p| p.is_file());
                     ResolvedInclude { path, resolution }
                 })
                 .collect()
