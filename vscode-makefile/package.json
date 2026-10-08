@@ -105,7 +105,8 @@
           "makefileVariable.defaultLibrary": ["support.variable.builtin.makefile"],
           "makefilePrerequisite": ["entity.name.type.prerequisite.makefile"],
           "makefileRecipe": ["string.unquoted.recipe.makefile"],
-          "comment": ["comment.line.number-sign.makefile"]
+          "comment": ["comment.line.number-sign.makefile"],
+          "keyword": ["keyword.control.makefile"]
         }
       }
     ]

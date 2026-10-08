@@ -5,8 +5,8 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use makefile_lossless::{
-    Conditional, Include, Makefile, MakefileVariant, Parse, ParseErrorKind, ReferenceLocation,
-    Rule, SyntaxKind, TextSize, VariableReference,
+    Conditional, Makefile, MakefileVariant, Parse, ParseErrorKind, ReferenceLocation, Rule,
+    SyntaxKind, TextSize, VariableReference,
 };
 use rowan::ast::AstNode;
 use tower_lsp_server::ls_types::{
@@ -242,22 +242,16 @@ fn make_include_optional_action(
 ) -> Option<CodeAction> {
     let offset = text_size::TextSize::from(byte_offset as u32);
     let include = makefile
-        .syntax()
-        .descendants()
-        .filter(|n| n.text_range().contains(offset))
-        .find_map(Include::cast)?;
-    if include.is_optional() {
-        return None;
-    }
+        .includes()
+        .find(|include| include.text_range().contains(offset))?;
     // BSD (`.include`) and nmake (`!include`) keywords have no `-include`
     // spelling.
-    let keyword = include
-        .syntax()
-        .first_token()
-        .filter(|t| t.text() == "include")?;
+    if include.keyword()? != "include" {
+        return None;
+    }
 
     let edit = TextEdit {
-        range: text_range_to_lsp_range(source_text, keyword.text_range()),
+        range: text_range_to_lsp_range(source_text, include.keyword_range()?),
         new_text: "-include".to_string(),
     };
     let mut changes = std::collections::HashMap::new();
