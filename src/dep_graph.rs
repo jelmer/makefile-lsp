@@ -13,11 +13,29 @@
 
 use std::collections::{HashMap, HashSet};
 
-use makefile_lossless::Makefile;
-use rowan::ast::AstNode;
-use text_size::TextRange;
+use makefile_lossless::{ConditionalBranch, Makefile};
 
-use crate::conditionals::{combine, conditional_branches, Branches};
+type Branches = Vec<ConditionalBranch>;
+
+/// Whether two sets of conditional branches can never be taken together.
+pub fn mutually_exclusive(a: &[ConditionalBranch], b: &[ConditionalBranch]) -> bool {
+    a.iter().any(|x| b.iter().any(|y| x.is_exclusive_with(y)))
+}
+
+/// The branches taken when both `a` and `b` are, sorted so that equal sets
+/// compare equal, or `None` if they are mutually exclusive.
+fn combine(a: &[ConditionalBranch], b: &[ConditionalBranch]) -> Option<Branches> {
+    if mutually_exclusive(a, b) {
+        return None;
+    }
+    let mut combined: Branches = a.iter().chain(b).cloned().collect();
+    combined.sort_by_key(|branch| {
+        let range = branch.conditional().text_range();
+        (range.start(), range.end(), branch.index())
+    });
+    combined.dedup();
+    Some(combined)
+}
 
 /// Special targets where multiple definitions accumulate prerequisites rather
 /// than redefining the rule.
@@ -103,7 +121,7 @@ impl DependencyGraph {
         let mut edges: HashMap<String, Vec<Edge>> = HashMap::new();
         for rule in makefile.rules() {
             let prereqs: Vec<String> = rule.prerequisites().collect();
-            let branches = conditional_branches(rule.syntax());
+            let branches = rule.enclosing_branches();
             for target in rule.targets() {
                 if !is_graph_target(&target) {
                     continue;
@@ -153,7 +171,7 @@ impl DependencyGraph {
     /// Edges out of `node` that can be followed when the conditional
     /// branches in `context` are taken, sorted by prerequisite, each with the
     /// branches taken after following it.
-    fn successors(&self, node: &str, context: &[(TextRange, usize)]) -> Vec<(&str, Branches)> {
+    fn successors(&self, node: &str, context: &[ConditionalBranch]) -> Vec<(&str, Branches)> {
         self.edges
             .get(node)
             .into_iter()
@@ -166,7 +184,7 @@ impl DependencyGraph {
     /// can be taken together with the conditional branches in `context`
     /// (e.g. those of the rule asking), not including `start` itself.
     /// Returns an empty set if `start` isn't a target. Cycle-safe.
-    pub fn reachable_from(&self, start: &str, context: &[(TextRange, usize)]) -> HashSet<String> {
+    pub fn reachable_from(&self, start: &str, context: &[ConditionalBranch]) -> HashSet<String> {
         let mut reached: HashSet<String> = HashSet::new();
         let mut visited: HashSet<(&str, Branches)> = HashSet::new();
         let mut stack = self.successors(start, context);
@@ -287,6 +305,31 @@ mod tests {
             .collect()
     }
 
+    fn rule_branches(text: &str) -> Vec<Branches> {
+        let parsed: Parse<Makefile> = Makefile::parse(text);
+        parsed
+            .tree()
+            .rules()
+            .map(|r| r.enclosing_branches())
+            .collect()
+    }
+
+    #[test]
+    fn combine_rejects_other_branch() {
+        let b = rule_branches("ifdef X\na:\nelse\nb:\nendif\nc:\n");
+        assert_eq!(combine(&b[0], &b[1]), None);
+        assert_eq!(combine(&b[0], &b[2]), Some(b[0].clone()));
+        assert_eq!(combine(&b[0], &b[0]), Some(b[0].clone()));
+    }
+
+    #[test]
+    fn combine_merges_unrelated_conditionals() {
+        let b = rule_branches("ifdef X\na:\nendif\nifdef Y\nb:\nendif\n");
+        let combined = vec![b[0][0].clone(), b[1][0].clone()];
+        assert_eq!(combine(&b[0], &b[1]), Some(combined.clone()));
+        assert_eq!(combine(&b[1], &b[0]), Some(combined));
+    }
+
     #[test]
     fn empty_makefile_has_no_edges() {
         let g = graph("");
@@ -355,7 +398,7 @@ mod tests {
         let makefile = parsed.tree();
         let g = DependencyGraph::from_makefile(&makefile);
         let all_rule = makefile.rules_by_target("all").next().unwrap();
-        let else_branch = conditional_branches(all_rule.syntax());
+        let else_branch = all_rule.enclosing_branches();
         assert_eq!(g.reachable_from("b", &[]), HashSet::from(["c".to_string()]));
         assert_eq!(g.reachable_from("b", &else_branch), HashSet::new());
     }

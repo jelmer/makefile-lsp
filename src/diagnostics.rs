@@ -3,15 +3,15 @@
 use std::collections::{HashMap, HashSet};
 
 use makefile_lossless::{
-    Makefile, MakefileItem, MakefileVariant, Parse, ParseErrorKind, ParsedReference,
-    PositionedParseError, ReferenceLocation, Rule, SyntaxKind, VariableReference,
+    ConditionalBranch, Makefile, MakefileItem, MakefileVariant, Parse, ParseErrorKind,
+    ParsedReference, PositionedParseError, ReferenceLocation, Rule, SyntaxKind, VariableReference,
 };
 use rowan::ast::AstNode;
 use text_size::TextRange;
 use tower_lsp_server::ls_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Range};
 
 use crate::builtins;
-use crate::conditionals::{conditional_branches, mutually_exclusive, Branches};
+use crate::dep_graph::mutually_exclusive;
 use crate::position::text_range_to_lsp_range;
 use crate::targets::targets_with_ranges;
 use crate::workspace::{FileSet, Resolution, ResolvedInclude};
@@ -343,10 +343,10 @@ fn separated_rules(makefile: &Makefile) -> impl Iterator<Item = Rule> + '_ {
 /// conditional, since only one of those takes effect.
 fn check_duplicate_targets(source_text: &str, makefile: &Makefile) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
-    let mut seen: HashMap<String, Vec<(Range, Branches)>> = HashMap::new();
+    let mut seen: HashMap<String, Vec<(Range, Vec<ConditionalBranch>)>> = HashMap::new();
 
     for rule in separated_rules(makefile) {
-        let branches = conditional_branches(rule.syntax());
+        let branches = rule.enclosing_branches();
         for (target, range) in targets_with_ranges(&rule) {
             // Skip pattern rules (contain %)
             if target.contains('%') {
@@ -747,11 +747,7 @@ fn check_unused_variables(
             continue;
         }
         // Inside a conditional? Skip — likely a configuration toggle.
-        if var_def
-            .syntax()
-            .ancestors()
-            .any(|a| a.kind() == SyntaxKind::CONDITIONAL)
-        {
+        if !var_def.enclosing_branches().is_empty() {
             continue;
         }
 
@@ -884,7 +880,8 @@ fn check_mixed_assignment_operators(source_text: &str, makefile: &Makefile) -> V
         _ => None,
     };
 
-    let mut by_name: HashMap<String, Vec<(Flavour, Range, Branches)>> = HashMap::new();
+    let mut by_name: HashMap<String, Vec<(Flavour, Range, Vec<ConditionalBranch>)>> =
+        HashMap::new();
     for var_def in makefile.variable_definitions() {
         let Some(name) = var_def.name() else { continue };
         let Some(op) = var_def.assignment_operator() else {
@@ -894,7 +891,7 @@ fn check_mixed_assignment_operators(source_text: &str, makefile: &Makefile) -> V
             continue;
         };
         let range = text_range_to_lsp_range(source_text, var_def.text_range());
-        let branches = conditional_branches(var_def.syntax());
+        let branches = var_def.enclosing_branches();
         by_name
             .entry(name)
             .or_default()
@@ -942,20 +939,15 @@ fn check_unterminated_conditionals(source_text: &str, makefile: &Makefile) -> Ve
         if cond.conditional_type().is_none() {
             continue;
         }
-        let has_endif = cond
-            .syntax()
-            .children()
-            .any(|c| c.kind() == SyntaxKind::CONDITIONAL_ENDIF);
-        if has_endif {
+        if cond.has_endif() {
             continue;
         }
 
-        // Point at the opening directive (CONDITIONAL_IF) for clarity.
+        // Point at the opening directive for clarity.
         let opener_range = cond
-            .syntax()
-            .children()
-            .find(|c| c.kind() == SyntaxKind::CONDITIONAL_IF)
-            .map(|c| c.text_range())
+            .branches()
+            .next()
+            .map(|b| b.directive_line_range())
             .unwrap_or_else(|| cond.text_range());
 
         let range = text_range_to_lsp_range(source_text, opener_range);
@@ -1022,7 +1014,7 @@ fn check_mixed_rule_separators(source_text: &str, makefile: &Makefile) -> Vec<Di
     struct Seen {
         double_colon: bool,
         line: u32,
-        branches: Vec<(TextRange, usize)>,
+        branches: Vec<ConditionalBranch>,
     }
 
     let mut diagnostics = Vec::new();
@@ -1031,7 +1023,7 @@ fn check_mixed_rule_separators(source_text: &str, makefile: &Makefile) -> Vec<Di
     // A line without a separator is a parse error, not a rule.
     for rule in makefile.rules().filter(|r| r.operator().is_some()) {
         let double_colon = rule.is_double_colon();
-        let branches = conditional_branches(rule.syntax());
+        let branches = rule.enclosing_branches();
         for (target, range) in targets_with_ranges(&rule) {
             if target.contains('%') {
                 continue;
@@ -1119,7 +1111,7 @@ fn check_redundant_transitive_prerequisites(
         if prereqs.len() < 2 {
             continue;
         }
-        let branches = conditional_branches(rule.syntax());
+        let branches = rule.enclosing_branches();
 
         let mut reported: HashSet<&str> = HashSet::new();
         for prereq in &prereqs {
@@ -3320,6 +3312,12 @@ mod tests {
     }
 
     #[test]
+    fn test_mixed_assignment_in_nested_exclusive_branches_ok() {
+        let text = "ifdef X\nifdef Y\nFOO = a\nendif\nelse\nFOO := b\nendif\n";
+        assert_eq!(mixed_assignment_lines(text), Vec::<u32>::new());
+    }
+
+    #[test]
     fn test_mixed_assignment_in_source_order() {
         let text = "A = 1\nB = 1\nC = 1\nA := 2\nB := 2\nC := 2\n";
         for _ in 0..20 {
@@ -3393,6 +3391,10 @@ mod tests {
             .collect();
         assert_eq!(unt.len(), 1);
         assert_eq!(unt[0].message, "'ifdef' is missing a matching 'endif'");
+        assert_eq!(
+            unt[0].range,
+            Range::new(Position::new(0, 0), Position::new(1, 0))
+        );
         assert_eq!(unt[0].severity, Some(DiagnosticSeverity::ERROR));
     }
 
