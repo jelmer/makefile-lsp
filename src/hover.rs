@@ -1,10 +1,6 @@
 //! Hover information for Makefiles.
 
-use makefile_lossless::{
-    Conditional, Lang, Load, Makefile, MakefileItem, SyntaxKind, TextRange, VariableReference,
-};
-use rowan::ast::AstNode;
-use rowan::SyntaxNode;
+use makefile_lossless::{Conditional, Load, Makefile, MakefileItem, TextRange, VariableReference};
 use text_size::TextSize;
 use tower_lsp_server::ls_types::{Hover, HoverContents, MarkupContent, MarkupKind, Position};
 
@@ -35,7 +31,7 @@ fn target_hover(files: &FileSet, target: &str) -> Option<Hover> {
     let prereqs: Vec<String> = rule.prerequisites().collect();
     let recipes: Vec<String> = rule.recipes().collect();
     let mut info = format!("**`{}`**", target);
-    if let Some(comment) = doc_comment(rule.syntax()) {
+    if let Some(comment) = doc_comment(MakefileItem::Rule(rule.clone())) {
         info.push_str(&format!("\n\n{}", comment));
     }
     if !prereqs.is_empty() {
@@ -52,40 +48,10 @@ fn target_hover(files: &FileSet, target: &str) -> Option<Hover> {
     Some(markdown_hover(info))
 }
 
-/// Collect the `#` comment lines directly above `node`, stopping at a blank
-/// line or any other content. Returns `None` if there are none.
-fn doc_comment(node: &SyntaxNode<Lang>) -> Option<String> {
-    let mut lines = Vec::new();
-    let mut token = node.first_token()?.prev_token();
-    while let Some(newline) = token.filter(|t| t.kind() == SyntaxKind::NEWLINE) {
-        let Some(comment) = newline
-            .prev_token()
-            .filter(|t| t.kind() == SyntaxKind::COMMENT && !t.text().starts_with("#!"))
-        else {
-            break;
-        };
-        // Only whole-line comments count, not trailing ones like `FOO = 1 # x`.
-        let before = comment.prev_token();
-        if before
-            .as_ref()
-            .is_some_and(|t| t.kind() != SyntaxKind::NEWLINE)
-        {
-            break;
-        }
-        let text = comment.text().trim_start_matches('#');
-        lines.push(
-            text.strip_prefix(' ')
-                .unwrap_or(text)
-                .trim_end()
-                .to_string(),
-        );
-        token = before;
-    }
-    if lines.is_empty() {
-        return None;
-    }
-    lines.reverse();
-    Some(lines.join("\n"))
+/// The doc comment of `item`, or `None` if it has none.
+fn doc_comment(item: MakefileItem) -> Option<String> {
+    let lines: Vec<String> = item.doc_comments().collect();
+    (!lines.is_empty()).then(|| lines.join("\n"))
 }
 
 /// Note where a definition comes from, when it's not the current document.
@@ -203,7 +169,7 @@ fn variable_hover(files: &FileSet, reference: &VariableReference) -> Option<Hove
             .map(|v| v.trim().to_string())
             .unwrap_or_default();
         let mut info = format!("```makefile\n{} {} {}\n```", var_name, op, value);
-        if let Some(comment) = doc_comment(var_def.syntax()) {
+        if let Some(comment) = doc_comment(MakefileItem::Variable(var_def.clone())) {
             info.push_str(&format!("\n\n{}", comment));
         }
         info.push_str(&origin_note(files, doc));
@@ -447,6 +413,22 @@ mod tests {
         );
         assert_eq!(
             hover_text("X = 1 # trailing\nfoo:\n", Position::new(1, 0)).as_deref(),
+            Some("**`foo`**")
+        );
+    }
+
+    #[test]
+    fn test_hover_target_indented_doc_comment() {
+        assert_eq!(
+            hover_text("# Build\n  # it\nfoo:\n", Position::new(2, 0)).as_deref(),
+            Some("**`foo`**\n\nBuild\nit")
+        );
+    }
+
+    #[test]
+    fn test_hover_target_ignores_continued_comment() {
+        assert_eq!(
+            hover_text("X = 1 \\\n# value\nfoo:\n", Position::new(2, 0)).as_deref(),
             Some("**`foo`**")
         );
     }
