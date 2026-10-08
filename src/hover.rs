@@ -1,6 +1,6 @@
 //! Hover information for Makefiles.
 
-use makefile_lossless::{Conditional, Load, Makefile, MakefileItem, TextRange, VariableReference};
+use makefile_lossless::{Conditional, Makefile, MakefileItem, TextRange, VariableReference};
 use text_size::TextSize;
 use tower_lsp_server::ls_types::{Hover, HoverContents, MarkupContent, MarkupKind, Position};
 
@@ -76,7 +76,10 @@ fn directive_keyword_at(makefile: &Makefile, offset: TextSize) -> Option<String>
     if makefile.vpaths().any(|v| at(v.keyword_range())) {
         return Some("vpath".to_string());
     }
-    if let Some(load) = load_at(makefile.items(), offset) {
+    let load = makefile
+        .loads()
+        .find(|load| load.keyword_range().is_some_and(|r| r.contains(offset)));
+    if let Some(load) = load {
         let keyword = if load.is_optional() { "-load" } else { "load" };
         return Some(keyword.to_string());
     }
@@ -89,21 +92,6 @@ fn directive_keyword_at(makefile: &Makefile, offset: TextSize) -> Option<String>
         makefile
             .all_conditionals()
             .find_map(|cond| conditional_keyword_at(&cond, offset))
-    })
-}
-
-/// The `load` directive among `items`, or in conditionals among them, whose
-/// keyword is at `offset`.
-fn load_at(mut items: impl Iterator<Item = MakefileItem>, offset: TextSize) -> Option<Load> {
-    items.find_map(|item| match item {
-        MakefileItem::Load(load) => load
-            .keyword_range()
-            .is_some_and(|r| r.contains(offset))
-            .then_some(load),
-        MakefileItem::Conditional(cond) => {
-            load_at(cond.if_items().chain(cond.else_items()), offset)
-        }
-        _ => None,
     })
 }
 
@@ -544,6 +532,11 @@ mod tests {
         assert_eq!(
             hover_text(text, Position::new(6, 1)),
             directive_hover("unexport")
+        );
+        let text = "ifdef A\nifdef B\n-load b.so\nendif\nendif\n";
+        assert_eq!(
+            hover_text(text, Position::new(2, 1)),
+            directive_hover("-load")
         );
     }
 
