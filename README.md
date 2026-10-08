@@ -34,7 +34,7 @@ makefiles it includes (see below); the Makefile is never executed.
 - **Selection ranges** - expand selection from a word to its expression, the
   enclosing rule, variable or conditional, and the whole file
 - **Semantic tokens** - highlighting for targets, variables, prerequisites,
-  recipes and comments
+  recipes, directive keywords and comments
 - **Formatting** - converts space-indented recipes to tabs, trims trailing
   whitespace where make ignores it, and normalizes the final newline
 - **On-type formatting** - inserts a tab after pressing enter on a rule line
