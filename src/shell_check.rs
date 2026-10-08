@@ -10,10 +10,7 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 
-use makefile_lossless::{
-    split_references, Makefile, MakefileVariant, Recipe, SyntaxKind, TextPart,
-};
-use rowan::ast::AstNode;
+use makefile_lossless::{split_references, Makefile, MakefileVariant, Recipe, TextPart};
 use tower_lsp_server::ls_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Position, Range};
 
 use crate::position::offset_to_position;
@@ -84,11 +81,7 @@ pub fn check_shell_syntax(source_text: &str, makefile: &Makefile) -> Vec<Diagnos
 fn shell_program(makefile: &Makefile) -> Option<String> {
     let mut values = HashSet::new();
     for def in makefile.variable_definitions_by_name("SHELL") {
-        let target_specific = def
-            .syntax()
-            .ancestors()
-            .any(|a| a.kind() == SyntaxKind::RULE);
-        if target_specific {
+        if def.is_target_specific() {
             return None;
         }
         values.insert(def.raw_value()?.trim().to_string());
@@ -436,6 +429,19 @@ mod tests {
         assert_eq!(check("SHELL = python3\nall:\n\tls )\n"), vec![]);
         assert_eq!(check("SHELL = $(BASH)\nall:\n\tls )\n"), vec![]);
         assert_eq!(check("all: SHELL = bash\nall:\n\tls )\n"), vec![]);
+    }
+
+    #[test]
+    fn test_shell_in_conditional_in_rule_body() {
+        // GNU make treats this assignment as global, not target-specific.
+        let text = "a:\nifndef X\n\techo\nSHELL := /bin/bash\nendif\nall:\n\tls )\n";
+        assert_eq!(
+            check(text),
+            vec![(
+                Range::new(Position::new(6, 1), Position::new(6, 5)),
+                "shell syntax error: syntax error near unexpected token `)'".to_string()
+            )]
+        );
     }
 
     #[test]

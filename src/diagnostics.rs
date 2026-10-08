@@ -291,21 +291,18 @@ fn check_recursive_variable_self_reference(
             continue;
         }
 
-        // Walk the EXPR descendants of this variable definition for self-references
-        for child in var_def.syntax().descendants() {
-            if let Some(var_ref) = VariableReference::cast(child) {
-                if var_ref.name().as_deref() == Some(&name) {
-                    let range = text_range_to_lsp_range(source_text, var_ref.text_range());
-                    diagnostics.push(make_diagnostic(
-                        range,
-                        DiagnosticSeverity::WARNING,
-                        "recursive-variable-reference",
-                        format!(
-                            "variable '{}' references itself in a recursively-expanded definition",
-                            name
-                        ),
-                    ));
-                }
+        for var_ref in var_def.value_references() {
+            if var_ref.name().as_deref() == Some(&name) {
+                let range = text_range_to_lsp_range(source_text, var_ref.text_range());
+                diagnostics.push(make_diagnostic(
+                    range,
+                    DiagnosticSeverity::WARNING,
+                    "recursive-variable-reference",
+                    format!(
+                        "variable '{}' references itself in a recursively-expanded definition",
+                        name
+                    ),
+                ));
             }
         }
     }
@@ -979,10 +976,7 @@ fn check_shell_in_recursive_assignment(source_text: &str, makefile: &Makefile) -
             continue;
         }
 
-        for child in var_def.syntax().descendants() {
-            let Some(var_ref) = VariableReference::cast(child) else {
-                continue;
-            };
+        for var_ref in var_def.value_references() {
             if !var_ref.is_function_call() {
                 continue;
             }
@@ -1149,29 +1143,11 @@ fn check_trailing_whitespace_in_value(source_text: &str, makefile: &Makefile) ->
     let mut diagnostics = Vec::new();
 
     for var_def in makefile.variable_definitions() {
-        let Some(expr) = var_def
-            .syntax()
-            .children()
-            .find(|c| c.kind() == SyntaxKind::EXPR)
-        else {
+        let Some(ws_range) = var_def.trailing_value_whitespace_range() else {
             continue;
         };
 
-        // The EXPR's last child must be a WHITESPACE token (ignoring any trailing
-        // COMMENT tokens). Nested nodes (e.g. variable references) don't count —
-        // we only flag whitespace that's actually at the tail of the value.
-        let last_non_comment = expr
-            .children_with_tokens()
-            .filter(|c| c.kind() != SyntaxKind::COMMENT)
-            .last();
-        let Some(ws) = last_non_comment
-            .and_then(|c| c.into_token())
-            .filter(|t| t.kind() == SyntaxKind::WHITESPACE)
-        else {
-            continue;
-        };
-
-        let range = text_range_to_lsp_range(source_text, ws.text_range());
+        let range = text_range_to_lsp_range(source_text, ws_range);
         diagnostics.push(make_diagnostic(
             range,
             DiagnosticSeverity::WARNING,
@@ -4001,6 +3977,16 @@ mod tests {
     #[test]
     fn test_automatic_variable_in_conditional_body_assignment() {
         assert_eq!(auto_var_messages("ifdef X\nY := $@\nendif\n").len(), 1);
+    }
+
+    #[test]
+    fn test_automatic_variable_in_conditional_in_rule_body() {
+        // GNU make treats this assignment as global, not target-specific.
+        assert_eq!(
+            auto_var_messages("all:\nifdef X\n\techo\nY := $@\nendif\n"),
+            auto_var_messages("ifdef X\nY := $@\nendif\n")
+        );
+        assert_eq!(auto_var_messages("all: Y := $@\n"), Vec::<String>::new());
     }
 
     #[test]

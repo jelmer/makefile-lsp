@@ -5,8 +5,8 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use makefile_lossless::{
-    Makefile, MakefileVariant, Parse, ParseErrorKind, ReferenceLocation, Rule, SyntaxKind,
-    TextSize, VariableReference,
+    Makefile, MakefileVariant, Parse, ReferenceLocation, Rule, SyntaxKind, TextSize,
+    VariableReference,
 };
 use rowan::ast::AstNode;
 use tower_lsp_server::ls_types::{
@@ -518,11 +518,9 @@ fn convert_to_simply_expanded_action(
         return None;
     }
 
-    let has_shell = var_def.syntax().descendants().any(|d| {
-        VariableReference::cast(d)
-            .filter(|v| v.is_function_call() && v.name().as_deref() == Some("shell"))
-            .is_some()
-    });
+    let has_shell = var_def
+        .value_references()
+        .any(|v| v.is_function_call() && v.name().as_deref() == Some("shell"));
     if !has_shell {
         return None;
     }
@@ -590,7 +588,7 @@ fn add_missing_endif_action(
 /// Offer "Insert missing endef" when the cursor is inside a `define` block
 /// that runs to the end of the file without a matching `endef`.
 ///
-/// makefile-lossless has no API to add an `endef`, so this appends it as text.
+/// Drives the change through `VariableDefinition::add_endef`.
 fn add_missing_endef_action(
     parsed: &Parse<Makefile>,
     source_text: &str,
@@ -599,45 +597,14 @@ fn add_missing_endef_action(
 ) -> Option<CodeAction> {
     let offset = text_size::TextSize::from(byte_offset as u32);
 
-    let error = parsed
-        .positioned_errors()
-        .iter()
-        .find(|e| e.kind() == ParseErrorKind::MissingEndef)?;
-    // The error covers the `define` keyword of the unterminated block.
-    let define = parsed
-        .tree()
-        .syntax()
-        .covering_element(error.range)
-        .ancestors()
-        .find(|n| n.kind() == SyntaxKind::VARIABLE)?;
-    if !define.text_range().contains_inclusive(offset) {
+    let mut define = parsed.tree().variable_definitions().find(|v| {
+        v.is_define() && !v.has_endef() && v.syntax().text_range().contains_inclusive(offset)
+    })?;
+    let original_range = define.syntax().text_range();
+    if !define.add_endef().expect("a define block") {
         return None;
     }
-
-    // Nested defines are part of the body text, so count how many are open.
-    let body = define.text().to_string();
-    let depth = body
-        .lines()
-        .filter_map(|line| line.split_whitespace().next())
-        .fold(0usize, |depth, word| match word {
-            "define" => depth + 1,
-            "endef" => depth.saturating_sub(1),
-            _ => depth,
-        });
-    if depth == 0 {
-        return None;
-    }
-
-    let mut new_text = String::new();
-    if !body.ends_with('\n') {
-        new_text.push('\n');
-    }
-    new_text.push_str(&"endef\n".repeat(depth));
-    let end = offset_to_position(source_text, define.text_range().end());
-    let edit = TextEdit {
-        range: Range::new(end, end),
-        new_text,
-    };
+    let edit = edit_for_node_change(source_text, original_range, &define);
 
     let mut changes = std::collections::HashMap::new();
     changes.insert(uri.clone(), vec![edit]);
