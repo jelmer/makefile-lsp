@@ -947,7 +947,7 @@ fn check_unterminated_conditionals(source_text: &str, makefile: &Makefile) -> Ve
         let opener_range = cond
             .branches()
             .next()
-            .map(|b| b.directive_range())
+            .map(|b| b.directive_line_range())
             .unwrap_or_else(|| cond.text_range());
 
         let range = text_range_to_lsp_range(source_text, opener_range);
@@ -3393,7 +3393,7 @@ mod tests {
         assert_eq!(unt[0].message, "'ifdef' is missing a matching 'endif'");
         assert_eq!(
             unt[0].range,
-            Range::new(Position::new(0, 0), Position::new(0, 11))
+            Range::new(Position::new(0, 0), Position::new(1, 0))
         );
         assert_eq!(unt[0].severity, Some(DiagnosticSeverity::ERROR));
     }
