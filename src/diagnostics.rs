@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 
 use makefile_lossless::{
-    Conditional, Makefile, MakefileItem, MakefileVariant, Parse, ParseErrorKind, ParsedReference,
+    Makefile, MakefileItem, MakefileVariant, Parse, ParseErrorKind, ParsedReference,
     PositionedParseError, ReferenceLocation, Rule, SyntaxKind, VariableReference,
 };
 use rowan::ast::AstNode;
@@ -672,11 +672,7 @@ fn referenced_variables(makefile: &Makefile) -> HashSet<String> {
 
     // `ifdef NAME` / `ifndef NAME` reference NAME but don't show up as
     // references because the argument is a bare identifier.
-    for cond in makefile
-        .syntax()
-        .descendants()
-        .filter_map(Conditional::cast)
-    {
+    for cond in makefile.all_conditionals() {
         match cond.conditional_type().as_deref() {
             Some("ifdef") | Some("ifndef") => {
                 if let Some(name) = cond.condition() {
@@ -940,11 +936,7 @@ fn check_mixed_assignment_operators(source_text: &str, makefile: &Makefile) -> V
 fn check_unterminated_conditionals(source_text: &str, makefile: &Makefile) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
 
-    for cond in makefile
-        .syntax()
-        .descendants()
-        .filter_map(Conditional::cast)
-    {
+    for cond in makefile.all_conditionals() {
         // Skip orphans that don't even have a recognized opener — the parser
         // already complains about those (e.g. bare `else`/`endif`).
         if cond.conditional_type().is_none() {
@@ -1401,18 +1393,19 @@ fn resolvable_target_names(
     makefile: &Makefile,
     includes_followed: bool,
 ) -> Option<HashSet<String>> {
-    let defers_elsewhere = makefile.syntax().descendants().any(|n| match n.kind() {
-        SyntaxKind::INCLUDE => !includes_followed,
-        SyntaxKind::VPATH => true,
+    let defers_elsewhere = (!includes_followed && makefile.includes().next().is_some())
+        || makefile.vpaths().next().is_some()
         // A line of only references is parsed as makefile text once expanded.
-        SyntaxKind::EXPRESSION_STATEMENT => !n
-            .descendants()
-            .filter_map(VariableReference::cast)
-            .next()
-            .and_then(|r| r.name())
-            .is_some_and(|name| matches!(name.as_str(), "info" | "warning" | "error")),
-        _ => VariableReference::cast(n).is_some_and(|r| r.name().as_deref() == Some("eval")),
-    });
+        || makefile.expression_statements().any(|stmt| {
+            !stmt
+                .references()
+                .next()
+                .and_then(|r| r.name())
+                .is_some_and(|name| matches!(name.as_str(), "info" | "warning" | "error"))
+        })
+        || makefile
+            .variable_references()
+            .any(|r| r.name().as_deref() == Some("eval"));
     if defers_elsewhere
         || makefile
             .variable_definitions_by_name("VPATH")
@@ -3775,6 +3768,8 @@ mod tests {
             "-include deps.mk\nall: missing\n",
             "ifdef X\ninclude deps.mk\nendif\nall: missing\n",
             "vpath %.c src\nall: missing.c\n",
+            "ifdef X\nvpath %.c src\nendif\nall: missing.c\n",
+            "ifdef X\n$(eval $(call rules))\nendif\nall: missing\n",
             "VPATH = src\nall: missing.c\n",
             "$(eval $(call rules))\nall: missing\n",
             "all: missing\n\t$(eval $(call rules))\n",

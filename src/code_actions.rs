@@ -5,8 +5,8 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use makefile_lossless::{
-    Conditional, Makefile, MakefileVariant, Parse, ParseErrorKind, ReferenceLocation, Rule,
-    SyntaxKind, TextSize, VariableReference,
+    Makefile, MakefileVariant, Parse, ParseErrorKind, ReferenceLocation, Rule, SyntaxKind,
+    TextSize, VariableReference,
 };
 use rowan::ast::AstNode;
 use tower_lsp_server::ls_types::{
@@ -561,9 +561,7 @@ fn add_missing_endif_action(
     // Find the innermost Conditional containing the cursor that is missing an
     // endif and has a recognized opener.
     let mut cond = makefile
-        .syntax()
-        .descendants()
-        .filter_map(Conditional::cast)
+        .all_conditionals()
         .filter(|c| c.text_range().contains_inclusive(offset))
         .filter(|c| c.conditional_type().is_some())
         .filter(|c| {
