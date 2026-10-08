@@ -1,7 +1,6 @@
 //! Semantic token generation for Makefile syntax highlighting.
 
-use makefile_lossless::{Makefile, MakefileItem, SyntaxKind, TextRange, TextSize};
-use rowan::ast::AstNode;
+use makefile_lossless::{Makefile, MakefileItem, TextRange, TextSize};
 use tower_lsp_server::ls_types::SemanticToken;
 
 use crate::builtins;
@@ -89,11 +88,8 @@ pub fn generate_semantic_tokens(makefile: &Makefile, source_text: &str) -> Vec<S
 
     tokens.extend(
         makefile
-            .syntax()
-            .descendants_with_tokens()
-            .filter_map(|element| element.into_token())
-            .filter(|token| token.kind() == SyntaxKind::COMMENT)
-            .map(|token| (token.text_range(), TokenType::Comment, 0)),
+            .comment_ranges()
+            .map(|range| (range, TokenType::Comment, 0)),
     );
 
     for rule in makefile.rules() {
@@ -407,6 +403,23 @@ mod tests {
                 (2, 5, 1, Prerequisite, 0),
                 (2, 7, 5, Comment, 0),
                 (3, 0, 2, Comment, 0),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_comment_tokens() {
+        use TokenType::*;
+        assert_eq!(
+            all_tokens("#!/usr/bin/make -f\nifdef A # g\nendif # h\nall:\n\techo # e\n\t# f\n"),
+            vec![
+                (0, 0, 18, Comment, 0),
+                (1, 0, 5, Keyword, 0),
+                (1, 8, 3, Comment, 0),
+                (2, 0, 5, Keyword, 0),
+                (2, 6, 3, Comment, 0),
+                (3, 0, 3, Target, DEF),
+                (5, 1, 3, Comment, 0),
             ]
         );
     }
