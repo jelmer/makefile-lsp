@@ -38,7 +38,7 @@ pub fn generate_folding_ranges(makefile: &Makefile, source_text: &str) -> Vec<Fo
         ));
     }
 
-    for cond in makefile.conditionals() {
+    for cond in makefile.all_conditionals() {
         ranges.extend(make_folding_range(
             source_text,
             cond.text_range(),
@@ -83,6 +83,16 @@ mod tests {
     #[test]
     fn test_empty_file() {
         assert!(get_ranges("").is_empty());
+    }
+
+    #[test]
+    fn test_nested_conditional_folding() {
+        let text = "ifdef A\nifdef B\nX = 1\nendif\nendif\nall:\nifdef C\n\techo c\nendif\n";
+        let lines: Vec<_> = get_ranges(text)
+            .iter()
+            .map(|r| (r.start_line, r.end_line))
+            .collect();
+        assert_eq!(lines, vec![(5, 9), (0, 5), (1, 4), (6, 9)]);
     }
 
     #[test]
