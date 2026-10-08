@@ -970,6 +970,8 @@ fn reference_contexts(var_ref: &VariableReference) -> Vec<InlineContext> {
 
 /// Whether `var_ref` is in the member list of an archive, as in
 /// `lib.a($(OBJS))`.
+// TODO: use makefile-lossless API once ReferenceLocation tells archive
+// members apart.
 fn in_archive_members(var_ref: &VariableReference) -> bool {
     var_ref
         .syntax()

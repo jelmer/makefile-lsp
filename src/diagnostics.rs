@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 
 use makefile_lossless::{
     Conditional, Makefile, MakefileItem, MakefileVariant, Parse, ParseErrorKind, ParsedReference,
-    PositionedParseError, Rule, SyntaxKind, VariableReference,
+    PositionedParseError, ReferenceLocation, Rule, SyntaxKind, VariableReference,
 };
 use rowan::ast::AstNode;
 use text_size::{TextRange, TextSize};
@@ -1540,7 +1540,7 @@ fn check_automatic_variable_outside_recipe(
             if !is_automatic_variable_reference(&text) {
                 return None;
             }
-            let context = immediate_expansion_context(var_ref.syntax(), second_expansion)?;
+            let context = immediate_expansion_context(&var_ref, second_expansion)?;
             Some(make_diagnostic(
                 text_range_to_lsp_range(source_text, var_ref.text_range()),
                 DiagnosticSeverity::WARNING,
@@ -1572,44 +1572,40 @@ fn is_automatic_variable_reference(text: &str) -> bool {
         && matches!(chars.as_str(), "" | "D" | "F")
 }
 
-/// Describe the immediately-expanded context `node` sits in, or `None` if it
-/// may be expanded later (or we can't tell).
+/// Describe the immediately-expanded context `var_ref` sits in, or `None` if
+/// it may be expanded later (or we can't tell).
 fn immediate_expansion_context(
-    node: &rowan::SyntaxNode<makefile_lossless::Lang>,
+    var_ref: &VariableReference,
     second_expansion: bool,
 ) -> Option<&'static str> {
-    for ancestor in node.ancestors().skip(1) {
-        match ancestor.kind() {
-            SyntaxKind::EXPR => {
-                let deferring = VariableReference::cast(ancestor)
-                    .and_then(|r| r.name())
-                    .is_some_and(|name| name == "eval" || name == "call");
-                if deferring {
+    let mut current = var_ref.clone();
+    loop {
+        match current.location() {
+            ReferenceLocation::FunctionArgument(outer)
+            | ReferenceLocation::ReferenceName(outer)
+            | ReferenceLocation::Modifier(outer) => {
+                if matches!(outer.name().as_deref(), Some("eval" | "call")) {
                     return None;
                 }
+                current = outer;
             }
-            SyntaxKind::PREREQUISITE => {}
-            SyntaxKind::TARGETS => return Some("a target list"),
-            SyntaxKind::PREREQUISITES => {
+            ReferenceLocation::Target(_) => return Some("a target list"),
+            ReferenceLocation::Prerequisite(_) => {
                 return (!second_expansion).then_some("a prerequisite list");
             }
-            SyntaxKind::VARIABLE => {
-                let target_specific = ancestor.ancestors().any(|a| a.kind() == SyntaxKind::RULE);
-                let var_def = makefile_lossless::VariableDefinition::cast(ancestor)?;
-                if target_specific || var_def.is_define() {
+            ReferenceLocation::VariableName(var_def)
+            | ReferenceLocation::VariableValue(var_def) => {
+                if var_def.is_target_specific() || var_def.is_define() {
                     return None;
                 }
                 let op = var_def.assignment_operator()?;
                 let immediate = matches!(op.as_str(), ":=" | "::=" | ":::=" | "!=");
                 return immediate.then_some("an immediately-expanded assignment");
             }
-            SyntaxKind::CONDITIONAL_IF | SyntaxKind::CONDITIONAL_ELSE => {
-                return Some("a conditional directive");
-            }
+            ReferenceLocation::Condition(_) => return Some("a conditional directive"),
             _ => return None,
         }
     }
-    None
 }
 
 #[cfg(test)]
@@ -3889,6 +3885,27 @@ mod tests {
     #[test]
     fn test_automatic_variable_in_conditional() {
         assert_eq!(auto_var_messages("ifeq ($@,foo)\nX = 1\nendif\n").len(), 1);
+    }
+
+    #[test]
+    fn test_automatic_variable_in_archive_members() {
+        assert_eq!(
+            auto_var_messages("lib.a($@): x\nall: lib.a($<)\n"),
+            vec![
+                "automatic variable '$@' is only set in recipes and is empty in a target list",
+                "automatic variable '$<' is only set in recipes and is empty in a prerequisite list",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_automatic_variable_in_variable_name() {
+        assert_eq!(
+            auto_var_messages("$@X := 1\n$<Y = 1\n"),
+            vec![
+                "automatic variable '$@' is only set in recipes and is empty in an immediately-expanded assignment"
+            ]
+        );
     }
 
     #[test]
