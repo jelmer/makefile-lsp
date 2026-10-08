@@ -13,7 +13,9 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use makefile_lossless::{Makefile, MakefileVariant, Parse, TextRange, TextSize};
+use makefile_lossless::{
+    split_references, Makefile, MakefileVariant, Parse, TextPart, TextRange, TextSize,
+};
 use tower_lsp_server::ls_types::Uri;
 
 /// Upper bound on the number of files visited when following includes.
@@ -201,29 +203,26 @@ fn literal_value(def: &makefile_lossless::VariableDefinition) -> Option<String> 
 /// `CURDIR` expands to `cwd` unless the makefiles assign it.
 fn expand(name: &str, vars: &LiteralVariables, cwd: Option<&Path>) -> Option<String> {
     let mut out = String::new();
-    let mut rest = name;
-    while let Some(idx) = rest.find('$') {
-        out.push_str(&rest[..idx]);
-        let after = &rest[idx + 1..];
-        let close = match after.chars().next()? {
-            '(' => ')',
-            '{' => '}',
+    for part in split_references(name, MakefileVariant::GNUMake) {
+        let reference = match part {
+            TextPart::Literal(range) => {
+                out.push_str(&name[range]);
+                continue;
+            }
+            TextPart::Reference {
+                parsed: Ok(reference),
+                ..
+            } if reference.modifiers.is_empty() && !reference.name.contains('$') => reference,
             _ => return None,
         };
-        let end = after.find(close)?;
-        let var = &after[1..end];
-        if var.is_empty() || var.contains(|c: char| c.is_whitespace() || "$:,=(){}".contains(c)) {
-            return None;
-        }
+        let var = reference.name.as_str();
         let value = match vars.get(var) {
             Some(v) => v.to_string(),
             None if var == "CURDIR" && !vars.is_assigned(var) => cwd?.to_str()?.to_string(),
             None => return None,
         };
         out.push_str(&value);
-        rest = &after[end + 1..];
     }
-    out.push_str(rest);
     // TODO: support wildcards, which GNU make expands in include directives.
     if out.contains(['*', '?', '[']) {
         return None;
@@ -984,7 +983,7 @@ pub mod tests {
 
     #[test]
     fn test_expand() {
-        let v = vars("TOP = ../top\n");
+        let v = vars("TOP = ../top\nT = t\n");
         let cwd = Path::new("/src");
         assert_eq!(
             expand("$(TOP)/rules.mk", &v, Some(cwd)),
@@ -1002,6 +1001,13 @@ pub mod tests {
         assert_eq!(expand("$(wildcard x)", &v, Some(cwd)), None);
         assert_eq!(expand("*.mk", &v, Some(cwd)), None);
         assert_eq!(expand("$@", &v, Some(cwd)), None);
+        assert_eq!(expand("$T/x.mk", &v, Some(cwd)), Some("t/x.mk".to_string()));
+        assert_eq!(expand("$$T/x.mk", &v, Some(cwd)), None);
+        assert_eq!(expand("$(TOP:%=%/)x.mk", &v, Some(cwd)), None);
+        assert_eq!(expand("$(TOP", &v, Some(cwd)), None);
+        assert_eq!(expand("$(TO P)", &v, Some(cwd)), None);
+        assert_eq!(expand("$(T$(T))", &v, Some(cwd)), None);
+        assert_eq!(expand("x.mk$", &v, Some(cwd)), None);
     }
 
     #[test]
