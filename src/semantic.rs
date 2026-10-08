@@ -1,6 +1,6 @@
 //! Semantic token generation for Makefile syntax highlighting.
 
-use makefile_lossless::{Makefile, MakefileItem, SyntaxKind, TextRange};
+use makefile_lossless::{Makefile, MakefileItem, SyntaxKind, TextRange, TextSize};
 use rowan::ast::AstNode;
 use tower_lsp_server::ls_types::SemanticToken;
 
@@ -150,18 +150,22 @@ pub fn generate_semantic_tokens(makefile: &Makefile, source_text: &str) -> Vec<S
 
     let mut builder = SemanticTokensBuilder::new();
     for (range, token_type, mods) in tokens {
-        let start = offset_to_position(source_text, range.start());
-        // Tokens can't span lines.
-        if offset_to_position(source_text, range.end()).line != start.line {
-            continue;
+        // Tokens can't span lines, so split them at line breaks.
+        let mut offset = range.start();
+        for line in source_text[range].split_inclusive('\n') {
+            let text = line.trim_end_matches(['\r', '\n']);
+            if !text.is_empty() {
+                let start = offset_to_position(source_text, offset);
+                builder.push(
+                    start.line,
+                    start.character,
+                    utf16_len(text),
+                    token_type,
+                    mods,
+                );
+            }
+            offset += TextSize::of(line);
         }
-        builder.push(
-            start.line,
-            start.character,
-            utf16_len(&source_text[range]),
-            token_type,
-            mods,
-        );
     }
     builder.build()
 }
@@ -387,6 +391,22 @@ mod tests {
                 (2, 0, 5, Keyword, 0),
                 (3, 0, 8, Keyword, 0),
                 (3, 9, 3, Variable, DEF),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_continued_comment() {
+        use TokenType::*;
+        assert_eq!(
+            all_tokens("# a \\\n  b\nall: x # c \\\r\n d\n"),
+            vec![
+                (0, 0, 5, Comment, 0),
+                (1, 0, 3, Comment, 0),
+                (2, 0, 3, Target, DEF),
+                (2, 5, 1, Prerequisite, 0),
+                (2, 7, 5, Comment, 0),
+                (3, 0, 2, Comment, 0),
             ]
         );
     }
