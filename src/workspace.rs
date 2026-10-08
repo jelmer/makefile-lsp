@@ -13,9 +13,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use makefile_lossless::{Makefile, MakefileVariant, Parse, SyntaxKind};
-use rowan::ast::AstNode;
-use text_size::{TextRange, TextSize};
+use makefile_lossless::{Makefile, MakefileVariant, Parse, TextRange, TextSize};
 use tower_lsp_server::ls_types::Uri;
 
 /// Upper bound on the number of files visited when following includes.
@@ -124,89 +122,32 @@ pub struct IncludePath {
 /// those inside conditionals.
 ///
 /// GNU make allows several names per directive; each gets its own entry.
-pub fn include_paths(makefile: &Makefile, text: &str) -> Vec<IncludePath> {
+///
+/// TODO: unescape backslash-escaped whitespace in names, as make does after
+/// expansion.
+pub fn include_paths(makefile: &Makefile) -> Vec<IncludePath> {
     makefile
         .includes()
         .flat_map(|inc| {
             let optional = inc.is_optional();
-            let Some(range) = inc.path_range() else {
-                return Vec::new();
-            };
-            let raw = &text[range];
-            // BSD make and nmake paths are delimited and name a single file.
-            if raw.starts_with(['<', '"']) {
-                return inc
-                    .path()
-                    .filter(|p| !p.is_empty())
-                    .map(|name| IncludePath {
-                        name,
-                        range,
-                        optional,
-                    })
-                    .into_iter()
-                    .collect();
-            }
-            split_words(raw)
-                .into_iter()
-                .map(|(start, end)| IncludePath {
-                    name: raw[start..end].replace("\\#", "#"),
-                    range: TextRange::new(
-                        range.start() + TextSize::from(start as u32),
-                        range.start() + TextSize::from(end as u32),
-                    ),
+            inc.paths()
+                .zip(inc.path_ranges())
+                .map(|(name, range)| IncludePath {
+                    name,
+                    range,
                     optional,
                 })
-                .collect()
+                .collect::<Vec<_>>()
         })
         .collect()
-}
-
-/// Split an include path list into words, returning byte ranges.
-///
-/// Whitespace inside variable references or function calls doesn't split, and
-/// a backslash-newline counts as whitespace.
-fn split_words(text: &str) -> Vec<(usize, usize)> {
-    let bytes = text.as_bytes();
-    let mut words = Vec::new();
-    let mut start = None;
-    let mut depth = 0usize;
-    let mut i = 0;
-    while i < bytes.len() {
-        let b = bytes[i];
-        let continuation = b == b'\\' && matches!(bytes.get(i + 1), Some(b'\n' | b'\r'));
-        let separator = depth == 0 && (b.is_ascii_whitespace() || continuation);
-        if separator {
-            if let Some(s) = start.take() {
-                words.push((s, i));
-            }
-        } else {
-            if start.is_none() {
-                start = Some(i);
-            }
-            match b {
-                b'$' if matches!(bytes.get(i + 1), Some(b'(' | b'{')) => {
-                    depth += 1;
-                    i += 1;
-                }
-                b'(' | b'{' if depth > 0 => depth += 1,
-                b')' | b'}' if depth > 0 => depth -= 1,
-                _ => {}
-            }
-        }
-        i += 1;
-    }
-    if let Some(s) = start {
-        words.push((s, bytes.len()));
-    }
-    words
 }
 
 /// Variables whose value is the same plain literal everywhere they are
 /// assigned, used to expand include paths like `$(TOPDIR)/rules.mk`.
 ///
 /// This is deliberately conservative: a variable counts only if every
-/// assignment seen is an unconditional `=`, `:=`, `::=` or `:::=` of the same
-/// value without variable references or whitespace.
+/// assignment seen is an unconditional, global `=`, `:=`, `::=` or `:::=` of
+/// the same value without variable references or whitespace.
 #[derive(Debug, Default)]
 pub struct LiteralVariables {
     values: HashMap<String, Option<String>>,
@@ -244,11 +185,7 @@ fn literal_value(def: &makefile_lossless::VariableDefinition) -> Option<String> 
     if !matches!(op.as_str(), "=" | ":=" | "::=" | ":::=") || def.is_define() {
         return None;
     }
-    if def
-        .syntax()
-        .ancestors()
-        .any(|a| a.kind() == SyntaxKind::CONDITIONAL)
-    {
+    if def.is_target_specific() || !def.enclosing_branches().is_empty() {
         return None;
     }
     let value = def.value_for(MakefileVariant::GNUMake)?;
@@ -770,7 +707,7 @@ impl Workspace {
 
         let mut resolved = Vec::new();
         let mut children = BTreeSet::new();
-        for path in include_paths(&makefile, doc.text()) {
+        for path in include_paths(&makefile) {
             let exists = |p: &Path| self.open_paths.contains_key(p) || p.is_file();
             let mut resolution = resolve_include(&path.name, &walk.vars, cwd, doc.dir(), &exists);
             if let Resolution::Found(target) = &resolution {
@@ -927,7 +864,7 @@ pub mod tests {
 
     fn names_of(text: &str) -> Vec<(String, bool)> {
         let parsed = Makefile::parse(text);
-        include_paths(&parsed.tree(), text)
+        include_paths(&parsed.tree())
             .into_iter()
             .map(|p| {
                 assert_eq!(&text[p.range], p.name.replace('#', "\\#"));
@@ -976,6 +913,56 @@ pub mod tests {
         assert_eq!(names_of("include\n"), vec![]);
     }
 
+    #[test]
+    fn test_include_paths_escapes() {
+        assert_eq!(
+            names_of("include a\\#b.mk a\\ b.mk c.mk\n"),
+            vec![
+                ("a#b.mk".to_string(), false),
+                ("a\\ b.mk".to_string(), false),
+                ("c.mk".to_string(), false)
+            ]
+        );
+    }
+
+    #[test]
+    fn test_include_paths_continuation() {
+        assert_eq!(
+            names_of("include a.mk \\\n  b.mk\\\nc.mk\n"),
+            vec![
+                ("a.mk".to_string(), false),
+                ("b.mk".to_string(), false),
+                ("c.mk".to_string(), false)
+            ]
+        );
+        let text = "include $(subst a \\\n  b,c,a  b) d.mk\n";
+        let paths = include_paths(&Makefile::parse(text).tree());
+        assert_eq!(
+            paths
+                .iter()
+                .map(|p| (p.name.as_str(), &text[p.range]))
+                .collect::<Vec<_>>(),
+            vec![
+                ("$(subst a b,c,a  b)", "$(subst a \\\n  b,c,a  b)"),
+                ("d.mk", "d.mk")
+            ]
+        );
+    }
+
+    #[test]
+    fn test_include_paths_delimited() {
+        let text = ".include <a b.mk>\n";
+        let parsed = Makefile::parse_with_variant(text, MakefileVariant::BSDMake);
+        let paths = include_paths(&parsed.tree());
+        assert_eq!(
+            paths
+                .iter()
+                .map(|p| (p.name.as_str(), &text[p.range]))
+                .collect::<Vec<_>>(),
+            vec![("a b.mk", "a b.mk")]
+        );
+    }
+
     fn vars(text: &str) -> LiteralVariables {
         let mut vars = LiteralVariables::default();
         vars.add(&Makefile::parse(text).tree());
@@ -992,6 +979,7 @@ pub mod tests {
         assert_eq!(v.get("E"), None);
         assert_eq!(v.get("F"), None);
         assert_eq!(v.get("G"), Some("g"));
+        assert_eq!(vars("all: T = x\n").get("T"), None);
     }
 
     #[test]

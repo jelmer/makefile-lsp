@@ -80,7 +80,7 @@ pub fn get_diagnostics(
 
             let mut vars = LiteralVariables::default();
             vars.add(&makefile);
-            include_paths(&makefile, source_text)
+            include_paths(&makefile)
                 .into_iter()
                 .map(|path| {
                     let resolution =
