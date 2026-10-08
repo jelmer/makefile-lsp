@@ -265,6 +265,15 @@ mod tests {
     }
 
     #[test]
+    fn test_rename_single_char_reference_in_recipe() {
+        let text = "X = 1\nall:\n\techo $X\n";
+        assert_eq!(
+            get_edits(text, Position::new(0, 0), "NEW"),
+            vec![edit(0, 0, 1, "NEW"), edit(2, 7, 8, "(NEW)")]
+        );
+    }
+
+    #[test]
     fn test_rename_single_char_reference_to_single_char() {
         let text = "X = 1\nY = $X $(X)\n";
         assert_eq!(

@@ -1,7 +1,7 @@
 //! Hover information for Makefiles.
 
 use makefile_lossless::{
-    is_in_prerequisites, variable_at_offset, word_at_offset, Lang, Makefile, SyntaxKind,
+    Conditional, Lang, Load, Makefile, MakefileItem, SyntaxKind, TextRange, VariableReference,
 };
 use rowan::ast::AstNode;
 use rowan::SyntaxNode;
@@ -10,7 +10,7 @@ use tower_lsp_server::ls_types::{Hover, HoverContents, MarkupContent, MarkupKind
 
 use crate::builtins;
 use crate::position::try_position_to_offset;
-use crate::targets::target_at_offset;
+use crate::targets::{prerequisite_at_offset, target_at_offset};
 use crate::workspace::{Document, FileSet};
 
 fn markdown_hover(text: String) -> Hover {
@@ -21,17 +21,6 @@ fn markdown_hover(text: String) -> Hover {
         }),
         range: None,
     }
-}
-
-/// Check whether `offset` lies on a target name in a rule head, outside of
-/// any variable reference in it.
-fn in_rule_targets(makefile: &Makefile, offset: TextSize) -> bool {
-    makefile
-        .rules()
-        .any(|rule| target_at_offset(&rule, offset.into()).is_some())
-        && !makefile
-            .variable_references()
-            .any(|r| r.text_range().contains(offset))
 }
 
 /// Describe the first rule defining `target`: its doc comment, prerequisites
@@ -112,35 +101,117 @@ fn origin_note(files: &FileSet, doc: &Document) -> String {
     format!("\n\nDefined in `{}`", name)
 }
 
-/// Return the directive named `word` (found at `byte_offset`) if it is used as a
-/// directive: at the start of a non-recipe line, optionally after modifiers
-/// such as `override` or `else`, and not itself a target or variable name.
-fn directive_at(
-    source_text: &str,
-    byte_offset: usize,
-    word: &str,
-) -> Option<&'static builtins::Directive> {
-    let directive = builtins::find_directive(word)?;
-    let is_word_char = |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-');
-    let word_start = source_text[..byte_offset]
-        .rfind(|c: char| !is_word_char(c))
-        .map_or(0, |i| i + 1);
-    let word_end = word_start + word.len();
-    let line_start = source_text[..word_start].rfind('\n').map_or(0, |i| i + 1);
-    let line_end = source_text[word_end..]
-        .find('\n')
-        .map_or(source_text.len(), |i| word_end + i);
-
-    if source_text[line_start..].starts_with('\t') {
-        return None;
+/// The directive keyword at `offset`, such as `include`, `else` or `endef`.
+fn directive_keyword_at(makefile: &Makefile, offset: TextSize) -> Option<String> {
+    let at = |range: Option<TextRange>| range.is_some_and(|r| r.contains(offset));
+    if let Some(include) = makefile.includes().find(|i| at(i.keyword_range())) {
+        return include.keyword();
     }
-    let modifiers_only = source_text[line_start..word_start]
-        .split_whitespace()
-        .all(|w| matches!(w, "else" | "override" | "export" | "private"));
-    let after = source_text[word_end..line_end].trim_start();
-    let is_definition =
-        after.starts_with([':', '=']) || ["+=", "?=", "!="].iter().any(|op| after.starts_with(op));
-    (modifiers_only && !is_definition).then_some(directive)
+    if makefile.vpaths().any(|v| at(v.keyword_range())) {
+        return Some("vpath".to_string());
+    }
+    if let Some(load) = load_at(makefile.items(), offset) {
+        let keyword = if load.is_optional() { "-load" } else { "load" };
+        return Some(keyword.to_string());
+    }
+    let variable_keyword = makefile
+        .variable_definitions()
+        .flat_map(|v| v.keyword_ranges())
+        .find(|(_, range)| range.contains(offset))
+        .map(|(keyword, _)| keyword);
+    variable_keyword.or_else(|| {
+        makefile
+            .all_conditionals()
+            .find_map(|cond| conditional_keyword_at(&cond, offset))
+    })
+}
+
+/// The `load` directive among `items`, or in conditionals among them, whose
+/// keyword is at `offset`.
+fn load_at(mut items: impl Iterator<Item = MakefileItem>, offset: TextSize) -> Option<Load> {
+    items.find_map(|item| match item {
+        MakefileItem::Load(load) => load
+            .keyword_range()
+            .is_some_and(|r| r.contains(offset))
+            .then_some(load),
+        MakefileItem::Conditional(cond) => {
+            load_at(cond.if_items().chain(cond.else_items()), offset)
+        }
+        _ => None,
+    })
+}
+
+/// The keyword of `cond` at `offset`: that of a branch, the `else` of an
+/// `else ifdef` and the like, or `endif`.
+fn conditional_keyword_at(cond: &Conditional, offset: TextSize) -> Option<String> {
+    if cond.endif_range().is_some_and(|r| r.contains(offset)) {
+        return Some("endif".to_string());
+    }
+    cond.branches().find_map(|branch| {
+        let range = branch.keyword_range().filter(|r| r.contains(offset))?;
+        if branch.is_else() {
+            return Some("else".to_string());
+        }
+        let kind = branch.conditional_type()?;
+        if branch.index() == 0 {
+            return Some(kind);
+        }
+        // The range covers both words of `else ifdef`.
+        let else_range = TextRange::at(range.start(), TextSize::of("else"));
+        let kind_range = TextRange::new(range.end() - TextSize::of(kind.as_str()), range.end());
+        if else_range.contains(offset) {
+            Some("else".to_string())
+        } else {
+            kind_range.contains(offset).then_some(kind)
+        }
+    })
+}
+
+/// Describe the variable or function referenced by `reference`.
+fn variable_hover(files: &FileSet, reference: &VariableReference) -> Option<Hover> {
+    let var_name = reference.name()?;
+    let function_hover = |f: &builtins::BuiltinFunction| {
+        let sig = format!("$({} {})", f.name, f.params.join(","));
+        markdown_hover(format!("`{}`: {}", sig, f.doc))
+    };
+    if reference.is_function_call() {
+        return builtins::find_builtin_function(&var_name).map(function_hover);
+    }
+
+    if let Some(doc) = builtins::find_automatic_variable(&var_name) {
+        return Some(markdown_hover(format!("**`${}`**: {}", var_name, doc)));
+    }
+
+    // A function name without arguments, as in `$(wildcard)`
+    if let Some(f) = builtins::find_builtin_function(&var_name) {
+        return Some(function_hover(f));
+    }
+
+    // User-defined variables take precedence over built-in ones
+    let definition = files.docs().find_map(|doc| {
+        doc.makefile()
+            .variable_definitions_by_name(&var_name)
+            .next()
+            .map(|v| (doc, v))
+    });
+    if let Some((doc, var_def)) = definition {
+        let op = var_def
+            .assignment_operator()
+            .unwrap_or_else(|| "=".to_string());
+        let value = var_def
+            .raw_value()
+            .map(|v| v.trim().to_string())
+            .unwrap_or_default();
+        let mut info = format!("```makefile\n{} {} {}\n```", var_name, op, value);
+        if let Some(comment) = doc_comment(var_def.syntax()) {
+            info.push_str(&format!("\n\n{}", comment));
+        }
+        info.push_str(&origin_note(files, doc));
+        return Some(markdown_hover(info));
+    }
+
+    let doc = builtins::find_builtin_variable(&var_name)?;
+    Some(markdown_hover(format!("**`{}`**: {}", var_name, doc)))
 }
 
 /// Get hover information for the symbol at the given position.
@@ -152,77 +223,30 @@ pub fn get_hover(files: &FileSet, position: Position) -> Option<Hover> {
     let offset = try_position_to_offset(source_text, position)?;
     let byte_offset: usize = offset.into();
 
-    // Variable reference: $(VAR) or ${VAR}
-    if let Some(var_name) = variable_at_offset(source_text, byte_offset) {
-        // Check automatic variables
-        if let Some(doc) = builtins::find_automatic_variable(var_name) {
-            return Some(markdown_hover(format!("**`${}`**: {}", var_name, doc)));
-        }
-
-        // Check built-in functions (var_name may be "wildcard *.c", so match the first word)
-        let func_name = var_name.split_whitespace().next().unwrap_or(var_name);
-        if let Some(f) = builtins::find_builtin_function(func_name) {
-            let sig = format!("$({} {})", f.name, f.params.join(","));
-            return Some(markdown_hover(format!("`{}`: {}", sig, f.doc)));
-        }
-
-        // Check user-defined variables (prioritize over built-ins)
-        let definition = files.docs().find_map(|doc| {
-            doc.makefile()
-                .variable_definitions()
-                .find(|v| v.name().as_deref() == Some(var_name))
-                .map(|v| (doc, v))
-        });
-        if let Some((doc, var_def)) = definition {
-            let op = var_def
-                .assignment_operator()
-                .unwrap_or_else(|| "=".to_string());
-            let value = var_def
-                .raw_value()
-                .map(|v| v.trim().to_string())
-                .unwrap_or_default();
-            let mut info = format!("```makefile\n{} {} {}\n```", var_name, op, value);
-            if let Some(comment) = doc_comment(var_def.syntax()) {
-                info.push_str(&format!("\n\n{}", comment));
-            }
-            info.push_str(&origin_note(files, doc));
-            return Some(markdown_hover(info));
-        }
-
-        // Check built-in variables
-        if let Some(doc) = builtins::find_builtin_variable(var_name) {
-            return Some(markdown_hover(format!("**`{}`**: {}", var_name, doc)));
-        }
-
-        return None;
+    let makefile = files.current().makefile();
+    if let Some(reference) = makefile.variable_reference_at(offset) {
+        return variable_hover(files, &reference);
     }
 
-    // Word in prerequisites area or at start of line (target name)
-    if let Some(word) = word_at_offset(source_text, byte_offset) {
-        if let Some(d) = directive_at(source_text, byte_offset, word) {
-            return Some(markdown_hover(format!(
-                "```makefile\n{}\n```\n\n{}",
-                d.syntax, d.doc
-            )));
-        }
-
-        // Check special targets
-        if let Some(doc) = builtins::find_special_target(word) {
-            return Some(markdown_hover(format!("**`{}`**: {}", word, doc)));
-        }
-
-        // Show rule info for a target, either where it is referenced as a
-        // prerequisite or where it is defined.
-        if is_in_prerequisites(source_text, byte_offset)
-            || in_rule_targets(&files.current().makefile(), offset)
-        {
-            if let Some(hover) = target_hover(files, word) {
-                return Some(hover);
-            }
-        }
+    if let Some(d) = directive_keyword_at(&makefile, offset)
+        .as_deref()
+        .and_then(builtins::find_directive)
+    {
+        return Some(markdown_hover(format!(
+            "```makefile\n{}\n```\n\n{}",
+            d.syntax, d.doc
+        )));
     }
 
-    None
+    // Show rule info for a target, either where it is referenced as a
+    // prerequisite or where it is defined.
+    let (target, _) = makefile.rules().find_map(|rule| {
+        target_at_offset(&rule, byte_offset).or_else(|| prerequisite_at_offset(&rule, byte_offset))
+    })?;
+    if let Some(doc) = builtins::find_special_target(&target) {
+        return Some(markdown_hover(format!("**`{}`**: {}", target, doc)));
+    }
+    target_hover(files, &target)
 }
 
 #[cfg(test)]
@@ -275,12 +299,38 @@ mod tests {
     }
 
     #[test]
+    fn test_hover_single_char_automatic_variable() {
+        assert_eq!(
+            hover_text("all:\n\techo $@\n", Position::new(1, 7)).as_deref(),
+            Some("**`$@`**: The file name of the target of the rule.")
+        );
+    }
+
+    #[test]
+    fn test_hover_variable_on_dollar() {
+        assert_eq!(
+            hover_text("CC = gcc\nall:\n\t$(CC)\n", Position::new(2, 1)).as_deref(),
+            Some("```makefile\nCC = gcc\n```")
+        );
+    }
+
+    #[test]
     fn test_hover_builtin_function() {
         let text = "FILES = $(wildcard *.c)\n";
         // 'w' of "wildcard" at col 10
         let result = hover_text(text, Position::new(0, 10));
         assert!(result.is_some());
         assert!(result.unwrap().contains("wildcard"));
+    }
+
+    #[test]
+    fn test_hover_builtin_function_with_nested_reference() {
+        let f = builtins::find_builtin_function("patsubst").unwrap();
+        let expected = format!("`$(patsubst {})`: {}", f.params.join(","), f.doc);
+        assert_eq!(
+            hover_text("OBJS = $(patsubst %.c,%.o,$(SRCS))\n", Position::new(0, 10)),
+            Some(expected)
+        );
     }
 
     #[test]
@@ -313,6 +363,21 @@ mod tests {
     }
 
     #[test]
+    fn test_hover_prerequisite_with_directory() {
+        let text = "all: src/foo.o\nsrc/foo.o:\n\tcc\n";
+        assert_eq!(
+            hover_text(text, Position::new(0, 6)).as_deref(),
+            Some("**`src/foo.o`**\n\n```makefile\n\tcc\n```")
+        );
+    }
+
+    #[test]
+    fn test_hover_target_name_in_variable_value() {
+        assert_eq!(hover_text("FOO := x\nx:\n", Position::new(0, 7)), None);
+        assert_eq!(hover_text("X = .PHONY\n", Position::new(0, 5)), None);
+    }
+
+    #[test]
     fn test_hover_target_definition() {
         let text = "all: build\n\nbuild:\n\techo ok\n";
         assert_eq!(
@@ -328,7 +393,10 @@ mod tests {
     #[test]
     fn test_hover_word_in_target_reference() {
         let text = "$(addprefix $(D)/, foo):\n\nfoo:\n\techo ok\n";
-        assert_eq!(hover_text(text, Position::new(0, 19)), None);
+        assert_eq!(
+            hover_text(text, Position::new(0, 19)).as_deref(),
+            Some("`$(addprefix prefix,names...)`: Prepend *prefix* to each word in *names*.")
+        );
         assert_eq!(
             hover_text(text, Position::new(2, 1)).as_deref(),
             Some("**`foo`**\n\n```makefile\n\techo ok\n```")
@@ -468,6 +536,32 @@ mod tests {
         assert_eq!(
             hover_text(text, Position::new(3, 10)),
             directive_hover("define")
+        );
+    }
+
+    #[test]
+    fn test_hover_directive_keywords() {
+        let text = "ifdef A\nelse ifndef B\nload a.so\nendif\ndefine X\nendef\nunexport Y\n";
+        assert_eq!(
+            hover_text(text, Position::new(1, 1)),
+            directive_hover("else")
+        );
+        assert_eq!(hover_text(text, Position::new(1, 4)), None);
+        assert_eq!(
+            hover_text(text, Position::new(2, 1)),
+            directive_hover("load")
+        );
+        assert_eq!(
+            hover_text(text, Position::new(3, 1)),
+            directive_hover("endif")
+        );
+        assert_eq!(
+            hover_text(text, Position::new(5, 1)),
+            directive_hover("endef")
+        );
+        assert_eq!(
+            hover_text(text, Position::new(6, 1)),
+            directive_hover("unexport")
         );
     }
 

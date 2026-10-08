@@ -109,6 +109,14 @@ mod tests {
     }
 
     #[test]
+    fn test_function_in_recipe() {
+        let text = "all:\n\techo $(subst a,b,text)\n";
+        let sig = get_sig(text, Position::new(1, 17)).unwrap();
+        assert_eq!(sig.active_parameter, Some(1));
+        assert!(sig.signatures[0].label.contains("subst"));
+    }
+
+    #[test]
     fn test_wildcard_single_arg() {
         let text = "FILES = $(wildcard *.c)\n";
         let sig = get_sig(text, Position::new(0, 19));

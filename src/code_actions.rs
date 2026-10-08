@@ -5,8 +5,8 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use makefile_lossless::{
-    Conditional, Include, Makefile, MakefileVariant, Parse, ParseErrorKind, Recipe, Rule,
-    SyntaxKind, VariableDefinition, VariableReference,
+    Conditional, Include, Makefile, MakefileVariant, Parse, ParseErrorKind, ReferenceLocation,
+    Rule, SyntaxKind, TextSize, VariableReference,
 };
 use rowan::ast::AstNode;
 use tower_lsp_server::ls_types::{
@@ -14,6 +14,7 @@ use tower_lsp_server::ls_types::{
     WorkspaceEdit,
 };
 
+use crate::builtins;
 use crate::position::{offset_to_position, text_range_to_lsp_range, try_position_to_offset};
 use crate::targets::target_at_offset;
 use crate::workspace::FileSet;
@@ -48,12 +49,7 @@ pub fn get_code_actions(
         uri,
         diagnostics,
     ));
-    actions.extend(define_variable_action(
-        &makefile,
-        source_text,
-        byte_offset,
-        uri,
-    ));
+    actions.extend(define_variable_action(&makefile, offset, uri));
     actions.extend(replace_spaces_with_tab_action(
         parsed,
         source_text,
@@ -193,7 +189,7 @@ fn create_target_action(
     let mut updated = parsed.tree();
     updated.try_add_rule(&name).ok()?;
     // The rule is appended, so only the new text needs to be inserted.
-    let updated_text = updated.code();
+    let updated_text = updated.to_string();
     let edit = match updated_text.strip_prefix(source_text) {
         Some(appended) => {
             let end = offset_to_position(source_text, original_range.end());
@@ -371,20 +367,24 @@ fn add_phony_action(
 }
 
 /// Offer "Define variable" for an undefined variable reference.
-fn define_variable_action(
-    makefile: &Makefile,
-    source_text: &str,
-    byte_offset: usize,
-    uri: &Uri,
-) -> Option<CodeAction> {
-    let var_name = makefile_lossless::variable_at_offset(source_text, byte_offset)?;
+fn define_variable_action(makefile: &Makefile, offset: TextSize, uri: &Uri) -> Option<CodeAction> {
+    let reference = makefile
+        .variable_reference_at(offset)
+        .filter(|r| !r.is_function_call())?;
+    let var_name = reference.name()?;
+    // Computed names, automatic variables and call parameters can't be defined.
+    if var_name.contains('$')
+        || builtins::find_automatic_variable(&var_name).is_some()
+        || builtins::is_call_parameter(&var_name)
+    {
+        return None;
+    }
 
-    // Check if the variable is already defined
-    let defined_vars: HashSet<String> = makefile
-        .variable_definitions()
-        .filter_map(|v| v.name())
-        .collect();
-    if defined_vars.contains(var_name) {
+    if makefile
+        .variable_definitions_by_name(&var_name)
+        .next()
+        .is_some()
+    {
         return None;
     }
 
@@ -713,7 +713,7 @@ fn remove_from_phony_action(
     if !removed {
         return None;
     }
-    let new_text = mutated.code();
+    let new_text = mutated.to_string();
 
     let doc_range = Range::new(
         offset_to_position(source_text, text_size::TextSize::from(0)),
@@ -810,10 +810,9 @@ fn replace_all_spaces_with_tabs_action(
 /// Offer "Inline variable" when the cursor is on a variable definition with a
 /// simple literal value (no `$` characters in the value).
 ///
-/// Replaces every `$(NAME)` / `${NAME}` reference, including those in
-/// recipes and define bodies, with the literal value, then deletes the
-/// variable definition's line. Not offered if any reference uses modifiers,
-/// as in `$(NAME:.c=.o)`.
+/// Replaces every reference to it, including those in recipes and define
+/// bodies, with the literal value, then deletes the variable definition's
+/// line. Not offered if any reference uses modifiers, as in `$(NAME:.c=.o)`.
 ///
 /// Also not offered if the value is written differently from what it
 /// stores, as with `\#` or a line continuation, or if a reference sits where
@@ -846,7 +845,7 @@ fn inline_variable_action(
     // Only inline values that are plain literals: no variable references,
     // function calls, or `$$` escapes. We'd otherwise be reasoning about
     // expansion order.
-    if value.contains('$') || var_def.value(MakefileVariant::GNUMake)? != value {
+    if value.contains('$') || var_def.value_for(MakefileVariant::GNUMake)? != value {
         return None;
     }
 
@@ -883,33 +882,6 @@ fn inline_variable_action(
             range,
             new_text: value.clone(),
         });
-    }
-
-    // Recipes and define bodies are raw text, so their references are not
-    // in the syntax tree. Recipe lines outside rules are included.
-    for node in makefile.syntax().descendants() {
-        let raw_refs = if let Some(recipe) = Recipe::cast(node.clone()) {
-            recipe.variable_references()
-        } else if let Some(definition) = VariableDefinition::cast(node.clone()) {
-            definition.define_variable_references()
-        } else {
-            continue;
-        };
-        let node_start = usize::from(node.text_range().start());
-        for raw_ref in raw_refs.iter().filter(|r| r.name() == name) {
-            let range = plain_reference_range(source_text, raw_ref.text_range())?;
-            let preceding = &source_text[node_start..usize::from(range.start())];
-            if !enclosing_text_references(preceding)
-                .iter()
-                .all(|context| context.accepts(&value))
-            {
-                return None;
-            }
-            edits.push(TextEdit {
-                range: text_range_to_lsp_range(source_text, range),
-                new_text: value.clone(),
-            });
-        }
     }
 
     if edits.is_empty() {
@@ -964,119 +936,45 @@ impl InlineContext {
     }
 }
 
-/// The contexts a reference in the syntax tree is nested in.
+/// The contexts a reference is nested in.
 ///
-/// Variable values, include lines and the text around a reference in a
-/// recipe or define body take the expanded text as is, so add no context.
+/// Variable values, include lines, recipes and define bodies take the
+/// expanded text as is, so add no context.
 fn reference_contexts(var_ref: &VariableReference) -> Vec<InlineContext> {
-    let start = var_ref.text_range().start();
     let mut contexts = Vec::new();
-    for node in var_ref.syntax().ancestors().skip(1) {
-        if let Some(outer) = VariableReference::cast(node.clone()) {
-            contexts.push(if outer.is_function_call() {
-                InlineContext::FunctionArgument
-            } else {
-                InlineContext::Other
-            });
-            continue;
-        }
-        match node.kind() {
-            SyntaxKind::EXPR
-            | SyntaxKind::TARGETS
-            | SyntaxKind::PREREQUISITES
-            | SyntaxKind::PREREQUISITE => continue,
-            SyntaxKind::VARIABLE => {
-                let in_value = node
-                    .children_with_tokens()
-                    .filter_map(|it| it.into_token())
-                    .find(|t| t.kind() == SyntaxKind::OPERATOR)
-                    .is_some_and(|op| op.text_range().end() <= start);
-                if !in_value {
-                    contexts.push(InlineContext::Other);
-                } else if node.parent().is_some_and(|p| p.kind() == SyntaxKind::RULE) {
-                    contexts.push(InlineContext::RuleLine);
-                }
+    let mut current = var_ref.clone();
+    let outermost = loop {
+        match current.location() {
+            ReferenceLocation::FunctionArgument(outer) => {
+                contexts.push(InlineContext::FunctionArgument);
+                current = outer;
             }
-            SyntaxKind::RULE => contexts.push(InlineContext::RuleLine),
-            SyntaxKind::INCLUDE => {}
-            _ => contexts.push(InlineContext::Other),
+            ReferenceLocation::ReferenceName(outer) | ReferenceLocation::Modifier(outer) => {
+                contexts.push(InlineContext::Other);
+                current = outer;
+            }
+            ReferenceLocation::VariableValue(_) | ReferenceLocation::Include(_) => break None,
+            ReferenceLocation::Recipe(_) => break None,
+            ReferenceLocation::TargetSpecificValue(_) => break Some(InlineContext::RuleLine),
+            ReferenceLocation::Target(_) | ReferenceLocation::Prerequisite(_)
+                if !in_archive_members(&current) =>
+            {
+                break Some(InlineContext::RuleLine)
+            }
+            _ => break Some(InlineContext::Other),
         }
-        break;
-    }
+    };
+    contexts.extend(outermost);
     contexts
 }
 
-/// The contexts of the references left open at the end of `text`, the
-/// recipe or define body text before a reference.
-fn enclosing_text_references(text: &str) -> Vec<InlineContext> {
-    // Each open reference's body start, closing char and nested paren depth.
-    let mut open: Vec<(usize, u8, usize)> = Vec::new();
-    let bytes = text.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        let close = match (bytes[i], bytes.get(i + 1)) {
-            (b'$', Some(b'$')) => {
-                i += 2;
-                continue;
-            }
-            (b'$', Some(b'(')) => Some(b')'),
-            (b'$', Some(b'{')) => Some(b'}'),
-            _ => None,
-        };
-        if let Some(close) = close {
-            open.push((i + 2, close, 0));
-            i += 2;
-            continue;
-        }
-        if let Some((_, close, depth)) = open.last_mut() {
-            let opening = if *close == b')' { b'(' } else { b'{' };
-            if bytes[i] == opening {
-                *depth += 1;
-            } else if bytes[i] == *close && *depth > 0 {
-                *depth -= 1;
-            } else if bytes[i] == *close {
-                open.pop();
-            }
-        }
-        i += 1;
-    }
-    open.iter()
-        .map(|&(body_start, _, _)| {
-            let body = &text[body_start..];
-            let name_len = body
-                .find(|c: char| c.is_whitespace() || ",$(){}:=".contains(c))
-                .unwrap_or(body.len());
-            let after_name = &body[name_len..];
-            if name_len > 0 && after_name.starts_with(|c: char| c.is_whitespace() || c == ',') {
-                InlineContext::FunctionArgument
-            } else {
-                InlineContext::Other
-            }
-        })
-        .collect()
-}
-
-/// The range of the whole `$(NAME)` or `${NAME}` reference whose name is at
-/// `name_range`, or None if the name is followed by modifiers.
-// TODO: use the reference's own range if makefile-lossless provides one for
-// references in recipes and define bodies.
-fn plain_reference_range(
-    source_text: &str,
-    name_range: text_size::TextRange,
-) -> Option<text_size::TextRange> {
-    let start = usize::from(name_range.start()).checked_sub(2)?;
-    let end = usize::from(name_range.end());
-    let close = match source_text.get(start..start + 2)? {
-        "$(" => ")",
-        "${" => "}",
-        _ => return None,
-    };
-    source_text[end..].starts_with(close).then(|| {
-        text_size::TextRange::new(
-            text_size::TextSize::from(start as u32),
-            name_range.end() + text_size::TextSize::of(close),
-        )
-    })
+/// Whether `var_ref` is in the member list of an archive, as in
+/// `lib.a($(OBJS))`.
+fn in_archive_members(var_ref: &VariableReference) -> bool {
+    var_ref
+        .syntax()
+        .ancestors()
+        .any(|node| node.kind() == SyntaxKind::ARCHIVE_MEMBERS)
 }
 
 /// Offer "Add '<target>' as prerequisite of '<goal>'" when the cursor is on
@@ -1360,6 +1258,42 @@ mod tests {
         // Position on 'C' in $(CC), col 11
         let actions = parse_and_actions(text, Position::new(1, 11));
         assert!(!actions.iter().any(|a| a.title.contains("Define variable")));
+    }
+
+    fn define_titles(text: &str, pos: Position) -> Vec<String> {
+        parse_and_actions(text, pos)
+            .into_iter()
+            .map(|a| a.title)
+            .filter(|t| t.starts_with("Define variable"))
+            .collect()
+    }
+
+    #[test]
+    fn test_no_define_action_for_function_call() {
+        assert_eq!(
+            define_titles("FILES = $(wildcard *.c)\n", Position::new(0, 11)),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn test_no_define_action_for_automatic_variable_or_parameter() {
+        assert_eq!(
+            define_titles("all:\n\techo $(@D)\n", Position::new(1, 8)),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            define_titles("f = echo $(1)\n", Position::new(0, 11)),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn test_define_action_for_single_char_reference() {
+        assert_eq!(
+            define_titles("all:\n\techo $X\n", Position::new(1, 7)),
+            vec!["Define variable 'X'".to_string()]
+        );
     }
 
     #[test]
@@ -2042,6 +1976,27 @@ mod tests {
         assert_eq!(
             inline_result("FOO = a,b\nall:\n\techo $(FOO)\n", "FOO"),
             Some("all:\n\techo a,b\n".to_string())
+        );
+    }
+
+    #[test]
+    fn test_inline_single_char_reference_in_recipe() {
+        assert_eq!(
+            inline_result("X = out\nall:\n\tmkdir $X $(X)\n", "X"),
+            Some("all:\n\tmkdir out out\n".to_string())
+        );
+    }
+
+    #[test]
+    fn test_no_inline_into_function_name() {
+        // The value would become part of the function name.
+        assert_eq!(
+            inline_result("FOO = a=b\nX = $(info$(FOO) x)\n", "FOO"),
+            None
+        );
+        assert_eq!(
+            inline_result("FOO = a=b\nall:\n\techo $(info$(FOO) x)\n", "FOO"),
+            None
         );
     }
 

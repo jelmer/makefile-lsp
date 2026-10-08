@@ -81,7 +81,7 @@ pub fn check_shell_syntax(source_text: &str, makefile: &Makefile) -> Vec<Diagnos
 /// determined or isn't one we can check with `-n`.
 fn shell_program(makefile: &Makefile) -> Option<String> {
     let mut values = HashSet::new();
-    for def in makefile.find_variable("SHELL") {
+    for def in makefile.variable_definitions_by_name("SHELL") {
         let target_specific = def
             .syntax()
             .ancestors()

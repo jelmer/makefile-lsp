@@ -42,7 +42,6 @@ pub struct ExternalSymbols {
     /// Names used as prerequisites of ordinary (non-special) rules.
     prerequisites: HashSet<String>,
     phony: HashSet<String>,
-    exports_all_variables: bool,
 }
 
 impl ExternalSymbols {
@@ -51,7 +50,6 @@ impl ExternalSymbols {
             .extend(makefile.variable_definitions().filter_map(|v| v.name()));
         self.variables_referenced
             .extend(referenced_variables(makefile));
-        self.exports_all_variables |= exports_all_variables(makefile);
         for rule in makefile.rules() {
             let targets: Vec<String> = rule.targets().collect();
             if targets.iter().any(|t| t == ".PHONY") {
@@ -298,6 +296,12 @@ fn check_undefined_variables(
     defined_vars.extend(external.variables_defined.iter().cloned());
 
     for var_ref in makefile.variable_references() {
+        // TODO: also check recipes and define bodies. Variables there are
+        // often set on the command line or in the environment, as DESTDIR
+        // is, so that needs a way to tell those apart first.
+        if crate::references::in_recipe(&var_ref) || crate::references::in_define_body(&var_ref) {
+            continue;
+        }
         let Some(name) = var_ref.name() else {
             continue;
         };
@@ -661,15 +665,9 @@ fn check_include_missing_path(source_text: &str, makefile: &Makefile) -> Vec<Dia
 ///
 /// `$<`, `$^`, `$+`, `$?` all expand to (part of) the prerequisite list, so
 /// they're empty in a rule with no prerequisites. `$*` expands to the stem of
-/// a pattern rule, so it's empty in a non-pattern rule.
-///
-/// TODO: `makefile-lossless` currently tokenizes recipe content as a single
-/// flat TEXT token, so we byte-scan it here for `$X` / `$(X)` / `${X}`. Once
-/// the parser surfaces structured VariableReference nodes inside recipes,
-/// replace this scanner with an AST walk over those nodes.
+/// a pattern rule, so it's empty in a non-pattern rule. The same goes for
+/// their `D` and `F` forms, such as `$(<D)`.
 fn check_empty_automatic_variables(source_text: &str, makefile: &Makefile) -> Vec<Diagnostic> {
-    use text_size::{TextRange, TextSize};
-
     let mut diagnostics = Vec::new();
 
     for rule in makefile.rules() {
@@ -680,98 +678,37 @@ fn check_empty_automatic_variables(source_text: &str, makefile: &Makefile) -> Ve
             continue;
         }
 
-        for recipe in rule.recipe_nodes() {
-            for token in recipe
-                .syntax()
-                .descendants_with_tokens()
-                .filter_map(|c| c.into_token())
-            {
-                if token.kind() != SyntaxKind::TEXT {
-                    continue;
-                }
-                let text = token.text();
-                let base: u32 = token.text_range().start().into();
-                for (var, start_off, end_off) in scan_automatic_vars(text) {
-                    let flagged = match var {
-                        '<' | '^' | '+' | '?' => !has_prereqs,
-                        '*' => !is_pattern,
-                        _ => false,
-                    };
-                    if !flagged {
-                        continue;
-                    }
-                    let range = TextRange::new(
-                        TextSize::from(base + start_off as u32),
-                        TextSize::from(base + end_off as u32),
-                    );
-                    let lsp_range = text_range_to_lsp_range(source_text, range);
-                    let reason = match var {
-                        '*' => "non-pattern rule",
-                        _ => "rule has no prerequisites",
-                    };
-                    diagnostics.push(make_diagnostic(
-                        lsp_range,
-                        DiagnosticSeverity::WARNING,
-                        "empty-automatic-variable",
-                        format!("${} expands to empty: {}", var, reason),
-                    ));
-                }
+        for var_ref in rule.recipe_nodes().flat_map(|recipe| recipe.references()) {
+            let Some(name) = var_ref.name() else {
+                continue;
+            };
+            let mut chars = name.chars();
+            let Some(var) = chars.next() else {
+                continue;
+            };
+            if !matches!(chars.as_str(), "" | "D" | "F") {
+                continue;
             }
+            let reason = match var {
+                '<' | '^' | '+' | '?' if !has_prereqs => "rule has no prerequisites",
+                '*' if !is_pattern => "non-pattern rule",
+                _ => continue,
+            };
+            let shown = if name.len() == 1 {
+                format!("${}", name)
+            } else {
+                format!("$({})", name)
+            };
+            diagnostics.push(make_diagnostic(
+                text_range_to_lsp_range(source_text, var_ref.text_range()),
+                DiagnosticSeverity::WARNING,
+                "empty-automatic-variable",
+                format!("{} expands to empty: {}", shown, reason),
+            ));
         }
     }
 
     diagnostics
-}
-
-/// Scan a recipe text snippet for automatic variable references.
-///
-/// Returns `(var_char, start, end)` tuples where `start..end` covers the
-/// whole `$X` (or `$(X)` / `${X}`) sequence within `text`. Only the single-
-/// character automatic variables we care about are reported: `<`, `^`, `+`,
-/// `?`, `*`. `$$` is treated as an escape and skipped.
-///
-/// TODO: see `check_empty_automatic_variables` — drop this when recipe
-/// content is structurally tokenized in makefile-lossless.
-fn scan_automatic_vars(text: &str) -> Vec<(char, usize, usize)> {
-    let mut out = Vec::new();
-    let bytes = text.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] != b'$' {
-            i += 1;
-            continue;
-        }
-        // Past the `$`. What's next?
-        if i + 1 >= bytes.len() {
-            break;
-        }
-        let next = bytes[i + 1];
-        if next == b'$' {
-            // Escaped `$$` — skip both.
-            i += 2;
-            continue;
-        }
-        if next == b'(' || next == b'{' {
-            // `$(X)` or `${X}` — only report if the contents are exactly a
-            // single automatic-variable character.
-            let close = if next == b'(' { b')' } else { b'}' };
-            if i + 3 < bytes.len() && bytes[i + 3] == close {
-                let c = bytes[i + 2];
-                if matches!(c, b'<' | b'^' | b'+' | b'?' | b'*') {
-                    out.push((c as char, i, i + 4));
-                }
-            }
-            i += 1;
-            continue;
-        }
-        if matches!(next, b'<' | b'^' | b'+' | b'?' | b'*') {
-            out.push((next as char, i, i + 2));
-            i += 2;
-            continue;
-        }
-        i += 1;
-    }
-    out
 }
 
 /// Collect the names of all variables a makefile references.
@@ -798,24 +735,7 @@ fn referenced_variables(makefile: &Makefile) -> HashSet<String> {
         }
     }
 
-    // `export NAME` passes NAME to recipe environments.
-    for var_def in makefile.variable_definitions() {
-        if var_def.is_export() {
-            referenced.extend(var_def.names());
-        }
-    }
-
     referenced
-}
-
-/// Whether a bare `export` or `.EXPORT_ALL_VARIABLES:` exports every variable.
-fn exports_all_variables(makefile: &Makefile) -> bool {
-    makefile
-        .variable_definitions()
-        .any(|v| v.is_export() && v.names().next().is_none())
-        || makefile
-            .rules()
-            .any(|r| r.targets().any(|t| t == ".EXPORT_ALL_VARIABLES"))
 }
 
 /// Check for variables that are defined but never referenced.
@@ -826,9 +746,7 @@ fn exports_all_variables(makefile: &Makefile) -> bool {
 /// variables for sub-makes or external tooling.
 ///
 /// Skipped:
-/// - Variables exported with `export` (consumed outside the makefile),
-///   including all variables if a bare `export` or `.EXPORT_ALL_VARIABLES`
-///   is present.
+/// - Variables exported with `export` (consumed outside the makefile).
 /// - Variables overriding a builtin (would change make's behaviour).
 /// - Variables defined inside conditionals (often configuration toggles).
 fn check_unused_variables(
@@ -837,9 +755,6 @@ fn check_unused_variables(
     external: &ExternalSymbols,
 ) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
-    if external.exports_all_variables || exports_all_variables(makefile) {
-        return diagnostics;
-    }
     let referenced = referenced_variables(makefile);
 
     for var_def in makefile.variable_definitions() {
@@ -849,8 +764,7 @@ fn check_unused_variables(
         if referenced.contains(&name) || external.variables_referenced.contains(&name) {
             continue;
         }
-        // `unexport NAME` doesn't define NAME.
-        if var_def.is_unexport() {
+        if var_def.is_export() {
             continue;
         }
         if builtins::is_known_variable(&name) {
@@ -1417,9 +1331,9 @@ fn check_missing_phony(
 ///   libraries, and so are `~` paths.
 /// - The check is skipped entirely when any of the makefiles could get
 ///   rules or files from elsewhere: `include` (unless `others` is complete),
-///   `vpath`/`VPATH`, `$(eval)` or a line that expands to makefile text, a
-///   `.DEFAULT` rule, or a target name that isn't a plain variable with a
-///   literal value.
+///   `vpath`/`VPATH`, `$(eval)` (also in a recipe) or a line that expands
+///   to makefile text, a `.DEFAULT` rule, or a target name that isn't a
+///   plain variable with a literal value.
 ///
 /// TODO: a fragment that is included from, or run with `make -f` from,
 /// another directory resolves its paths relative to that directory, and a
@@ -1522,7 +1436,10 @@ fn resolvable_target_names(
         _ => VariableReference::cast(n).is_some_and(|r| r.name().as_deref() == Some("eval")),
     });
     if defers_elsewhere
-        || makefile.find_variable("VPATH").next().is_some()
+        || makefile
+            .variable_definitions_by_name("VPATH")
+            .next()
+            .is_some()
         || makefile.rules_by_target(".DEFAULT").next().is_some()
     {
         return None;
@@ -1542,7 +1459,7 @@ fn resolvable_target_names(
             .filter(|r| r.modifiers.is_empty() && is_valid_var_name(&r.name))?
             .name;
         let mut defined = false;
-        for def in makefile.find_variable(&var) {
+        for def in makefile.variable_definitions_by_name(&var) {
             let value = def.raw_value()?;
             if value.contains('$') {
                 return None;
@@ -2796,6 +2713,34 @@ mod tests {
         assert!(auto[0].message.contains("no prerequisites"));
     }
 
+    #[test]
+    fn test_dir_form_flagged() {
+        let text = "foo:\n\techo $(<D) ${*F}\n";
+        let messages: Vec<_> = get_diags(text)
+            .into_iter()
+            .filter(|d| {
+                d.code
+                    == Some(NumberOrString::String(
+                        "empty-automatic-variable".to_string(),
+                    ))
+            })
+            .map(|d| (d.range, d.message))
+            .collect();
+        assert_eq!(
+            messages,
+            vec![
+                (
+                    Range::new(Position::new(1, 6), Position::new(1, 11)),
+                    "$(<D) expands to empty: rule has no prerequisites".to_string()
+                ),
+                (
+                    Range::new(Position::new(1, 12), Position::new(1, 17)),
+                    "$(*F) expands to empty: non-pattern rule".to_string()
+                ),
+            ]
+        );
+    }
+
     // Unused variable tests
 
     #[test]
@@ -2828,6 +2773,20 @@ mod tests {
     }
 
     #[test]
+    fn test_used_in_recipe_single_char_ok() {
+        let text = "X = bar\nall:\n\techo $X\n";
+        let codes = diag_codes(text);
+        assert!(!codes.contains(&"unused-variable".to_string()));
+    }
+
+    #[test]
+    fn test_undefined_in_recipe_and_define_body_not_flagged() {
+        let text = "define F\n$(1) $(A)\nendef\nall:\n\techo $(B) $@ $(notdir $<)\n";
+        let codes = diag_codes(text);
+        assert!(!codes.contains(&"undefined-variable".to_string()));
+    }
+
+    #[test]
     fn test_used_in_ifdef_ok() {
         let text = "FOO = bar\nifdef FOO\nVAR = x\nendif\n";
         let codes = diag_codes(text);
@@ -2841,44 +2800,6 @@ mod tests {
         let text = "export FOO = bar\n";
         let codes = diag_codes(text);
         assert!(!codes.contains(&"unused-variable".to_string()));
-    }
-
-    fn unused_variable_messages(text: &str) -> Vec<String> {
-        get_diags(text)
-            .into_iter()
-            .filter(|d| d.code == Some(NumberOrString::String("unused-variable".to_string())))
-            .map(|d| d.message)
-            .collect()
-    }
-
-    #[test]
-    fn test_export_directive_counts_as_use() {
-        let empty: Vec<String> = vec![];
-        assert_eq!(unused_variable_messages("Z = 1\nexport Z\n"), empty);
-        assert_eq!(unused_variable_messages("export Z\nZ = 1\n"), empty);
-        assert_eq!(
-            unused_variable_messages("Z = 1\nY = 2\nexport Z Y\n"),
-            empty
-        );
-    }
-
-    #[test]
-    fn test_unexport_does_not_count_as_use() {
-        // `unexport` removes Z from recipe environments; it doesn't read it.
-        assert_eq!(
-            unused_variable_messages("Z = 1\nunexport Z\n"),
-            vec!["variable 'Z' is defined but never used"]
-        );
-    }
-
-    #[test]
-    fn test_export_all_variables_counts_as_use() {
-        let empty: Vec<String> = vec![];
-        assert_eq!(
-            unused_variable_messages("Z = 1\n.EXPORT_ALL_VARIABLES:\n"),
-            empty
-        );
-        assert_eq!(unused_variable_messages("Z = 1\nexport\n"), empty);
     }
 
     #[test]
@@ -3558,23 +3479,6 @@ mod tests {
     }
 
     #[test]
-    fn test_cross_file_export_directive() {
-        let fx = crate::workspace::tests::Fixture::new(&[
-            ("Makefile", "Z = 1\ninclude rules.mk\n"),
-            ("rules.mk", "export Z\n"),
-        ]);
-        let empty: Vec<String> = vec![];
-        assert_eq!(file_set_codes(&fx, "Makefile"), empty);
-        assert_eq!(file_set_codes(&fx, "rules.mk"), empty);
-
-        let fx = crate::workspace::tests::Fixture::new(&[
-            ("Makefile", "Z = 1\ninclude rules.mk\n"),
-            ("rules.mk", ".EXPORT_ALL_VARIABLES:\n"),
-        ]);
-        assert_eq!(file_set_codes(&fx, "Makefile"), empty);
-    }
-
-    #[test]
     fn test_cross_file_phony_targets() {
         let fx = crate::workspace::tests::Fixture::new(&[
             (
@@ -3784,6 +3688,7 @@ mod tests {
             "vpath %.c src\nall: missing.c\n",
             "VPATH = src\nall: missing.c\n",
             "$(eval $(call rules))\nall: missing\n",
+            "all: missing\n\t$(eval $(call rules))\n",
             "$(foreach t,a b,$(call rule,$(t)))\nall: missing\n",
             ".DEFAULT:\n\t@echo $@\nall: missing\n",
             "%:\n\ttouch $@\nall: missing\n",

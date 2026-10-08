@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use makefile_lossless::{is_in_prerequisites, Makefile};
+use makefile_lossless::{Makefile, TextSize};
 use tower_lsp_server::ls_types::{CompletionItem, CompletionItemKind, Documentation, Position};
 
 use crate::builtins;
@@ -52,8 +52,11 @@ pub fn get_completions(
     // If the cursor sits in the prerequisites area, offer target names and
     // filesystem paths matching whatever is being typed.
     if let Some(offset) = try_position_to_offset(source_text, position) {
-        let byte_offset: usize = offset.into();
-        if is_in_prerequisites(source_text, byte_offset) {
+        if makefiles
+            .first()
+            .is_some_and(|makefile| in_prerequisites(makefile, offset))
+        {
+            let byte_offset: usize = offset.into();
             return get_prerequisite_completions(makefiles, source_text, byte_offset, base_dir);
         }
     }
@@ -101,6 +104,15 @@ pub fn get_completions(
     }
 
     vec![]
+}
+
+/// Whether `offset` is in the prerequisite list of a rule, including at its
+/// end, where the next prerequisite is typed.
+fn in_prerequisites(makefile: &Makefile, offset: TextSize) -> bool {
+    makefile.rules().any(|rule| {
+        rule.prerequisite_list_range()
+            .is_some_and(|range| range.contains_inclusive(offset))
+    })
 }
 
 /// Return the complete words on the line before the word being typed, or
@@ -582,6 +594,23 @@ mod tests {
         assert!(labels.contains(&"build"));
         assert!(!labels.iter().any(|l| l.contains('%')));
         assert!(!labels.iter().any(|l| l.starts_with('.')));
+    }
+
+    #[test]
+    fn test_prerequisite_completions_on_continuation_line() {
+        let text = "build:\nall: a \\\n  \n";
+        let makefile = Makefile::parse(text).tree();
+        let completions = get_completions(&[makefile], text, Position::new(2, 2), None);
+        let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+        assert_eq!(labels, vec!["build", "all"]);
+    }
+
+    #[test]
+    fn test_no_prerequisite_completions_in_variable_value() {
+        let text = "build:\nFOO := b";
+        let makefile = Makefile::parse(text).tree();
+        let completions = get_completions(&[makefile], text, Position::new(1, 8), None);
+        assert_eq!(completions, vec![]);
     }
 
     #[test]
