@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use makefile_lossless::{
-    Makefile, MakefileVariant, Parse, ReferenceLocation, SyntaxKind, TextSize, VariableReference,
+    Makefile, MakefileVariant, Parse, ReferenceLocation, TextSize, VariableReference,
 };
 use tower_lsp_server::ls_types::{
     CodeAction, CodeActionKind, Diagnostic, NumberOrString, Position, Range, TextEdit, Uri,
