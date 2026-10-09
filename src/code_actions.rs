@@ -1048,6 +1048,7 @@ fn inline_prerequisite_action(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::position::try_lsp_range_to_text_range;
 
     fn actions_at(
         uri: &str,
@@ -1244,28 +1245,9 @@ mod tests {
 
     /// Apply a single TextEdit to a source string.
     fn apply_edit(source: &str, edit: &TextEdit) -> String {
-        let to_byte = |p: Position| {
-            let mut byte = 0usize;
-            let mut line = 0u32;
-            for ch in source.chars() {
-                if line == p.line {
-                    break;
-                }
-                if ch == '\n' {
-                    line += 1;
-                }
-                byte += ch.len_utf8();
-            }
-            // byte now points at the start of the requested line (UTF-8 in this
-            // codepath since we only test ASCII).
-            byte + p.character as usize
-        };
-        let start = to_byte(edit.range.start);
-        let end = to_byte(edit.range.end);
-        let mut result = String::new();
-        result.push_str(&source[..start]);
-        result.push_str(&edit.new_text);
-        result.push_str(&source[end..]);
+        let range = try_lsp_range_to_text_range(source, &edit.range).expect("edit range in source");
+        let mut result = source.to_string();
+        result.replace_range(std::ops::Range::<usize>::from(range), &edit.new_text);
         result
     }
 
@@ -1766,6 +1748,14 @@ mod tests {
         assert_eq!(
             inline_result("OUT = dist\ndefine F\ncp $(OUT)/a ${OUT}\nendef\n", "OUT"),
             Some("define F\ncp dist/a dist\nendef\n".to_string())
+        );
+    }
+
+    #[test]
+    fn test_inline_variable_after_non_ascii() {
+        assert_eq!(
+            inline_result("OUT = dist\nall:\n\techo \u{e9}\u{1f600} $(OUT)\n", "OUT"),
+            Some("all:\n\techo \u{e9}\u{1f600} dist\n".to_string())
         );
     }
 
