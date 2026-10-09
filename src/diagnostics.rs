@@ -1516,6 +1516,8 @@ fn has_file_with_same_stem(path: &std::path::Path) -> bool {
 /// `$!` (`.ARCHIVE`) in prerequisites too, and leaves them unexpanded rather
 /// than empty elsewhere outside recipes. It also leaves references to
 /// undefined variables in a `:=` assignment unexpanded.
+/// nmake only sets the dependent macros `$$@` and `$$(@F)` etc. in
+/// prerequisites.
 fn check_automatic_variable_outside_recipe(
     source_text: &str,
     makefile: &Makefile,
@@ -1531,12 +1533,10 @@ fn check_automatic_variable_outside_recipe(
         .filter_map(|var_ref| {
             let text = var_ref.to_string();
             let name = automatic_variable_name(&text, variant)?;
-            // TODO: nmake's `$$@` is the target on a dependency line, but its
-            // reference can't be told apart from a plain `$@` yet.
             let bsd_target_variable =
                 variant == MakefileVariant::BSDMake && matches!(name, '@' | '*' | '%' | '!');
             let set_in_prerequisites =
-                second_expansion || variant == MakefileVariant::NMake || bsd_target_variable;
+                second_expansion || var_ref.is_target_as_dependent() || bsd_target_variable;
             let context = immediate_expansion_context(&var_ref, set_in_prerequisites, variant)?;
             let value = if bsd_target_variable {
                 "not expanded"
@@ -1557,9 +1557,9 @@ fn check_automatic_variable_outside_recipe(
 }
 
 /// If `text` is a reference to an automatic variable, such as `$@`, `$(<)`,
-/// `${@D}` or `$(@:.c=.o)`, the character naming the variable. BSD make's
-/// long names, such as `${.TARGET}`, map to their single-character aliases;
-/// it has `$>` and `$!` but no `$^` or `$+`.
+/// `${@D}` or `$(@:.c=.o)`, or nmake's `$**` or `$(@B)`, the character
+/// naming the variable. BSD make's long names, such as `${.TARGET}`, map to
+/// their single-character aliases; it has `$>` and `$!` but no `$^` or `$+`.
 fn automatic_variable_name(text: &str, variant: MakefileVariant) -> Option<char> {
     let reference = ParsedReference::parse(text, variant).ok()?;
     let bsd = variant == MakefileVariant::BSDMake;
@@ -1586,7 +1586,13 @@ fn automatic_variable_name(text: &str, variant: MakefileVariant) -> Option<char>
         .modifiers
         .iter()
         .all(|m| matches!(m, Modifier::SysVSubstitute { .. }));
-    (only_substitutions && matches!(chars.as_str(), "" | "D" | "F")).then_some(name)
+    let suffix_ok = match (variant, chars.as_str()) {
+        (_, "" | "D" | "F") => true,
+        (MakefileVariant::NMake, "B" | "R") => true,
+        (MakefileVariant::NMake, "*") => name == '*',
+        _ => false,
+    };
+    (only_substitutions && suffix_ok).then_some(name)
 }
 
 /// Describe the immediately-expanded context `var_ref` sits in, or `None` if
@@ -4688,6 +4694,34 @@ endif
                 dir.path()
             ),
             Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn test_nmake_automatic_variable_in_prerequisites() {
+        // Only the dependent macros `$$@` and `$$(@F)` etc. are set on a
+        // dependency line.
+        let text = "a.obj: $$@.c $@.h $$(@B).y $(@F).x $(@B).z $**\n\tcl $**\n";
+        let parsed = Makefile::parse_with_variant(text, MakefileVariant::NMake);
+        let messages: Vec<String> = get_diagnostics(text, &parsed, None)
+            .into_iter()
+            .filter(|d| {
+                d.code
+                    == Some(NumberOrString::String(
+                        "automatic-variable-outside-recipe".to_string(),
+                    ))
+            })
+            .map(|d| d.message)
+            .collect();
+        assert_eq!(
+            messages,
+            ["$@", "$(@F)", "$(@B)", "$**"]
+                .iter()
+                .map(|v| format!(
+                    "automatic variable '{v}' is only set in recipes and is empty in \
+                     a prerequisite list"
+                ))
+                .collect::<Vec<_>>()
         );
     }
 
