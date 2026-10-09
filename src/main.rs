@@ -22,6 +22,7 @@ mod goto;
 mod highlights;
 mod hover;
 mod inlay_hints;
+mod linked_editing;
 mod position;
 mod references;
 mod rename;
@@ -284,6 +285,9 @@ impl LanguageServer for Backend {
                 code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
                 inlay_hint_provider: Some(OneOf::Left(true)),
                 document_highlight_provider: Some(OneOf::Left(true)),
+                linked_editing_range_provider: Some(LinkedEditingRangeServerCapabilities::Simple(
+                    true,
+                )),
                 references_provider: Some(OneOf::Left(true)),
                 definition_provider: Some(OneOf::Left(true)),
                 document_formatting_provider: Some(OneOf::Left(true)),
@@ -551,6 +555,20 @@ impl LanguageServer for Backend {
         } else {
             Ok(Some(links))
         }
+    }
+
+    async fn linked_editing_range(
+        &self,
+        params: LinkedEditingRangeParams,
+    ) -> Result<Option<LinkedEditingRanges>> {
+        let uri = &params.text_document_position_params.text_document.uri;
+        let Some(files) = self.file_set(uri).await else {
+            return Ok(None);
+        };
+        Ok(linked_editing::linked_editing_ranges(
+            &files,
+            params.text_document_position_params.position,
+        ))
     }
 
     async fn document_highlight(
