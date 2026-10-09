@@ -4,6 +4,7 @@ use makefile_lossless::Makefile;
 use tower_lsp_server::ls_types::{GotoDefinitionResponse, Location, Position, Range, Uri};
 
 use crate::position::{text_range_to_lsp_range, try_position_to_offset};
+use crate::references::ifdef_reference_at;
 use crate::targets::prerequisite_at_offset;
 use crate::workspace::{FileSet, Resolution};
 
@@ -24,6 +25,12 @@ pub fn goto_definition(files: &FileSet, position: Position) -> Option<GotoDefini
             return None;
         }
         let var_name = reference.name()?;
+        return files.docs().find_map(|doc| {
+            find_variable_definition(&doc.makefile(), doc.text(), &var_name, doc.uri())
+        });
+    }
+
+    if let Some(var_name) = ifdef_reference_at(&makefile, offset) {
         return files.docs().find_map(|doc| {
             find_variable_definition(&doc.makefile(), doc.text(), &var_name, doc.uri())
         });
@@ -246,5 +253,20 @@ mod tests {
             }
             other => panic!("Expected scalar response, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_goto_variable_in_ifdef() {
+        assert_goto_line("X = 1\n\nifdef X\nendif\n", Position::new(2, 6), 0);
+        assert_goto_line(
+            "X = 1\nifeq (a,b)\nelse ifndef X\nendif\n",
+            Position::new(2, 12),
+            0,
+        );
+    }
+
+    #[test]
+    fn test_goto_ifdef_expanded_name() {
+        assert_goto_none("X = Y\nY = 1\nifdef X$(Y)\nendif\n", Position::new(2, 6));
     }
 }
