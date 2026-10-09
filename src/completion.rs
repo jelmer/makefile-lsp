@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use makefile_lossless::{Makefile, TextSize};
+use makefile_lossless::{Makefile, TextRange, TextSize};
 use tower_lsp_server::ls_types::{CompletionItem, CompletionItemKind, Documentation, Position};
 
 use crate::builtins;
@@ -23,9 +23,13 @@ pub fn get_completions(
 ) -> Vec<CompletionItem> {
     let lines: Vec<&str> = source_text.lines().collect();
     let line = lines.get(position.line as usize).copied().unwrap_or("");
+    // The current makefile and the offset in it.
+    let at = makefiles
+        .first()
+        .zip(try_position_to_offset(source_text, position));
 
-    // In a recipe line (starts with tab), offer function and variable completions after $
-    if line.starts_with('\t') {
+    // In a recipe line, offer function and variable completions after $
+    if at.is_some_and(|(makefile, offset)| in_recipe(makefile, source_text, offset)) {
         let col = position.character as usize;
         let prefix = &line[..col.min(line.len())];
         if prefix.ends_with("$(") {
@@ -39,28 +43,22 @@ pub fn get_completions(
         return vec![];
     }
 
-    // On an include directive line, offer filesystem completions for the path,
-    // ranking common Makefile fragment names first.
-    let col = position.character as usize;
-    if let Some(path_start) = include_path_start(line) {
-        if col >= path_start {
-            let partial = &line[path_start..col.min(line.len())];
+    if let Some((makefile, offset)) = at {
+        // In the file names of an include directive, offer filesystem
+        // completions, ranking common Makefile fragment names first.
+        if let Some(partial) = include_partial(makefile, source_text, offset) {
             return get_include_completions(partial, base_dir);
         }
-    }
 
-    // If the cursor sits in the prerequisites area, offer target names and
-    // filesystem paths matching whatever is being typed.
-    if let Some(offset) = try_position_to_offset(source_text, position) {
-        if makefiles
-            .first()
-            .is_some_and(|makefile| in_prerequisites(makefile, offset))
-        {
+        // If the cursor sits in the prerequisites area, offer target names and
+        // filesystem paths matching whatever is being typed.
+        if in_prerequisites(makefile, offset) {
             let byte_offset: usize = offset.into();
             return get_prerequisite_completions(makefiles, source_text, byte_offset, base_dir);
         }
     }
 
+    let col = position.character as usize;
     let typing_variable = position.character > 0 && !line.contains('=') && !line.contains(':');
     let prefix = &line[..col.min(line.len())];
     match words_before_cursor(prefix).as_deref() {
@@ -275,26 +273,42 @@ fn get_variable_reference_completions(makefiles: &[Makefile]) -> Vec<CompletionI
     items
 }
 
-/// If `line` is an `include`/`-include`/`sinclude` directive, return the byte
-/// offset within the line where the (last) path argument begins. Returns `None`
-/// for non-include lines. Multiple paths may be listed; we complete the one the
-/// cursor is currently within, so we anchor on the start of the final
-/// whitespace-separated word.
-fn include_path_start(line: &str) -> Option<usize> {
-    let trimmed_start = line.len() - line.trim_start().len();
-    let rest = &line[trimmed_start..];
+/// Whether `offset` is on the lines of an item covering `range`, which ends
+/// with the item's line ending unless it is at the end of the file.
+fn on_item_lines(source_text: &str, range: TextRange, offset: TextSize) -> bool {
+    range.contains(offset)
+        || (offset == range.end() && !source_text[..usize::from(offset)].ends_with('\n'))
+}
 
-    let keyword = ["include", "-include", "sinclude"]
-        .iter()
-        .find(|kw| rest.strip_prefix(*kw).is_some_and(|r| r.starts_with(' ')))?;
+/// Whether `offset` is in a recipe.
+fn in_recipe(makefile: &Makefile, source_text: &str, offset: TextSize) -> bool {
+    makefile
+        .recipe_nodes()
+        .any(|recipe| on_item_lines(source_text, recipe.text_range(), offset))
+}
 
-    // Everything after the keyword and its following whitespace is the path
-    // list. Anchor on the start of the final word so that, with several paths
-    // on one line, we complete whichever the cursor sits in.
-    let after_keyword = trimmed_start + keyword.len();
-    let args = &line[after_keyword..];
-    let last_word = args.rfind(char::is_whitespace).map(|i| i + 1).unwrap_or(0);
-    Some(after_keyword + last_word)
+/// If `offset` is in the file names of an `include`, `-include` or
+/// `sinclude` directive, return the part of the file name before it.
+fn include_partial<'a>(
+    makefile: &Makefile,
+    source_text: &'a str,
+    offset: TextSize,
+) -> Option<&'a str> {
+    let include = makefile
+        .includes()
+        .find(|include| on_item_lines(source_text, include.text_range(), offset))?;
+    if !matches!(
+        include.keyword()?.as_str(),
+        "include" | "-include" | "sinclude"
+    ) || offset <= include.keyword_range()?.end()
+    {
+        return None;
+    }
+    let start = include
+        .path_ranges()
+        .find(|range| range.contains_inclusive(offset))
+        .map_or(offset, |range| range.start());
+    Some(&source_text[TextRange::new(start, offset)])
 }
 
 /// Common Makefile fragment naming patterns, used to rank include completions.
@@ -681,17 +695,26 @@ mod tests {
         assert!(labels.contains(&".hidden"), "got {:?}", labels);
     }
 
+    /// The include partial in `text` at its end.
+    fn partial_at_end(text: &str) -> Option<String> {
+        let makefile = Makefile::parse(text).tree();
+        include_partial(&makefile, text, TextSize::of(text)).map(str::to_string)
+    }
+
     #[test]
-    fn test_include_path_start() {
-        assert_eq!(include_path_start("include "), Some(8));
-        assert_eq!(include_path_start("include foo.mk"), Some(8));
-        assert_eq!(include_path_start("-include .env"), Some(9));
-        assert_eq!(include_path_start("sinclude bar"), Some(9));
-        assert_eq!(include_path_start("  include foo"), Some(10));
-        // Multiple paths: anchor on the last word.
-        assert_eq!(include_path_start("include a.mk b.mk"), Some(13));
-        assert_eq!(include_path_start("all: foo"), None);
-        assert_eq!(include_path_start("includex foo"), None);
+    fn test_include_partial() {
+        assert_eq!(partial_at_end("include "), Some(String::new()));
+        assert_eq!(partial_at_end("include foo.mk"), Some("foo.mk".to_string()));
+        assert_eq!(partial_at_end("-include .env"), Some(".env".to_string()));
+        assert_eq!(partial_at_end("sinclude bar"), Some("bar".to_string()));
+        assert_eq!(partial_at_end("  include foo"), Some("foo".to_string()));
+        assert_eq!(
+            partial_at_end("include a.mk b.mk"),
+            Some("b.mk".to_string())
+        );
+        assert_eq!(partial_at_end("include"), None);
+        assert_eq!(partial_at_end("all: foo"), None);
+        assert_eq!(partial_at_end("includex foo"), None);
     }
 
     #[test]
@@ -721,6 +744,47 @@ mod tests {
             "fragment {:?} should rank before {:?}",
             mk.sort_text,
             readme.sort_text
+        );
+    }
+
+    #[test]
+    fn test_include_completions_for_earlier_path() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("rules")).unwrap();
+        let text = "include ru b.mk\n";
+        let parsed = Makefile::parse(text);
+        let completions = get_completions(
+            &[parsed.tree()],
+            text,
+            Position::new(0, 10),
+            Some(dir.path()),
+        );
+        let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+        assert_eq!(labels, vec!["rules"]);
+    }
+
+    #[test]
+    fn test_no_include_completions_on_next_line() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("rules")).unwrap();
+        let text = "include a.mk\n\n";
+        let parsed = Makefile::parse(text);
+        let completions = get_completions(
+            &[parsed.tree()],
+            text,
+            Position::new(1, 0),
+            Some(dir.path()),
+        );
+        assert!(completions.iter().all(|c| c.label != "rules"));
+    }
+
+    #[test]
+    fn test_completions_in_recipe_with_recipe_prefix() {
+        let completions = labels(".RECIPEPREFIX = >\nall:\n>echo $\n", Position::new(2, 7));
+        assert!(
+            completions.contains(&"$@".to_string()),
+            "got {:?}",
+            completions
         );
     }
 
