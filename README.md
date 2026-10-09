@@ -70,6 +70,7 @@ Each diagnostic carries a code, so it can be identified in editors:
 | `undefined-phony-target` | warning | `.PHONY` entry without a matching rule |
 | `unused-phony-target` | warning | phony target with no recipe that nothing depends on |
 | `unreferenced-phony-target` | hint | phony target that nothing depends on, other than conventional ones like `all` or `install` |
+| `unreachable-target` | hint | file target built from prerequisites that nothing depends on and that is not the default goal (only in top-level makefiles whose includes can all be followed) |
 | `empty-rule-probably-phony` | hint | rule without prerequisites or recipe that should probably be phony |
 | `missing-phony` | hint | conventional non-file target like `clean` or `install` that is not declared `.PHONY` |
 | `spaces-instead-of-tab` | error | recipe line indented with spaces |
