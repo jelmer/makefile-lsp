@@ -9,6 +9,7 @@ use tower_lsp_server::ls_types::*;
 use tower_lsp_server::{Client, LanguageServer, LspService, Server};
 
 mod builtins;
+mod call_hierarchy;
 mod check;
 mod code_actions;
 mod completion;
@@ -78,6 +79,22 @@ impl Backend {
 
     async fn file_set(&self, uri: &Uri) -> Option<FileSet> {
         self.workspace.lock().await.file_set(uri)
+    }
+
+    /// The file set for `uri`, which need not be open, as for a call
+    /// hierarchy item in an included makefile.
+    async fn file_set_for_uri(&self, uri: &Uri) -> Result<FileSet> {
+        let mut workspace = self.workspace.lock().await;
+        if let Some(files) = workspace.file_set(uri) {
+            return Ok(files);
+        }
+        let path = workspace::file_path(uri)
+            .ok_or_else(|| Error::invalid_params(format!("not a file URI: {}", uri.as_str())))?;
+        workspace.file_set_for_path(&path).map_err(|e| Error {
+            code: tower_lsp_server::jsonrpc::ErrorCode::InternalError,
+            message: format!("unable to load {}: {e}", path.display()).into(),
+            data: None,
+        })
     }
 
     async fn update_file(&self, uri: Uri, text: String) {
@@ -285,6 +302,7 @@ impl LanguageServer for Backend {
                 inlay_hint_provider: Some(OneOf::Left(true)),
                 document_highlight_provider: Some(OneOf::Left(true)),
                 references_provider: Some(OneOf::Left(true)),
+                call_hierarchy_provider: Some(CallHierarchyServerCapability::Simple(true)),
                 definition_provider: Some(OneOf::Left(true)),
                 document_formatting_provider: Some(OneOf::Left(true)),
                 document_range_formatting_provider: Some(OneOf::Left(true)),
@@ -479,6 +497,35 @@ impl LanguageServer for Backend {
         } else {
             Ok(Some(refs))
         }
+    }
+
+    async fn prepare_call_hierarchy(
+        &self,
+        params: CallHierarchyPrepareParams,
+    ) -> Result<Option<Vec<CallHierarchyItem>>> {
+        let uri = &params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+
+        let Some(files) = self.file_set(uri).await else {
+            return Ok(None);
+        };
+        Ok(call_hierarchy::prepare(&files, position))
+    }
+
+    async fn incoming_calls(
+        &self,
+        params: CallHierarchyIncomingCallsParams,
+    ) -> Result<Option<Vec<CallHierarchyIncomingCall>>> {
+        let files = self.file_set_for_uri(&params.item.uri).await?;
+        Ok(Some(call_hierarchy::incoming_calls(&files, &params.item)))
+    }
+
+    async fn outgoing_calls(
+        &self,
+        params: CallHierarchyOutgoingCallsParams,
+    ) -> Result<Option<Vec<CallHierarchyOutgoingCall>>> {
+        let files = self.file_set_for_uri(&params.item.uri).await?;
+        Ok(Some(call_hierarchy::outgoing_calls(&files, &params.item)))
     }
 
     async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {

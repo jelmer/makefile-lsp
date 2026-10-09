@@ -26,6 +26,8 @@ makefiles it includes (see below); the Makefile is never executed.
   prerequisite to the rule defining it, and from an include path to the file
 - **Find references** and **document highlights** - for targets and variables
 - **Rename** - targets and variables, with prepare-rename support
+- **Call hierarchy** - the prerequisites of a target (outgoing) and the
+  targets that depend on it (incoming)
 - **Document links** - `include`, `-include` and `sinclude` paths are clickable
 - **Inlay hints** - the value of simply-expanded (`:=`) variables at their
   references, and the dependency depth of top-level targets
