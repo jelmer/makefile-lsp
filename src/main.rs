@@ -403,27 +403,13 @@ impl LanguageServer for Backend {
             .map(|d| d.text().to_string())
             .unwrap_or_default();
 
-        let mut _changed_range: Option<text_size::TextRange> = None;
-
         for change in &params.content_changes {
             if let Some(range) = &change.range {
                 if let Some(text_range) = try_lsp_range_to_text_range(&text, range) {
-                    let start: usize = text_range.start().into();
-                    let end: usize = text_range.end().into();
-                    let new_end = start + change.text.len();
-                    let new_range = text_size::TextRange::new(
-                        text_size::TextSize::from(start as u32),
-                        text_size::TextSize::from(new_end as u32),
-                    );
-                    _changed_range = Some(match _changed_range {
-                        Some(existing) => existing.cover(new_range),
-                        None => new_range,
-                    });
-                    text.replace_range(start..end, &change.text);
+                    text.replace_range(std::ops::Range::<usize>::from(text_range), &change.text);
                 }
             } else {
                 text = change.text.clone();
-                _changed_range = None;
             }
         }
 
