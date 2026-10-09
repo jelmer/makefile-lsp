@@ -284,9 +284,9 @@ fn check_undefined_variables(
         let Some(name) = var_ref.name() else {
             continue;
         };
-        // TODO: know the variables BSD make defines, such as .CURDIR.
         let known = match variant {
             MakefileVariant::NMake => builtins::is_nmake_known_macro(&name),
+            MakefileVariant::BSDMake => builtins::is_bsd_known_variable(&name),
             _ => builtins::is_known_variable(&name),
         };
         if known || defined_vars.contains(&name) {
@@ -4605,6 +4605,35 @@ endif
         assert_eq!(
             messages,
             vec!["variable 'CURDIR' is not defined".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_bsd_builtin_variables() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = "D = ${.CURDIR} ${.OBJDIR} ${.PARSEDIR}/${.PARSEFILE} ${.MAKE.LEVEL}\n\
+                    M = ${MAKE} ${.MAKE} ${.MAKEFLAGS} ${MACHINE} ${MACHINE_ARCH} ${.MAKE.OS}\n\
+                    N = ${.SHELL} ${.newline} ${.INCLUDEDFROMDIR} ${CC} ${CFLAGS}\n\
+                    G = $(CURDIR) $(MAKECMDGOALS) ${UNKNOWN}\n\
+                    all: ${D} ${M} ${N} ${G}\n";
+        assert_eq!(
+            bsd_messages(text, dir.path(), "undefined-variable"),
+            vec![
+                "variable 'CURDIR' is not defined".to_string(),
+                "variable 'MAKECMDGOALS' is not defined".to_string(),
+                "variable 'UNKNOWN' is not defined".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_bsd_local_variables() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = "X = ${.TARGET} ${.ALLSRC} ${.IMPSRC} ${.OODATE} ${.PREFIX} ${.MEMBER} \
+                    ${.ARCHIVE} $@ $> $< $? $* $% $! ${@D} ${>F} ${^}\nall: ${X}\n";
+        assert_eq!(
+            bsd_messages(text, dir.path(), "undefined-variable"),
+            vec!["variable '^' is not defined".to_string()]
         );
     }
 }

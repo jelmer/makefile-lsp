@@ -508,6 +508,101 @@ pub fn is_nmake_known_macro(name: &str) -> bool {
     NMAKE_PREDEFINED_MACROS.contains(&name) || matches!(base, "@" | "*" | "**" | "?" | "<")
 }
 
+/// The variables BSD make sets or knows about, from the bmake manual page,
+/// and the default macros its `sys.mk` defines.
+const BSD_BUILTIN_VARIABLES: &[&str] = &[
+    ".ALLTARGETS",
+    ".CURDIR",
+    ".ERROR_CMD",
+    ".ERROR_CWD",
+    ".ERROR_TARGET",
+    ".INCLUDEDFROMDIR",
+    ".INCLUDEDFROMFILE",
+    ".INCLUDES",
+    ".LIBS",
+    "MAKE",
+    ".MAKE",
+    ".MAKE.DEPENDFILE",
+    ".MAKE.EXPAND_VARIABLES",
+    ".MAKE.EXPORTED",
+    ".MAKE.JOBS",
+    ".MAKE.JOB.PREFIX",
+    ".MAKE.LEVEL",
+    ".MAKE.LEVEL.ENV",
+    ".MAKE.MAKEFILE_PREFERENCE",
+    ".MAKE.MAKEFILES",
+    ".MAKE.MODE",
+    ".MAKE.OS",
+    ".MAKE.PATH_FILEMON",
+    ".MAKE.PID",
+    ".MAKE.PPID",
+    ".MAKE.SAVE_DOLLARS",
+    "MAKEFLAGS",
+    ".MAKEFLAGS",
+    ".MAKEOVERRIDES",
+    "MAKE_PRINT_VAR_ON_ERROR",
+    "MAKE_VERSION",
+    "MFLAGS",
+    ".newline",
+    ".OBJDIR",
+    ".PARSEDIR",
+    ".PARSEFILE",
+    ".PATH",
+    "PWD",
+    ".SHELL",
+    ".TARGETS",
+    "VPATH",
+    "MACHINE",
+    "MACHINE_ARCH",
+    "MACHINE_MULTIARCH",
+    "MAKEOBJDIR",
+    "MAKEOBJDIRPREFIX",
+    "MAKESYSPATH",
+    "TMPDIR",
+    "HOME",
+    "PATH",
+    "TERM",
+    "USER",
+    "AFLAGS",
+    "AR",
+    "ARFLAGS",
+    "AS",
+    "CC",
+    "CFLAGS",
+    "CPP",
+    "CXX",
+    "CXXFLAGS",
+    "FC",
+    "FFLAGS",
+    "LD",
+    "LDFLAGS",
+    "LEX",
+    "LFLAGS",
+    "LINT",
+    "LINTFLAGS",
+    "PC",
+    "PFLAGS",
+    "RANLIB",
+    "RFLAGS",
+    "SHELL",
+    "YACC",
+    "YFLAGS",
+];
+
+/// BSD make's local variables, which it sets for each target.
+const BSD_LOCAL_VARIABLES: &[&str] = &[
+    ".TARGET", ".ALLSRC", ".IMPSRC", ".OODATE", ".PREFIX", ".MEMBER", ".ARCHIVE",
+];
+
+/// Check if `name` is a variable BSD make defines: a built-in variable, or a
+/// local variable such as `.TARGET`, `@` or `@D`.
+pub fn is_bsd_known_variable(name: &str) -> bool {
+    let base = name.strip_suffix(['D', 'F']).unwrap_or(name);
+    BSD_BUILTIN_VARIABLES.contains(&name)
+        || BSD_LOCAL_VARIABLES.contains(&name)
+        || matches!(base, "@" | ">" | "<" | "?" | "*" | "%" | "!")
+}
+
 /// Check if a name is a parameter of a `$(call)`, such as `1` in `$(1)`.
 pub fn is_call_parameter(name: &str) -> bool {
     !name.is_empty() && name.bytes().all(|b| b.is_ascii_digit())
