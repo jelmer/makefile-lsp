@@ -266,12 +266,9 @@ fn final_newline_edit(makefile: &Makefile, text: &str, tail_start: usize) -> Opt
     let continued = makefile
         .line_continuations()
         .any(|r| r.start() < tail && tail < r.end());
-    // TODO: line_continuations() does not report a backslash at the very
-    // end of the input, so check the text for that case.
-    let backslash_at_eof = tail_start == text.len() && {
-        let backslashes = text.len() - text.trim_end_matches('\\').len();
-        backslashes % 2 == 1
-    };
+    // A newline after a backslash at the end of the input would make it
+    // continue the line.
+    let backslash_at_eof = makefile.trailing_backslash_range().is_some();
     if continued || backslash_at_eof || &text[tail_start..] == "\n" {
         return None;
     }
@@ -504,6 +501,13 @@ mod tests {
     fn test_keeps_trailing_backslash_without_newline() {
         let text = "VAR = a \\";
         assert_formats(text, text);
+        let text = "all:\n\techo a \\";
+        assert_formats(text, text);
+    }
+
+    #[test]
+    fn test_final_newline_after_escaped_trailing_backslash() {
+        assert_formats("VAR = a \\\\", "VAR = a \\\\\n");
     }
 
     #[test]
