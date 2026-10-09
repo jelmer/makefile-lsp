@@ -59,8 +59,8 @@ pub fn get_inlay_hints(makefile: &Makefile, source_text: &str, range: Range) -> 
         }
 
         // Truncate long values
-        let display_value = if value.len() > 40 {
-            format!("{}...", &value[..37])
+        let display_value = if value.chars().count() > 40 {
+            format!("{}...", value.chars().take(37).collect::<String>())
         } else {
             value
         };
@@ -278,5 +278,19 @@ mod tests {
             assert!(s.contains("..."));
             assert!(s.len() < 50);
         }
+    }
+
+    #[test]
+    fn test_hint_truncation_non_ascii() {
+        let value = format!("{}{}", "a".repeat(36), "\u{e9}".repeat(10));
+        let text = format!("VAR := {}\nOTHER := $(VAR)\n", value);
+        let labels: Vec<_> = get_hints(&text)
+            .into_iter()
+            .map(|h| match h.label {
+                InlayHintLabel::String(s) => s,
+                InlayHintLabel::LabelParts(_) => panic!("expected a string label"),
+            })
+            .collect();
+        assert_eq!(labels, vec![format!(": {}\u{e9}...", "a".repeat(36))]);
     }
 }
