@@ -577,4 +577,20 @@ mod tests {
             ]
         );
     }
+
+    #[test]
+    fn test_rename_variable_in_bsd_condition() {
+        let text = "FOO = 1\n.if defined(FOO)\n.endif\n";
+        let ranges: Vec<Range> = get_edits(text, Position::new(1, 12), "BAR")
+            .into_iter()
+            .map(|e| e.range)
+            .collect();
+        assert_eq!(
+            ranges,
+            vec![
+                Range::new(Position::new(0, 0), Position::new(0, 3)),
+                Range::new(Position::new(1, 12), Position::new(1, 15)),
+            ]
+        );
+    }
 }

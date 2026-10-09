@@ -3,9 +3,8 @@
 use std::collections::{HashMap, HashSet};
 
 use makefile_lossless::{
-    BsdCondition, BsdFunction, ConditionalBranch, ConditionalKind, Makefile, MakefileVariant,
-    Modifier, NmakeCondition, Parse, ParseErrorKind, ParsedReference, PositionedParseError,
-    ReferenceLocation, Rule, TextRange, VariableReference,
+    ConditionalBranch, Makefile, MakefileVariant, Modifier, Parse, ParseErrorKind, ParsedReference,
+    PositionedParseError, ReferenceLocation, Rule, TextRange, VariableReference,
 };
 use tower_lsp_server::ls_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Range};
 
@@ -678,7 +677,7 @@ fn referenced_variables(makefile: &Makefile) -> HashSet<String> {
     // don't show up as references because NAME is a bare identifier.
     for cond in makefile.all_conditionals() {
         for branch in cond.branches() {
-            referenced.extend(tested_variables(&branch));
+            referenced.extend(branch.tested_variables().into_iter().map(|(name, _)| name));
         }
     }
 
@@ -690,72 +689,6 @@ fn referenced_variables(makefile: &Makefile) -> HashSet<String> {
     }
 
     referenced
-}
-
-/// The variables whose definedness or value the condition of `branch` tests
-/// by name rather than by reference.
-fn tested_variables(branch: &ConditionalBranch) -> Vec<String> {
-    let mut names = Vec::new();
-    match branch.conditional_kind() {
-        Some(
-            ConditionalKind::Ifdef
-            | ConditionalKind::Ifndef
-            | ConditionalKind::NmakeIfdef
-            | ConditionalKind::NmakeIfndef,
-        ) => names.extend(branch.condition()),
-        // A bare word is a variable name for these, but a target for
-        // `.ifmake`.
-        Some(ConditionalKind::BsdIf | ConditionalKind::BsdIfdef | ConditionalKind::BsdIfndef) => {
-            if let Some(Ok(condition)) = branch.bsd_condition() {
-                bsd_tested_variables(&condition, &mut names);
-            }
-        }
-        Some(ConditionalKind::NmakeIf) => {
-            if let Some(Ok(condition)) = branch.nmake_condition() {
-                nmake_tested_variables(&condition, &mut names);
-            }
-        }
-        _ => {}
-    }
-    names
-}
-
-fn bsd_tested_variables(condition: &BsdCondition, names: &mut Vec<String>) {
-    match condition {
-        BsdCondition::Or(terms) | BsdCondition::And(terms) => {
-            for term in terms {
-                bsd_tested_variables(term, names);
-            }
-        }
-        BsdCondition::Not(term) => bsd_tested_variables(term, names),
-        BsdCondition::Bare(name)
-        | BsdCondition::Call {
-            function: BsdFunction::Defined,
-            argument: name,
-        } => names.push(name.clone()),
-        // The argument of `empty()` is a reference without the `${...}`.
-        BsdCondition::Call {
-            function: BsdFunction::Empty,
-            argument,
-        } => names.extend(
-            ParsedReference::parse(&format!("${{{argument}}}"), MakefileVariant::BSDMake)
-                .ok()
-                .map(|reference| reference.name),
-        ),
-        _ => {}
-    }
-}
-
-fn nmake_tested_variables(condition: &NmakeCondition, names: &mut Vec<String>) {
-    match condition {
-        NmakeCondition::Defined(name) => names.push(name.clone()),
-        NmakeCondition::Unary { operand, .. } => nmake_tested_variables(operand, names),
-        NmakeCondition::Binary { lhs, rhs, .. } => {
-            nmake_tested_variables(lhs, names);
-            nmake_tested_variables(rhs, names);
-        }
-        _ => {}
-    }
 }
 
 /// Whether a bare `export` or `.EXPORT_ALL_VARIABLES:` exports every variable.
