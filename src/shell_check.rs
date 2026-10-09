@@ -11,9 +11,9 @@ use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 
 use makefile_lossless::{split_references, Makefile, MakefileVariant, Recipe, TextPart};
-use tower_lsp_server::ls_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Position, Range};
+use tower_lsp_server::ls_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Range};
 
-use crate::position::offset_to_position;
+use crate::position::text_range_to_lsp_range;
 
 /// Word substituted for make variable and function references, so the shell
 /// sees a plain word in their place.
@@ -249,32 +249,18 @@ fn parse_shell_error(stderr: &str) -> (usize, String) {
     (0, first.to_string())
 }
 
-/// The range of the `line`th physical line of `recipe`, clamped to its last
-/// line, excluding the leading tab and line ending.
+/// The range of the `line`th line of the command of `recipe`, clamped to
+/// its last line, excluding the recipe prefix and line ending.
 fn recipe_line_range(source_text: &str, recipe: &Recipe, line: usize) -> Range {
-    let range = recipe.text_range();
-    let recipe_text = &source_text[range];
-    let lines: Vec<&str> = recipe_text
-        .trim_end_matches(['\n', '\r'])
-        .split('\n')
-        .collect();
-    let index = line.min(lines.len() - 1);
-    let start = offset_to_position(source_text, range.start());
-    let line_text = lines[index].trim_end_matches('\r');
-    let first_column = if index == 0 { start.character } else { 0 };
-    let indent = line_text.len() - line_text.trim_start_matches('\t').len();
-    let line_number = start.line + index as u32;
-    let width: u32 = line_text[indent..].encode_utf16().count() as u32;
-    let begin = first_column + line_text[..indent].len() as u32;
-    Range::new(
-        Position::new(line_number, begin),
-        Position::new(line_number, begin + width),
-    )
+    let ranges: Vec<_> = recipe.line_ranges().collect();
+    let range = ranges[line.min(ranges.len() - 1)];
+    text_range_to_lsp_range(source_text, range)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tower_lsp_server::ls_types::Position;
 
     fn check(text: &str) -> Vec<(Range, String)> {
         let parsed = Makefile::parse(text);
@@ -383,6 +369,21 @@ mod tests {
             check(text),
             vec![(
                 Range::new(Position::new(3, 1), Position::new(3, 9)),
+                "shell syntax error: Syntax error: end of file unexpected (expecting \"fi\")"
+                    .to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn test_continuation_line_keeps_second_tab() {
+        // make strips only one tab from a continuation line, so the second
+        // is part of the command.
+        let text = "all:\n\tif true; then \\\n\t\techo x\n";
+        assert_eq!(
+            check(text),
+            vec![(
+                Range::new(Position::new(2, 1), Position::new(2, 8)),
                 "shell syntax error: Syntax error: end of file unexpected (expecting \"fi\")"
                     .to_string()
             )]
