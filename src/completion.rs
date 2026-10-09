@@ -23,6 +23,12 @@ pub fn get_completions(
 ) -> Vec<CompletionItem> {
     let lines: Vec<&str> = source_text.lines().collect();
     let line = lines.get(position.line as usize).copied().unwrap_or("");
+    // Byte offset of the cursor within the line; the LSP column is in UTF-16
+    // code units.
+    let col: usize = try_position_to_offset(line, Position::new(0, position.character))
+        .map_or(line.len(), Into::into);
+    let prefix = &line[..col];
+
     // The current makefile and the offset in it.
     let at = makefiles
         .first()
@@ -30,8 +36,6 @@ pub fn get_completions(
 
     // In a recipe line, offer function and variable completions after $
     if at.is_some_and(|(makefile, offset)| in_recipe(makefile, source_text, offset)) {
-        let col = position.character as usize;
-        let prefix = &line[..col.min(line.len())];
         if prefix.ends_with("$(") {
             let mut items = get_function_completions();
             items.extend(get_variable_reference_completions(makefiles));
@@ -58,9 +62,7 @@ pub fn get_completions(
         }
     }
 
-    let col = position.character as usize;
     let typing_variable = position.character > 0 && !line.contains('=') && !line.contains(':');
-    let prefix = &line[..col.min(line.len())];
     match words_before_cursor(prefix).as_deref() {
         Some([]) if line.trim().is_empty() => {
             let mut items = get_directive_completions(|_| true);
@@ -91,14 +93,10 @@ pub fn get_completions(
     }
 
     // After $( in any context, offer function and variable completions
-    let col = position.character as usize;
-    if col >= 2 {
-        let prefix = &line[..col.min(line.len())];
-        if prefix.ends_with("$(") {
-            let mut items = get_function_completions();
-            items.extend(get_variable_reference_completions(makefiles));
-            return items;
-        }
+    if prefix.ends_with("$(") {
+        let mut items = get_function_completions();
+        items.extend(get_variable_reference_completions(makefiles));
+        return items;
     }
 
     vec![]
@@ -930,5 +928,34 @@ mod tests {
             labels_in(&fx, Position::new(1, 5)),
             vec!["all".to_string(), "build".to_string()]
         );
+    }
+
+    #[test]
+    fn test_completions_after_non_ascii_comment() {
+        // The cursor sits right after the two-byte 'é'; treating the UTF-16
+        // column as a byte offset would slice inside it.
+        assert_eq!(
+            labels("# h\u{e9}llo\n", Position::new(0, 4)),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn test_completions_in_recipe_after_non_ascii() {
+        let completions = labels("all:\n\techo \u{e9} $(\n", Position::new(1, 10));
+        assert!(completions.contains(&"wildcard".to_string()));
+        assert!(!completions.contains(&"$@".to_string()));
+    }
+
+    #[test]
+    fn test_completions_in_recipe_after_surrogate_pair() {
+        let completions = labels("all:\n\t\u{1f600} $(\n", Position::new(1, 6));
+        assert!(completions.contains(&"wildcard".to_string()));
+    }
+
+    #[test]
+    fn test_function_completions_in_value_after_non_ascii() {
+        let completions = labels("X = \u{e9} $(\n", Position::new(0, 8));
+        assert!(completions.contains(&"wildcard".to_string()));
     }
 }
