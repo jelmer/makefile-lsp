@@ -30,6 +30,8 @@ makefiles it includes (see below); the Makefile is never executed.
 - **Inlay hints** - the value of simply-expanded (`:=`) variables at their
   references, and the dependency depth of top-level targets
 - **Document symbols** - outline of targets and variable assignments
+- **Workspace symbols** - search targets and variables across the open
+  makefiles, the makefiles in the workspace folders and the files they include
 - **Folding ranges** - rules, conditionals and comment blocks
 - **Selection ranges** - expand selection from a word to its expression, the
   enclosing rule, variable or conditional, and the whole file

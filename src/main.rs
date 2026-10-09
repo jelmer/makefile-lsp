@@ -299,6 +299,7 @@ impl LanguageServer for Backend {
                 selection_range_provider: Some(SelectionRangeProviderCapability::Simple(true)),
                 folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
                 document_symbol_provider: Some(OneOf::Left(true)),
+                workspace_symbol_provider: Some(OneOf::Left(true)),
                 semantic_tokens_provider: Some(
                     SemanticTokensServerCapabilities::SemanticTokensOptions(
                         SemanticTokensOptions {
@@ -625,6 +626,27 @@ impl LanguageServer for Backend {
         let symbols = symbols::generate_document_symbols(&makefile, doc.text());
 
         Ok(Some(DocumentSymbolResponse::Nested(symbols)))
+    }
+
+    async fn symbol(
+        &self,
+        params: WorkspaceSymbolParams,
+    ) -> Result<Option<WorkspaceSymbolResponse>> {
+        let mut workspace = self.workspace.lock().await;
+        let docs: Vec<_> = workspace
+            .all_documents()
+            .into_iter()
+            .map(|d| {
+                let name = workspace.display_name(&d);
+                (d, name)
+            })
+            .collect();
+        drop(workspace);
+        let symbols = symbols::workspace_symbols(
+            docs.iter().map(|(d, n)| (d.as_ref(), n.clone())),
+            &params.query,
+        );
+        Ok(Some(WorkspaceSymbolResponse::Nested(symbols)))
     }
 
     async fn folding_range(&self, params: FoldingRangeParams) -> Result<Option<Vec<FoldingRange>>> {
