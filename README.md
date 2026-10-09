@@ -13,7 +13,9 @@ makefiles it includes (see below); the Makefile is never executed.
   a line, conditional directives after `else`,
   variable names, built-in functions and variables after `$(`, automatic
   variables after `$`, targets and file paths in prerequisite lists, and file
-  paths after `include`
+  paths after `include`, plus snippets for clients that support them: rules,
+  pattern or suffix rules, conditionals and `define` blocks for the make
+  variant in use, and function calls with argument placeholders
 - **Hover** - the definition of user-defined variables, documentation for
   directives such as `ifeq` and `include`, automatic variables, built-in
   variables, built-in functions and special targets such as `.PHONY`, the
