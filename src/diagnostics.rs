@@ -1512,9 +1512,9 @@ fn has_file_with_same_stem(path: &std::path::Path) -> bool {
 /// arguments to `$(eval)` and `$(call)` usually build text that is, so those
 /// are left alone.
 ///
-/// BSD make sets `$@` (`.TARGET`), `$*` (`.PREFIX`) and `$%` (`.MEMBER`) in
-/// prerequisites too, and leaves references to undefined variables in a
-/// `:=` assignment unexpanded.
+/// BSD make sets `$@` (`.TARGET`), `$*` (`.PREFIX`), `$%` (`.MEMBER`) and
+/// `$!` (`.ARCHIVE`) in prerequisites too, and leaves references to undefined
+/// variables in a `:=` assignment unexpanded.
 fn check_automatic_variable_outside_recipe(
     source_text: &str,
     makefile: &Makefile,
@@ -1534,7 +1534,7 @@ fn check_automatic_variable_outside_recipe(
             // reference can't be told apart from a plain `$@` yet.
             let set_in_prerequisites = second_expansion
                 || variant == MakefileVariant::NMake
-                || (variant == MakefileVariant::BSDMake && matches!(name, '@' | '*' | '%'));
+                || (variant == MakefileVariant::BSDMake && matches!(name, '@' | '*' | '%' | '!'));
             let context = immediate_expansion_context(&var_ref, set_in_prerequisites, variant)?;
             Some(make_diagnostic(
                 text_range_to_lsp_range(source_text, var_ref.text_range()),
@@ -1550,13 +1550,26 @@ fn check_automatic_variable_outside_recipe(
 }
 
 /// If `text` is a reference to an automatic variable, such as `$@`, `$(<)`,
-/// `${@D}` or `$(@:.c=.o)`, the character naming the variable.
+/// `${@D}` or `$(@:.c=.o)`, the character naming the variable. BSD make's
+/// long names, such as `${.TARGET}`, map to their single-character aliases.
 fn automatic_variable_name(text: &str, variant: MakefileVariant) -> Option<char> {
     let reference = ParsedReference::parse(text, variant).ok()?;
-    let mut chars = reference.name.chars();
-    let name = chars
-        .next()
-        .filter(|c| matches!(c, '@' | '<' | '^' | '?' | '*' | '+' | '|' | '%'))?;
+    let bsd = variant == MakefileVariant::BSDMake;
+    let name = match reference.name.as_str() {
+        ".TARGET" if bsd => "@",
+        ".ALLSRC" if bsd => ">",
+        ".IMPSRC" if bsd => "<",
+        ".OODATE" if bsd => "?",
+        ".PREFIX" if bsd => "*",
+        ".MEMBER" if bsd => "%",
+        ".ARCHIVE" if bsd => "!",
+        name => name,
+    };
+    let mut chars = name.chars();
+    let name = chars.next().filter(|c| {
+        matches!(c, '@' | '<' | '^' | '?' | '*' | '+' | '|' | '%')
+            || (bsd && matches!(c, '>' | '!'))
+    })?;
     let only_substitutions = reference
         .modifiers
         .iter()
@@ -4491,6 +4504,78 @@ endif
             ),
             Vec::<String>::new()
         );
+    }
+
+    fn bsd_outside_recipe(text: &str) -> Vec<String> {
+        let dir = tempfile::tempdir().unwrap();
+        bsd_messages(text, dir.path(), "automatic-variable-outside-recipe")
+    }
+
+    fn outside_recipe_messages(vars: &[&str], context: &str) -> Vec<String> {
+        vars.iter()
+            .map(|v| {
+                format!("automatic variable '{v}' is only set in recipes and is empty in {context}")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_bsd_long_automatic_variables_in_prerequisites() {
+        // .TARGET, .PREFIX, .MEMBER and .ARCHIVE ($!) are set for sources;
+        // .ALLSRC is `$>`.
+        assert_eq!(
+            bsd_outside_recipe(
+                "all: ${.TARGET}.c ${.PREFIX}.h ${.MEMBER}.o ${.ARCHIVE}.a \
+                 ${.IMPSRC}.x ${.ALLSRC}.y ${.OODATE}.z $!.b $>.w\n"
+            ),
+            outside_recipe_messages(
+                &["${.IMPSRC}", "${.ALLSRC}", "${.OODATE}", "$>"],
+                "a prerequisite list"
+            )
+        );
+    }
+
+    #[test]
+    fn test_bsd_long_automatic_variables_in_assignments() {
+        assert_eq!(
+            bsd_outside_recipe(
+                "A := ${.TARGET} ${.IMPSRC}\nB = ${.TARGET} ${.ALLSRC}\n\
+                 C != echo ${.TARGET} ${.IMPSRC:.c=.o} ${.ALLSRC:T}\n"
+            ),
+            outside_recipe_messages(
+                &["${.TARGET}", "${.IMPSRC:.c=.o}"],
+                "an immediately-expanded assignment"
+            )
+        );
+    }
+
+    #[test]
+    fn test_bsd_long_automatic_variables_in_condition_and_target() {
+        assert_eq!(
+            bsd_outside_recipe(".if ${.OODATE} == \"\"\n.endif\n${.TARGET}.o:\n"),
+            [
+                outside_recipe_messages(&["${.OODATE}"], "a conditional directive"),
+                outside_recipe_messages(&["${.TARGET}"], "a target list"),
+            ]
+            .concat()
+        );
+    }
+
+    #[test]
+    fn test_long_automatic_variables_only_for_bsd() {
+        let text = "X := $(.TARGET) $>\n";
+        let parsed = Makefile::parse_with_variant(text, MakefileVariant::GNUMake);
+        let messages: Vec<String> = get_diagnostics(text, &parsed, None)
+            .into_iter()
+            .filter(|d| {
+                d.code
+                    == Some(NumberOrString::String(
+                        "automatic-variable-outside-recipe".to_string(),
+                    ))
+            })
+            .map(|d| d.message)
+            .collect();
+        assert_eq!(messages, Vec::<String>::new());
     }
 
     #[test]
