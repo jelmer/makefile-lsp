@@ -60,6 +60,8 @@ struct Backend {
     diagnostics: Arc<Mutex<HashMap<Uri, PublishedDiagnostics>>>,
     /// Whether the client can watch files for us.
     watch_files: AtomicBool,
+    /// Whether the client supports snippets in completion items.
+    snippet_support: AtomicBool,
 }
 
 impl Backend {
@@ -69,6 +71,7 @@ impl Backend {
             workspace: Arc::new(Mutex::new(Workspace::new())),
             diagnostics: Arc::new(Mutex::new(HashMap::new())),
             watch_files: AtomicBool::new(false),
+            snippet_support: AtomicBool::new(false),
         }
     }
 
@@ -248,6 +251,16 @@ impl LanguageServer for Backend {
             .and_then(|w| w.dynamic_registration)
             .unwrap_or(false);
         self.watch_files.store(watch_files, Ordering::Relaxed);
+        let snippet_support = params
+            .capabilities
+            .text_document
+            .as_ref()
+            .and_then(|t| t.completion.as_ref())
+            .and_then(|c| c.completion_item.as_ref())
+            .and_then(|i| i.snippet_support)
+            .unwrap_or(false);
+        self.snippet_support
+            .store(snippet_support, Ordering::Relaxed);
 
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
@@ -431,7 +444,15 @@ impl LanguageServer for Backend {
         let doc = files.current();
         let makefiles: Vec<makefile_lossless::Makefile> =
             files.docs().map(|d| d.makefile()).collect();
-        let completions = completion::get_completions(&makefiles, doc.text(), position, doc.dir());
+        let completions = completion::get_completions(
+            &makefiles,
+            doc.text(),
+            position,
+            doc.dir(),
+            self.snippet_support
+                .load(Ordering::Relaxed)
+                .then(|| doc.variant()),
+        );
 
         if completions.is_empty() {
             Ok(None)
