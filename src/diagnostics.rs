@@ -116,7 +116,7 @@ pub fn get_file_set_diagnostics(files: &FileSet) -> Vec<Diagnostic> {
         external.add(makefile);
     }
     let current = files.current();
-    collect_diagnostics(
+    let mut diagnostics = collect_diagnostics(
         current.text(),
         current.parsed(),
         &external,
@@ -127,7 +127,9 @@ pub fn get_file_set_diagnostics(files: &FileSet) -> Vec<Diagnostic> {
             OtherMakefiles::Incomplete
         },
         current.dir(),
-    )
+    );
+    diagnostics.extend(crate::unreachable::check_unreachable_targets(files));
+    diagnostics
 }
 
 /// The other makefiles of a file set, for checks that need to know all rules.
@@ -1411,17 +1413,7 @@ fn resolvable_target_names(
 ) -> Option<HashSet<String>> {
     let defers_elsewhere = (!includes_followed && makefile.includes().next().is_some())
         || makefile.vpaths().next().is_some()
-        // A line of only references is parsed as makefile text once expanded.
-        || makefile.expression_statements().any(|stmt| {
-            !stmt
-                .references()
-                .next()
-                .and_then(|r| r.name())
-                .is_some_and(|name| matches!(name.as_str(), "info" | "warning" | "error"))
-        })
-        || makefile
-            .variable_references()
-            .any(|r| r.name().as_deref() == Some("eval"));
+        || may_generate_rules(makefile);
     if defers_elsewhere
         || makefile
             .variable_definitions_by_name("VPATH")
@@ -1463,6 +1455,21 @@ fn resolvable_target_names(
         }
     }
     Some(names)
+}
+
+/// Whether `makefile` may define rules that only exist once expanded: with
+/// `$(eval)` (also in a recipe) or a line that expands to makefile text.
+pub(crate) fn may_generate_rules(makefile: &Makefile) -> bool {
+    // A line of only references is parsed as makefile text once expanded.
+    makefile.expression_statements().any(|stmt| {
+        !stmt
+            .references()
+            .next()
+            .and_then(|r| r.name())
+            .is_some_and(|name| matches!(name.as_str(), "info" | "warning" | "error"))
+    }) || makefile
+        .variable_references()
+        .any(|r| r.name().as_deref() == Some("eval"))
 }
 
 /// Does a file with the same stem as `path` but some extension exist?

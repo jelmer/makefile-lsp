@@ -13,7 +13,9 @@ makefiles it includes (see below); the Makefile is never executed.
   a line, conditional directives after `else`,
   variable names, built-in functions and variables after `$(`, automatic
   variables after `$`, targets and file paths in prerequisite lists, and file
-  paths after `include`
+  paths after `include`, plus snippets for clients that support them: rules,
+  pattern or suffix rules, conditionals and `define` blocks for the make
+  variant in use, and function calls with argument placeholders
 - **Hover** - the definition of user-defined variables, documentation for
   directives such as `ifeq` and `include`, automatic variables, built-in
   variables, built-in functions and special targets such as `.PHONY`, the
@@ -28,10 +30,14 @@ makefiles it includes (see below); the Makefile is never executed.
 - **Rename** - targets and variables, with prepare-rename support
 - **Linked editing** - editing a variable name edits its other occurrences in
   the same file along with it
+- **Call hierarchy** - the prerequisites of a target (outgoing) and the
+  targets that depend on it (incoming)
 - **Document links** - `include`, `-include` and `sinclude` paths are clickable
 - **Inlay hints** - the value of simply-expanded (`:=`) variables at their
   references, and the dependency depth of top-level targets
 - **Document symbols** - outline of targets and variable assignments
+- **Workspace symbols** - search targets and variables across the open
+  makefiles, the makefiles in the workspace folders and the files they include
 - **Folding ranges** - rules, conditionals and comment blocks
 - **Selection ranges** - expand selection from a word to its expression, the
   enclosing rule, variable or conditional, and the whole file
@@ -72,6 +78,7 @@ Each diagnostic carries a code, so it can be identified in editors:
 | `undefined-phony-target` | warning | `.PHONY` entry without a matching rule |
 | `unused-phony-target` | warning | phony target with no recipe that nothing depends on |
 | `unreferenced-phony-target` | hint | phony target that nothing depends on, other than conventional ones like `all` or `install` |
+| `unreachable-target` | hint | file target built from prerequisites that nothing depends on and that is not the default goal (only in top-level makefiles whose includes can all be followed) |
 | `empty-rule-probably-phony` | hint | rule without prerequisites or recipe that should probably be phony |
 | `missing-phony` | hint | conventional non-file target like `clean` or `install` that is not declared `.PHONY` |
 | `spaces-instead-of-tab` | error | recipe line indented with spaces |

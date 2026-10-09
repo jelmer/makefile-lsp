@@ -2,8 +2,11 @@
 
 use std::path::Path;
 
-use makefile_lossless::{Makefile, TextRange, TextSize};
-use tower_lsp_server::ls_types::{CompletionItem, CompletionItemKind, Documentation, Position};
+use makefile_lossless::{Makefile, MakefileVariant, TextRange, TextSize};
+use tower_lsp_server::ls_types::{
+    CompletionItem, CompletionItemKind, CompletionTextEdit, Documentation, InsertTextFormat,
+    InsertTextMode, Position, Range, TextEdit,
+};
 
 use crate::builtins;
 use crate::position::try_position_to_offset;
@@ -14,12 +17,14 @@ use crate::position::try_position_to_offset;
 /// makefiles visible from it (included or including ones), whose targets and
 /// variables are offered too. `base_dir` is the directory of the source file;
 /// used to resolve relative paths when offering filesystem completions for
-/// prerequisites.
+/// prerequisites. `snippets` is the make variant to offer snippets for, or
+/// `None` if the client does not support snippets.
 pub fn get_completions(
     makefiles: &[Makefile],
     source_text: &str,
     position: Position,
     base_dir: Option<&Path>,
+    snippets: Option<MakefileVariant>,
 ) -> Vec<CompletionItem> {
     let lines: Vec<&str> = source_text.lines().collect();
     let line = lines.get(position.line as usize).copied().unwrap_or("");
@@ -28,6 +33,8 @@ pub fn get_completions(
     let col: usize = try_position_to_offset(line, Position::new(0, position.character))
         .map_or(line.len(), Into::into);
     let prefix = &line[..col];
+    let suffix = &line[col..];
+    let function_snippets = snippets.is_some();
 
     // The current makefile and the offset in it.
     let at = makefiles
@@ -37,7 +44,7 @@ pub fn get_completions(
     // In a recipe line, offer function and variable completions after $
     if at.is_some_and(|(makefile, offset)| in_recipe(makefile, source_text, offset)) {
         if prefix.ends_with("$(") {
-            let mut items = get_function_completions();
+            let mut items = get_function_completions(function_snippets, suffix);
             items.extend(get_variable_reference_completions(makefiles));
             return items;
         }
@@ -63,15 +70,30 @@ pub fn get_completions(
     }
 
     let typing_variable = position.character > 0 && !line.contains('=') && !line.contains(':');
+    // Snippets insert whole lines, so only offer them when nothing follows.
+    let line_snippets = || {
+        let (Some(variant), Some((makefile, offset))) = (snippets, at) else {
+            return vec![];
+        };
+        if !suffix.trim().is_empty() {
+            return vec![];
+        }
+        let word = prefix.trim_start();
+        let start = position.character - word.encode_utf16().count() as u32;
+        let range = Range::new(Position::new(position.line, start), position);
+        get_line_snippets(variant, recipe_prefix(makefile, variant, offset), range)
+    };
     match words_before_cursor(prefix).as_deref() {
         Some([]) if line.trim().is_empty() => {
             let mut items = get_directive_completions(|_| true);
             items.extend(get_target_completions(makefiles));
+            items.extend(line_snippets());
             return items;
         }
         Some([]) if typing_variable => {
             let mut items = get_directive_completions(|_| true);
             items.extend(get_variable_completions(makefiles));
+            items.extend(line_snippets());
             return items;
         }
         Some(["else"]) => {
@@ -94,7 +116,7 @@ pub fn get_completions(
 
     // After $( in any context, offer function and variable completions
     if prefix.ends_with("$(") {
-        let mut items = get_function_completions();
+        let mut items = get_function_completions(function_snippets, suffix);
         items.extend(get_variable_reference_completions(makefiles));
         return items;
     }
@@ -213,22 +235,217 @@ fn get_automatic_variable_completions() -> Vec<CompletionItem> {
         .collect()
 }
 
-/// Generate function completions for use after $(.
-fn get_function_completions() -> Vec<CompletionItem> {
+/// Generate function completions for use after $(. As snippets, they insert
+/// placeholders for the arguments and close the parenthesis unless `suffix`,
+/// the rest of the line, already starts with one.
+fn get_function_completions(snippets: bool, suffix: &str) -> Vec<CompletionItem> {
     builtins::BUILTIN_FUNCTIONS
         .iter()
         .map(|f| {
-            let insert = format!("{} ", f.name);
             let sig = format!("$({} {})", f.name, f.params.join(","));
+            let (insert, format) = if snippets {
+                let args: Vec<String> = f
+                    .params
+                    .iter()
+                    .enumerate()
+                    .map(|(i, p)| format!("${{{}:{}}}", i + 1, escape_snippet(p)))
+                    .collect();
+                let close = if suffix.starts_with(')') { "" } else { ")$0" };
+                let insert = format!("{} {}{}", f.name, args.join(","), close);
+                (insert, Some(InsertTextFormat::SNIPPET))
+            } else {
+                (format!("{} ", f.name), None)
+            };
             CompletionItem {
                 label: f.name.to_string(),
                 kind: Some(CompletionItemKind::FUNCTION),
                 detail: Some(format!("{}: {}", sig, f.doc)),
                 insert_text: Some(insert),
+                insert_text_format: format,
                 ..Default::default()
             }
         })
         .collect()
+}
+
+/// A snippet for a construct starting at the beginning of a line. A tab in
+/// `body` stands for the recipe prefix.
+struct LineSnippet {
+    label: &'static str,
+    detail: &'static str,
+    body: &'static str,
+}
+
+const RULE_SNIPPET: LineSnippet = LineSnippet {
+    label: "rule",
+    detail: "Rule with a recipe",
+    body: "${1:target}: ${2:prerequisites}\n\t$0",
+};
+
+const PHONY_RULE_SNIPPET: LineSnippet = LineSnippet {
+    label: "phony rule",
+    detail: "Rule for a target that is not a file",
+    body: ".PHONY: ${1:target}\n${1:target}: ${2:prerequisites}\n\t$0",
+};
+
+const SUFFIX_RULE_SNIPPET: LineSnippet = LineSnippet {
+    label: "suffix rule",
+    detail: "Suffix rule making .o files from .c files",
+    body: ".${1:c}.${2:o}:\n\t$0",
+};
+
+const GNU_SNIPPETS: &[LineSnippet] = &[
+    RULE_SNIPPET,
+    PHONY_RULE_SNIPPET,
+    LineSnippet {
+        label: "pattern rule",
+        detail: "Pattern rule compiling .c files to .o files",
+        body: "%.${1:o}: %.${2:c}\n\t${0:\\$(CC) \\$(CPPFLAGS) \\$(CFLAGS) -c -o \\$@ \\$<}",
+    },
+    LineSnippet {
+        label: "ifeq/endif",
+        detail: "Conditional on two values being equal",
+        body: "ifeq (${1:\\$(VAR)},${2:value})\n$0\nendif",
+    },
+    LineSnippet {
+        label: "ifeq/else/endif",
+        detail: "Conditional on two values being equal, with an else branch",
+        body: "ifeq (${1:\\$(VAR)},${2:value})\n$3\nelse\n$0\nendif",
+    },
+    LineSnippet {
+        label: "ifdef/endif",
+        detail: "Conditional on a variable being defined",
+        body: "ifdef ${1:VAR}\n$0\nendif",
+    },
+    LineSnippet {
+        label: "ifdef/else/endif",
+        detail: "Conditional on a variable being defined, with an else branch",
+        body: "ifdef ${1:VAR}\n$2\nelse\n$0\nendif",
+    },
+    LineSnippet {
+        label: "ifndef/endif",
+        detail: "Conditional on a variable not being defined",
+        body: "ifndef ${1:VAR}\n$0\nendif",
+    },
+    LineSnippet {
+        label: "define/endef",
+        detail: "Multi-line variable",
+        body: "define ${1:name}\n$0\nendef",
+    },
+];
+
+const BSD_SNIPPETS: &[LineSnippet] = &[
+    RULE_SNIPPET,
+    PHONY_RULE_SNIPPET,
+    SUFFIX_RULE_SNIPPET,
+    LineSnippet {
+        label: ".if/.endif",
+        detail: "Conditional",
+        body: ".if ${1:condition}\n$0\n.endif",
+    },
+    LineSnippet {
+        label: ".if/.else/.endif",
+        detail: "Conditional with an else branch",
+        body: ".if ${1:condition}\n$2\n.else\n$0\n.endif",
+    },
+    LineSnippet {
+        label: ".ifdef/.endif",
+        detail: "Conditional on a variable being defined",
+        body: ".ifdef ${1:VAR}\n$0\n.endif",
+    },
+    LineSnippet {
+        label: ".for/.endfor",
+        detail: "Loop over the words of a list",
+        body: ".for ${1:item} in ${2:list}\n$0\n.endfor",
+    },
+];
+
+const NMAKE_SNIPPETS: &[LineSnippet] = &[
+    RULE_SNIPPET,
+    LineSnippet {
+        label: "inference rule",
+        detail: "Inference rule making .obj files from .c files",
+        body: ".${1:c}.${2:obj}:\n\t$0",
+    },
+    LineSnippet {
+        label: "!IF/!ENDIF",
+        detail: "Conditional",
+        body: "!IF ${1:condition}\n$0\n!ENDIF",
+    },
+    LineSnippet {
+        label: "!IF/!ELSE/!ENDIF",
+        detail: "Conditional with an else branch",
+        body: "!IF ${1:condition}\n$2\n!ELSE\n$0\n!ENDIF",
+    },
+    LineSnippet {
+        label: "!IFDEF/!ENDIF",
+        detail: "Conditional on a macro being defined",
+        body: "!IFDEF ${1:MACRO}\n$0\n!ENDIF",
+    },
+];
+
+const POSIX_SNIPPETS: &[LineSnippet] = &[RULE_SNIPPET, PHONY_RULE_SNIPPET, SUFFIX_RULE_SNIPPET];
+
+/// Generate the line snippets for `variant`, replacing `range`, the word
+/// typed so far.
+fn get_line_snippets(
+    variant: MakefileVariant,
+    recipe_prefix: char,
+    range: Range,
+) -> Vec<CompletionItem> {
+    let snippets = match variant {
+        MakefileVariant::BSDMake => BSD_SNIPPETS,
+        MakefileVariant::NMake => NMAKE_SNIPPETS,
+        MakefileVariant::POSIXMake => POSIX_SNIPPETS,
+        _ => GNU_SNIPPETS,
+    };
+    let prefix = escape_snippet(&recipe_prefix.to_string());
+    snippets
+        .iter()
+        .map(|s| CompletionItem {
+            label: s.label.to_string(),
+            kind: Some(CompletionItemKind::SNIPPET),
+            detail: Some(s.detail.to_string()),
+            insert_text_format: Some(InsertTextFormat::SNIPPET),
+            // Keep the client from reindenting the lines, which would break
+            // recipes.
+            insert_text_mode: Some(InsertTextMode::AS_IS),
+            text_edit: Some(CompletionTextEdit::Edit(TextEdit::new(
+                range,
+                s.body.replace('\t', &prefix),
+            ))),
+            ..Default::default()
+        })
+        .collect()
+}
+
+/// Escape the characters that are special in snippet text.
+fn escape_snippet(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for c in text.chars() {
+        if matches!(c, '$' | '}' | '\\') {
+            escaped.push('\\');
+        }
+        escaped.push(c);
+    }
+    escaped
+}
+
+/// The recipe prefix in effect at `offset`: the first character of the last
+/// `.RECIPEPREFIX` set before it, or a tab.
+// TODO: use a makefile-lossless API for this once there is one; this misses
+// .RECIPEPREFIX set in included files and does not expand its value.
+fn recipe_prefix(makefile: &Makefile, variant: MakefileVariant, offset: TextSize) -> char {
+    if variant != MakefileVariant::GNUMake {
+        return '\t';
+    }
+    makefile
+        .variable_definitions_by_name(".RECIPEPREFIX")
+        .filter(|v| v.text_range().end() <= offset)
+        .last()
+        .and_then(|v| v.raw_value())
+        .and_then(|value| value.trim().chars().next())
+        .unwrap_or('\t')
 }
 
 /// Generate variable reference completions for use after `$(`: well-known
@@ -482,7 +699,7 @@ mod tests {
         let text = "all: build\n\n";
         let parsed = Makefile::parse(text);
         let makefile = parsed.tree();
-        let completions = get_completions(&[makefile], text, Position::new(1, 0), None);
+        let completions = get_completions(&[makefile], text, Position::new(1, 0), None, None);
         assert!(!completions.is_empty());
         assert!(completions.iter().any(|c| c.label == ".PHONY"));
     }
@@ -492,7 +709,7 @@ mod tests {
         let text = ".PHONY: all\n\n";
         let parsed = Makefile::parse(text);
         let makefile = parsed.tree();
-        let completions = get_completions(&[makefile], text, Position::new(1, 0), None);
+        let completions = get_completions(&[makefile], text, Position::new(1, 0), None, None);
         assert!(!completions.iter().any(|c| c.label == ".PHONY"));
     }
 
@@ -501,7 +718,7 @@ mod tests {
         let text = "all:\n\t";
         let parsed = Makefile::parse(text);
         let makefile = parsed.tree();
-        let completions = get_completions(&[makefile], text, Position::new(1, 1), None);
+        let completions = get_completions(&[makefile], text, Position::new(1, 1), None, None);
         assert!(completions.is_empty());
     }
 
@@ -510,7 +727,7 @@ mod tests {
         let text = "CC = gcc\nCFLAGS = -Wall\n";
         let parsed = Makefile::parse(text);
         let makefile = parsed.tree();
-        let completions = get_completions(&[makefile], text, Position::new(2, 1), None);
+        let completions = get_completions(&[makefile], text, Position::new(2, 1), None, None);
         // Should not crash, may offer variable completions
         let _ = completions;
     }
@@ -520,7 +737,7 @@ mod tests {
         let text = "all:\n\t$(";
         let parsed = Makefile::parse(text);
         let makefile = parsed.tree();
-        let completions = get_completions(&[makefile], text, Position::new(1, 3), None);
+        let completions = get_completions(&[makefile], text, Position::new(1, 3), None, None);
         let make = completions.iter().find(|c| c.label == "MAKE").unwrap();
         assert_eq!(make.insert_text.as_deref(), Some("MAKE)"));
         assert!(completions.iter().any(|c| c.label == "MAKEFLAGS"));
@@ -534,7 +751,7 @@ mod tests {
         let text = "CC = gcc\nall:\n\t$(";
         let parsed = Makefile::parse(text);
         let makefile = parsed.tree();
-        let completions = get_completions(&[makefile], text, Position::new(2, 3), None);
+        let completions = get_completions(&[makefile], text, Position::new(2, 3), None, None);
         let cc = completions.iter().find(|c| c.label == "CC").unwrap();
         assert_eq!(cc.insert_text.as_deref(), Some("CC)"));
     }
@@ -553,7 +770,7 @@ mod tests {
 
     #[test]
     fn test_function_completions() {
-        let completions = get_function_completions();
+        let completions = get_function_completions(false, "");
         assert!(!completions.is_empty());
         assert!(completions.iter().any(|c| c.label == "subst"));
         assert!(completions.iter().any(|c| c.label == "wildcard"));
@@ -586,7 +803,7 @@ mod tests {
         let parsed = Makefile::parse(text);
         let makefile = parsed.tree();
         // Position cursor right after "all: "
-        let completions = get_completions(&[makefile], text, Position::new(6, 5), None);
+        let completions = get_completions(&[makefile], text, Position::new(6, 5), None, None);
         let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
         assert!(
             labels.contains(&"build"),
@@ -601,7 +818,7 @@ mod tests {
         let text = ".PHONY: build\n\n%.o: %.c\n\techo compile\n\nbuild:\n\techo build\n\nall: \n";
         let parsed = Makefile::parse(text);
         let makefile = parsed.tree();
-        let completions = get_completions(&[makefile], text, Position::new(8, 5), None);
+        let completions = get_completions(&[makefile], text, Position::new(8, 5), None, None);
         let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
         assert!(labels.contains(&"build"));
         assert!(!labels.iter().any(|l| l.contains('%')));
@@ -612,7 +829,7 @@ mod tests {
     fn test_prerequisite_completions_on_continuation_line() {
         let text = "build:\nall: a \\\n  \n";
         let makefile = Makefile::parse(text).tree();
-        let completions = get_completions(&[makefile], text, Position::new(2, 2), None);
+        let completions = get_completions(&[makefile], text, Position::new(2, 2), None, None);
         let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
         assert_eq!(labels, vec!["build", "all"]);
     }
@@ -621,7 +838,7 @@ mod tests {
     fn test_no_prerequisite_completions_in_variable_value() {
         let text = "build:\nFOO := b";
         let makefile = Makefile::parse(text).tree();
-        let completions = get_completions(&[makefile], text, Position::new(1, 8), None);
+        let completions = get_completions(&[makefile], text, Position::new(1, 8), None, None);
         assert_eq!(completions, vec![]);
     }
 
@@ -635,7 +852,13 @@ mod tests {
         let text = "all: \n";
         let parsed = Makefile::parse(text);
         let makefile = parsed.tree();
-        let completions = get_completions(&[makefile], text, Position::new(0, 5), Some(dir.path()));
+        let completions = get_completions(
+            &[makefile],
+            text,
+            Position::new(0, 5),
+            Some(dir.path()),
+            None,
+        );
 
         let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
         assert!(labels.contains(&"main.c"), "got {:?}", labels);
@@ -657,7 +880,13 @@ mod tests {
         let text = "all: src/\n";
         let parsed = Makefile::parse(text);
         let makefile = parsed.tree();
-        let completions = get_completions(&[makefile], text, Position::new(0, 9), Some(dir.path()));
+        let completions = get_completions(
+            &[makefile],
+            text,
+            Position::new(0, 9),
+            Some(dir.path()),
+            None,
+        );
 
         let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
         assert!(labels.contains(&"src/main.c"), "got {:?}", labels);
@@ -673,7 +902,13 @@ mod tests {
         let text = "all: \n";
         let parsed = Makefile::parse(text);
         let makefile = parsed.tree();
-        let completions = get_completions(&[makefile], text, Position::new(0, 5), Some(dir.path()));
+        let completions = get_completions(
+            &[makefile],
+            text,
+            Position::new(0, 5),
+            Some(dir.path()),
+            None,
+        );
         let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
         assert!(labels.contains(&"visible.c"));
         assert!(!labels.contains(&".hidden"));
@@ -688,7 +923,13 @@ mod tests {
         let text = "all: .\n";
         let parsed = Makefile::parse(text);
         let makefile = parsed.tree();
-        let completions = get_completions(&[makefile], text, Position::new(0, 6), Some(dir.path()));
+        let completions = get_completions(
+            &[makefile],
+            text,
+            Position::new(0, 6),
+            Some(dir.path()),
+            None,
+        );
         let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
         assert!(labels.contains(&".hidden"), "got {:?}", labels);
     }
@@ -725,7 +966,13 @@ mod tests {
         let text = "include \n";
         let parsed = Makefile::parse(text);
         let makefile = parsed.tree();
-        let completions = get_completions(&[makefile], text, Position::new(0, 8), Some(dir.path()));
+        let completions = get_completions(
+            &[makefile],
+            text,
+            Position::new(0, 8),
+            Some(dir.path()),
+            None,
+        );
 
         let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
         assert!(labels.contains(&"config.mk"), "got {:?}", labels);
@@ -756,6 +1003,7 @@ mod tests {
             text,
             Position::new(0, 10),
             Some(dir.path()),
+            None,
         );
         let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
         assert_eq!(labels, vec!["rules"]);
@@ -772,6 +1020,7 @@ mod tests {
             text,
             Position::new(1, 0),
             Some(dir.path()),
+            None,
         );
         assert!(completions.iter().all(|c| c.label != "rules"));
     }
@@ -796,8 +1045,13 @@ mod tests {
         let text = "include rules/\n";
         let parsed = Makefile::parse(text);
         let makefile = parsed.tree();
-        let completions =
-            get_completions(&[makefile], text, Position::new(0, 14), Some(dir.path()));
+        let completions = get_completions(
+            &[makefile],
+            text,
+            Position::new(0, 14),
+            Some(dir.path()),
+            None,
+        );
         let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
         assert!(labels.contains(&"rules/common.mk"), "got {:?}", labels);
     }
@@ -805,7 +1059,7 @@ mod tests {
     fn labels(text: &str, pos: Position) -> Vec<String> {
         let parsed = Makefile::parse(text);
         let makefile = parsed.tree();
-        get_completions(&[makefile], text, pos, None)
+        get_completions(&[makefile], text, pos, None, None)
             .into_iter()
             .map(|c| c.label)
             .collect()
@@ -824,7 +1078,7 @@ mod tests {
         let text = "CC = gcc\nifd\n";
         let parsed = Makefile::parse(text);
         let makefile = parsed.tree();
-        let completions = get_completions(&[makefile], text, Position::new(1, 3), None);
+        let completions = get_completions(&[makefile], text, Position::new(1, 3), None, None);
         let ifdef = completions.iter().find(|c| c.label == "ifdef").unwrap();
         assert_eq!(ifdef.kind, Some(CompletionItemKind::KEYWORD));
         assert_eq!(ifdef.insert_text.as_deref(), Some("ifdef "));
@@ -898,16 +1152,17 @@ mod tests {
     fn labels_in(fx: &crate::workspace::tests::Fixture, pos: Position) -> Vec<String> {
         let set = fx.file_set("Makefile");
         let makefiles: Vec<Makefile> = set.docs().map(|d| d.makefile()).collect();
-        let mut labels: Vec<String> = get_completions(&makefiles, set.current().text(), pos, None)
-            .into_iter()
-            .filter(|c| c.kind != Some(CompletionItemKind::FUNCTION))
-            .filter(|c| {
-                !builtins::BUILTIN_VARIABLES
-                    .iter()
-                    .any(|(n, _)| *n == c.label)
-            })
-            .map(|c| c.label)
-            .collect();
+        let mut labels: Vec<String> =
+            get_completions(&makefiles, set.current().text(), pos, None, None)
+                .into_iter()
+                .filter(|c| c.kind != Some(CompletionItemKind::FUNCTION))
+                .filter(|c| {
+                    !builtins::BUILTIN_VARIABLES
+                        .iter()
+                        .any(|(n, _)| *n == c.label)
+                })
+                .map(|c| c.label)
+                .collect();
         labels.sort();
         labels
     }
@@ -963,5 +1218,253 @@ mod tests {
     fn test_function_completions_in_value_after_non_ascii() {
         let completions = labels("X = \u{e9} $(\n", Position::new(0, 8));
         assert!(completions.contains(&"wildcard".to_string()));
+    }
+
+    fn snippets(text: &str, pos: Position, variant: MakefileVariant) -> Vec<(String, String)> {
+        let makefile = Makefile::parse(text).tree();
+        get_completions(&[makefile], text, pos, None, Some(variant))
+            .into_iter()
+            .filter(|c| c.kind == Some(CompletionItemKind::SNIPPET))
+            .map(|c| {
+                assert_eq!(c.insert_text_format, Some(InsertTextFormat::SNIPPET));
+                let Some(CompletionTextEdit::Edit(edit)) = c.text_edit else {
+                    panic!("snippet {} has no text edit", c.label);
+                };
+                (c.label, edit.new_text)
+            })
+            .collect()
+    }
+
+    fn snippet_labels(text: &str, pos: Position, variant: MakefileVariant) -> Vec<String> {
+        snippets(text, pos, variant)
+            .into_iter()
+            .map(|(label, _)| label)
+            .collect()
+    }
+
+    #[test]
+    fn test_gnu_snippets_on_empty_line() {
+        assert_eq!(
+            snippets("all:\n\n", Position::new(1, 0), MakefileVariant::GNUMake),
+            [
+                ("rule", "${1:target}: ${2:prerequisites}\n\t$0"),
+                (
+                    "phony rule",
+                    ".PHONY: ${1:target}\n${1:target}: ${2:prerequisites}\n\t$0"
+                ),
+                (
+                    "pattern rule",
+                    "%.${1:o}: %.${2:c}\n\t${0:\\$(CC) \\$(CPPFLAGS) \\$(CFLAGS) -c -o \\$@ \\$<}"
+                ),
+                ("ifeq/endif", "ifeq (${1:\\$(VAR)},${2:value})\n$0\nendif"),
+                (
+                    "ifeq/else/endif",
+                    "ifeq (${1:\\$(VAR)},${2:value})\n$3\nelse\n$0\nendif"
+                ),
+                ("ifdef/endif", "ifdef ${1:VAR}\n$0\nendif"),
+                ("ifdef/else/endif", "ifdef ${1:VAR}\n$2\nelse\n$0\nendif"),
+                ("ifndef/endif", "ifndef ${1:VAR}\n$0\nendif"),
+                ("define/endef", "define ${1:name}\n$0\nendef"),
+            ]
+            .map(|(l, t)| (l.to_string(), t.to_string()))
+        );
+    }
+
+    #[test]
+    fn test_no_snippets_without_client_support() {
+        let makefile = Makefile::parse("all:\n\n").tree();
+        let completions = get_completions(&[makefile], "all:\n\n", Position::new(1, 0), None, None);
+        assert!(!completions.is_empty());
+        assert_eq!(
+            completions
+                .iter()
+                .filter(|c| c.insert_text_format.is_some() || c.text_edit.is_some())
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn test_snippet_replaces_typed_word() {
+        let makefile = Makefile::parse("  ife").tree();
+        let item = get_completions(
+            &[makefile],
+            "  ife",
+            Position::new(0, 5),
+            None,
+            Some(MakefileVariant::GNUMake),
+        )
+        .into_iter()
+        .find(|c| c.label == "ifeq/endif")
+        .unwrap();
+        assert_eq!(item.insert_text_mode, Some(InsertTextMode::AS_IS));
+        assert_eq!(
+            item.text_edit,
+            Some(CompletionTextEdit::Edit(TextEdit::new(
+                Range::new(Position::new(0, 2), Position::new(0, 5)),
+                "ifeq (${1:\\$(VAR)},${2:value})\n$0\nendif".to_string()
+            )))
+        );
+    }
+
+    #[test]
+    fn test_bsd_snippets() {
+        assert_eq!(
+            snippets(".i", Position::new(0, 2), MakefileVariant::BSDMake),
+            [
+                ("rule", "${1:target}: ${2:prerequisites}\n\t$0"),
+                (
+                    "phony rule",
+                    ".PHONY: ${1:target}\n${1:target}: ${2:prerequisites}\n\t$0"
+                ),
+                ("suffix rule", ".${1:c}.${2:o}:\n\t$0"),
+                (".if/.endif", ".if ${1:condition}\n$0\n.endif"),
+                (
+                    ".if/.else/.endif",
+                    ".if ${1:condition}\n$2\n.else\n$0\n.endif"
+                ),
+                (".ifdef/.endif", ".ifdef ${1:VAR}\n$0\n.endif"),
+                (".for/.endfor", ".for ${1:item} in ${2:list}\n$0\n.endfor"),
+            ]
+            .map(|(l, t)| (l.to_string(), t.to_string()))
+        );
+    }
+
+    #[test]
+    fn test_nmake_snippets() {
+        assert_eq!(
+            snippets(
+                "!IFDEF DEBUG\n!ENDIF\n!I",
+                Position::new(2, 2),
+                MakefileVariant::NMake
+            ),
+            [
+                ("rule", "${1:target}: ${2:prerequisites}\n\t$0"),
+                ("inference rule", ".${1:c}.${2:obj}:\n\t$0"),
+                ("!IF/!ENDIF", "!IF ${1:condition}\n$0\n!ENDIF"),
+                (
+                    "!IF/!ELSE/!ENDIF",
+                    "!IF ${1:condition}\n$2\n!ELSE\n$0\n!ENDIF"
+                ),
+                ("!IFDEF/!ENDIF", "!IFDEF ${1:MACRO}\n$0\n!ENDIF"),
+            ]
+            .map(|(l, t)| (l.to_string(), t.to_string()))
+        );
+    }
+
+    #[test]
+    fn test_posix_snippets() {
+        assert_eq!(
+            snippet_labels("", Position::new(0, 0), MakefileVariant::POSIXMake),
+            vec!["rule", "phony rule", "suffix rule"]
+        );
+    }
+
+    #[test]
+    fn test_snippets_use_recipe_prefix() {
+        let text = ".RECIPEPREFIX = >\n\n";
+        let rule = snippets(text, Position::new(1, 0), MakefileVariant::GNUMake)
+            .into_iter()
+            .find(|(label, _)| label == "rule")
+            .unwrap();
+        assert_eq!(rule.1, "${1:target}: ${2:prerequisites}\n>$0");
+    }
+
+    #[test]
+    fn test_snippets_recipe_prefix_set_later_ignored() {
+        let text = "\n.RECIPEPREFIX = >\n";
+        let rule = snippets(text, Position::new(0, 0), MakefileVariant::GNUMake)
+            .into_iter()
+            .find(|(label, _)| label == "rule")
+            .unwrap();
+        assert_eq!(rule.1, "${1:target}: ${2:prerequisites}\n\t$0");
+    }
+
+    #[test]
+    fn test_snippets_escape_recipe_prefix() {
+        let text = ".RECIPEPREFIX = }\n\n";
+        let rule = snippets(text, Position::new(1, 0), MakefileVariant::GNUMake)
+            .into_iter()
+            .find(|(label, _)| label == "rule")
+            .unwrap();
+        assert_eq!(rule.1, "${1:target}: ${2:prerequisites}\n\\}$0");
+    }
+
+    #[test]
+    fn test_no_snippets_mid_line() {
+        let gnu = MakefileVariant::GNUMake;
+        // Text after the cursor.
+        assert_eq!(
+            snippet_labels("ife x\n", Position::new(0, 3), gnu),
+            Vec::<String>::new()
+        );
+        // After the first word.
+        assert_eq!(
+            snippet_labels("FOO ba\n", Position::new(0, 6), gnu),
+            Vec::<String>::new()
+        );
+        // In a rule or a variable value.
+        assert_eq!(
+            snippet_labels("all: \n", Position::new(0, 5), gnu),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            snippet_labels("X = a\n", Position::new(0, 5), gnu),
+            Vec::<String>::new()
+        );
+        // In a recipe.
+        assert_eq!(
+            snippet_labels("all:\n\t\n", Position::new(1, 1), gnu),
+            Vec::<String>::new()
+        );
+    }
+
+    fn function_item(text: &str, pos: Position, snippets: bool) -> CompletionItem {
+        let makefile = Makefile::parse(text).tree();
+        get_completions(
+            &[makefile],
+            text,
+            pos,
+            None,
+            snippets.then_some(MakefileVariant::GNUMake),
+        )
+        .into_iter()
+        .find(|c| c.label == "patsubst")
+        .unwrap()
+    }
+
+    #[test]
+    fn test_function_snippet() {
+        let item = function_item("X = $(", Position::new(0, 6), true);
+        assert_eq!(item.insert_text_format, Some(InsertTextFormat::SNIPPET));
+        assert_eq!(
+            item.insert_text.as_deref(),
+            Some("patsubst ${1:pattern},${2:replacement},${3:text})$0")
+        );
+    }
+
+    #[test]
+    fn test_function_snippet_before_closing_paren() {
+        let item = function_item("X = $()", Position::new(0, 6), true);
+        assert_eq!(
+            item.insert_text.as_deref(),
+            Some("patsubst ${1:pattern},${2:replacement},${3:text}")
+        );
+    }
+
+    #[test]
+    fn test_function_snippet_in_recipe() {
+        let item = function_item("all:\n\techo $(", Position::new(1, 8), true);
+        assert_eq!(
+            item.insert_text.as_deref(),
+            Some("patsubst ${1:pattern},${2:replacement},${3:text})$0")
+        );
+    }
+
+    #[test]
+    fn test_function_without_snippet_support() {
+        let item = function_item("X = $(", Position::new(0, 6), false);
+        assert_eq!(item.insert_text_format, None);
+        assert_eq!(item.insert_text.as_deref(), Some("patsubst "));
     }
 }

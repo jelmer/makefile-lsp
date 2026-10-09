@@ -9,7 +9,7 @@ use serde_json::json;
 use tower_lsp_server::ls_types::{Diagnostic, DiagnosticSeverity, NumberOrString};
 
 use crate::position::utf16_to_char_column;
-use crate::workspace::Workspace;
+use crate::workspace::{is_makefile_name, Workspace};
 
 /// No diagnostics at or above the severity threshold.
 pub const EXIT_CLEAN: i32 = 0;
@@ -315,12 +315,6 @@ fn findings(
         .collect();
     findings.sort_by_key(|f| (f.start_line, f.start_column));
     findings
-}
-
-fn is_makefile_name(name: &str) -> bool {
-    matches!(name, "Makefile" | "makefile" | "GNUmakefile")
-        || name.ends_with(".mk")
-        || name.ends_with(".mak")
 }
 
 /// Drop `.` components so `./Makefile` is reported as `Makefile`.

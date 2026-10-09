@@ -9,7 +9,7 @@ use tower_lsp_server::ls_types::{
 
 use crate::position::{text_range_to_lsp_range, try_position_to_offset};
 use crate::references::{single_char_reference_ranges, symbol_at, symbol_locations, Symbol};
-use crate::workspace::FileSet;
+use crate::workspace::{Document, FileSet};
 
 /// Why a symbol can't be renamed.
 #[derive(Debug, PartialEq, Eq)]
@@ -19,6 +19,9 @@ pub enum RenameError {
     /// The symbol is used in a file outside the workspace, which would be
     /// left referring to the old name.
     UsedOutsideWorkspace(String, Uri),
+    /// The name contains a variable reference, so it is only known after
+    /// expansion.
+    ComputedName(String),
 }
 
 impl std::fmt::Display for RenameError {
@@ -35,6 +38,11 @@ impl std::fmt::Display for RenameError {
                 "'{}' is used outside the workspace, in {}",
                 name,
                 uri.as_str()
+            ),
+            RenameError::ComputedName(name) => write!(
+                f,
+                "'{}' is computed from variable references and can't be renamed",
+                name
             ),
         }
     }
@@ -53,6 +61,24 @@ fn symbol_name(symbol: &Symbol) -> &str {
     match symbol {
         Symbol::Variable(name) | Symbol::Target(name) => name,
     }
+}
+
+/// Whether the occurrence of `symbol` at `position` contains a variable
+/// reference, as in `$(P)_FLAGS`, so that its name is only known after
+/// expansion.
+fn is_computed(doc: &Document, symbol: &Symbol, position: Position) -> bool {
+    let makefile = doc.makefile();
+    let text = doc.text();
+    let offset = |pos| try_position_to_offset(text, pos).expect("symbol location outside document");
+    symbol_locations(&makefile, text, doc.uri(), symbol, true)
+        .into_iter()
+        .filter(|loc| loc.range.start <= position && position <= loc.range.end)
+        .map(|loc| TextRange::new(offset(loc.range.start), offset(loc.range.end)))
+        .any(|range| {
+            makefile
+                .variable_references()
+                .any(|reference| range.contains_range(reference.text_range()))
+        })
 }
 
 /// Find the renameable symbol at `position`, checking that it may be renamed.
@@ -80,6 +106,11 @@ pub(crate) fn renameable_symbol(
         return Some(Err(RenameError::DefinedOutsideWorkspace(
             name,
             defining[0].clone(),
+        )));
+    }
+    if is_computed(current, &symbol, position) {
+        return Some(Err(RenameError::ComputedName(
+            symbol_name(&symbol).to_string(),
         )));
     }
     Some(Ok(symbol))
@@ -595,5 +626,58 @@ mod tests {
                 Range::new(Position::new(1, 12), Position::new(1, 15)),
             ]
         );
+    }
+
+    #[test]
+    fn test_rename_refused_for_computed_variable_name() {
+        let text = "P = a\n$(P)_FLAGS = x\nall:\n\techo $(a_FLAGS) $($(P)_FLAGS)\n";
+        let refused = || Some(Some(RenameError::ComputedName("$(P)_FLAGS".to_string())));
+        for pos in [
+            Position::new(1, 0),
+            Position::new(1, 6),
+            Position::new(3, 25),
+        ] {
+            assert_eq!(
+                prepare_rename(&single(text), pos).map(Result::err),
+                refused()
+            );
+            assert_eq!(
+                rename(&single(text), pos, "NEW").map(Result::err),
+                refused()
+            );
+        }
+    }
+
+    #[test]
+    fn test_rename_reference_in_computed_variable_name() {
+        let text = "P = a\n$(P)_FLAGS = x\n";
+        assert_eq!(
+            prepared(text, Position::new(1, 2)),
+            Some((range(1, 2, 3), "P".to_string()))
+        );
+        let edit = |line, start, end| TextEdit {
+            range: range(line, start, end),
+            new_text: "Q".to_string(),
+        };
+        assert_eq!(
+            get_edits(text, Position::new(1, 2), "Q"),
+            vec![edit(0, 0, 1), edit(1, 2, 3)]
+        );
+    }
+
+    #[test]
+    fn test_rename_refused_for_computed_target_name() {
+        let text = "all: $(P)_bin\n$(P)_bin:\n\techo\n";
+        let refused = || Some(Some(RenameError::ComputedName("$(P)_bin".to_string())));
+        for pos in [Position::new(0, 10), Position::new(1, 5)] {
+            assert_eq!(
+                prepare_rename(&single(text), pos).map(Result::err),
+                refused()
+            );
+            assert_eq!(
+                rename(&single(text), pos, "NEW").map(Result::err),
+                refused()
+            );
+        }
     }
 }

@@ -9,6 +9,7 @@ use tower_lsp_server::ls_types::*;
 use tower_lsp_server::{Client, LanguageServer, LspService, Server};
 
 mod builtins;
+mod call_hierarchy;
 mod check;
 mod code_actions;
 mod completion;
@@ -34,6 +35,7 @@ mod shell_check;
 mod signature_help;
 mod symbols;
 mod targets;
+mod unreachable;
 mod workspace;
 
 use position::try_lsp_range_to_text_range;
@@ -61,6 +63,8 @@ struct Backend {
     diagnostics: Arc<Mutex<HashMap<Uri, PublishedDiagnostics>>>,
     /// Whether the client can watch files for us.
     watch_files: AtomicBool,
+    /// Whether the client supports snippets in completion items.
+    snippet_support: AtomicBool,
 }
 
 impl Backend {
@@ -70,6 +74,7 @@ impl Backend {
             workspace: Arc::new(Mutex::new(Workspace::new())),
             diagnostics: Arc::new(Mutex::new(HashMap::new())),
             watch_files: AtomicBool::new(false),
+            snippet_support: AtomicBool::new(false),
         }
     }
 
@@ -79,6 +84,22 @@ impl Backend {
 
     async fn file_set(&self, uri: &Uri) -> Option<FileSet> {
         self.workspace.lock().await.file_set(uri)
+    }
+
+    /// The file set for `uri`, which need not be open, as for a call
+    /// hierarchy item in an included makefile.
+    async fn file_set_for_uri(&self, uri: &Uri) -> Result<FileSet> {
+        let mut workspace = self.workspace.lock().await;
+        if let Some(files) = workspace.file_set(uri) {
+            return Ok(files);
+        }
+        let path = workspace::file_path(uri)
+            .ok_or_else(|| Error::invalid_params(format!("not a file URI: {}", uri.as_str())))?;
+        workspace.file_set_for_path(&path).map_err(|e| Error {
+            code: tower_lsp_server::jsonrpc::ErrorCode::InternalError,
+            message: format!("unable to load {}: {e}", path.display()).into(),
+            data: None,
+        })
     }
 
     async fn update_file(&self, uri: Uri, text: String) {
@@ -249,6 +270,16 @@ impl LanguageServer for Backend {
             .and_then(|w| w.dynamic_registration)
             .unwrap_or(false);
         self.watch_files.store(watch_files, Ordering::Relaxed);
+        let snippet_support = params
+            .capabilities
+            .text_document
+            .as_ref()
+            .and_then(|t| t.completion.as_ref())
+            .and_then(|c| c.completion_item.as_ref())
+            .and_then(|i| i.snippet_support)
+            .unwrap_or(false);
+        self.snippet_support
+            .store(snippet_support, Ordering::Relaxed);
 
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
@@ -289,6 +320,7 @@ impl LanguageServer for Backend {
                     true,
                 )),
                 references_provider: Some(OneOf::Left(true)),
+                call_hierarchy_provider: Some(CallHierarchyServerCapability::Simple(true)),
                 definition_provider: Some(OneOf::Left(true)),
                 document_formatting_provider: Some(OneOf::Left(true)),
                 document_range_formatting_provider: Some(OneOf::Left(true)),
@@ -303,6 +335,7 @@ impl LanguageServer for Backend {
                 selection_range_provider: Some(SelectionRangeProviderCapability::Simple(true)),
                 folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
                 document_symbol_provider: Some(OneOf::Left(true)),
+                workspace_symbol_provider: Some(OneOf::Left(true)),
                 semantic_tokens_provider: Some(
                     SemanticTokensServerCapabilities::SemanticTokensOptions(
                         SemanticTokensOptions {
@@ -435,7 +468,15 @@ impl LanguageServer for Backend {
         let doc = files.current();
         let makefiles: Vec<makefile_lossless::Makefile> =
             files.docs().map(|d| d.makefile()).collect();
-        let completions = completion::get_completions(&makefiles, doc.text(), position, doc.dir());
+        let completions = completion::get_completions(
+            &makefiles,
+            doc.text(),
+            position,
+            doc.dir(),
+            self.snippet_support
+                .load(Ordering::Relaxed)
+                .then(|| doc.variant()),
+        );
 
         if completions.is_empty() {
             Ok(None)
@@ -483,6 +524,35 @@ impl LanguageServer for Backend {
         } else {
             Ok(Some(refs))
         }
+    }
+
+    async fn prepare_call_hierarchy(
+        &self,
+        params: CallHierarchyPrepareParams,
+    ) -> Result<Option<Vec<CallHierarchyItem>>> {
+        let uri = &params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+
+        let Some(files) = self.file_set(uri).await else {
+            return Ok(None);
+        };
+        Ok(call_hierarchy::prepare(&files, position))
+    }
+
+    async fn incoming_calls(
+        &self,
+        params: CallHierarchyIncomingCallsParams,
+    ) -> Result<Option<Vec<CallHierarchyIncomingCall>>> {
+        let files = self.file_set_for_uri(&params.item.uri).await?;
+        Ok(Some(call_hierarchy::incoming_calls(&files, &params.item)))
+    }
+
+    async fn outgoing_calls(
+        &self,
+        params: CallHierarchyOutgoingCallsParams,
+    ) -> Result<Option<Vec<CallHierarchyOutgoingCall>>> {
+        let files = self.file_set_for_uri(&params.item.uri).await?;
+        Ok(Some(call_hierarchy::outgoing_calls(&files, &params.item)))
     }
 
     async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
@@ -643,6 +713,27 @@ impl LanguageServer for Backend {
         let symbols = symbols::generate_document_symbols(&makefile, doc.text());
 
         Ok(Some(DocumentSymbolResponse::Nested(symbols)))
+    }
+
+    async fn symbol(
+        &self,
+        params: WorkspaceSymbolParams,
+    ) -> Result<Option<WorkspaceSymbolResponse>> {
+        let mut workspace = self.workspace.lock().await;
+        let docs: Vec<_> = workspace
+            .all_documents()
+            .into_iter()
+            .map(|d| {
+                let name = workspace.display_name(&d);
+                (d, name)
+            })
+            .collect();
+        drop(workspace);
+        let symbols = symbols::workspace_symbols(
+            docs.iter().map(|(d, n)| (d.as_ref(), n.clone())),
+            &params.query,
+        );
+        Ok(Some(WorkspaceSymbolResponse::Nested(symbols)))
     }
 
     async fn folding_range(&self, params: FoldingRangeParams) -> Result<Option<Vec<FoldingRange>>> {
