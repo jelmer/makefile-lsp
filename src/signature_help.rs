@@ -18,55 +18,48 @@ pub fn get_signature_help(
     source_text: &str,
     position: Position,
 ) -> Option<SignatureHelp> {
-    let offset = try_position_to_offset(source_text, position)?;
-    let byte_offset: usize = offset.into();
+    let offset: usize = try_position_to_offset(source_text, position)?.into();
 
-    // Find a variable reference containing this offset that is a function call
-    for var_ref in makefile.variable_references() {
-        let range = var_ref.text_range();
-        let start: usize = range.start().into();
-        let end: usize = range.end().into();
+    // References nested in others come after them, so the last match is the
+    // innermost call.
+    let (var_ref, f) = makefile
+        .variable_references()
+        .filter(|var_ref| {
+            let range = var_ref.text_range();
+            usize::from(range.start()) <= offset && offset <= usize::from(range.end())
+        })
+        .filter(|var_ref| var_ref.is_function_call())
+        .filter_map(|var_ref| {
+            let f = builtins::find_builtin_function(&var_ref.name()?)?;
+            Some((var_ref, f))
+        })
+        .last()?;
+    let active_param = var_ref.argument_index_at_offset(offset)?;
 
-        if byte_offset < start || byte_offset > end {
-            continue;
-        }
+    let parameters: Vec<ParameterInformation> = f
+        .params
+        .iter()
+        .map(|label| ParameterInformation {
+            label: ParameterLabel::Simple(label.to_string()),
+            documentation: None,
+        })
+        .collect();
 
-        if !var_ref.is_function_call() {
-            continue;
-        }
+    let label = format!("$({} {})", f.name, f.params.join(","));
 
-        let func_name = var_ref.name()?;
-        let active_param = var_ref.argument_index_at_offset(byte_offset)?;
-
-        let f = builtins::find_builtin_function(&func_name)?;
-
-        let parameters: Vec<ParameterInformation> = f
-            .params
-            .iter()
-            .map(|label| ParameterInformation {
-                label: ParameterLabel::Simple(label.to_string()),
-                documentation: None,
-            })
-            .collect();
-
-        let label = format!("$({} {})", f.name, f.params.join(","));
-
-        return Some(SignatureHelp {
-            signatures: vec![SignatureInformation {
-                label,
-                documentation: Some(Documentation::MarkupContent(MarkupContent {
-                    kind: MarkupKind::Markdown,
-                    value: f.doc.to_string(),
-                })),
-                parameters: Some(parameters),
-                active_parameter: Some(active_param as u32),
-            }],
-            active_signature: Some(0),
+    Some(SignatureHelp {
+        signatures: vec![SignatureInformation {
+            label,
+            documentation: Some(Documentation::MarkupContent(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: f.doc.to_string(),
+            })),
+            parameters: Some(parameters),
             active_parameter: Some(active_param as u32),
-        });
-    }
-
-    None
+        }],
+        active_signature: Some(0),
+        active_parameter: Some(active_param as u32),
+    })
 }
 
 #[cfg(test)]
@@ -122,6 +115,41 @@ mod tests {
         let sig = get_sig(text, Position::new(0, 19));
         assert!(sig.is_some());
         assert_eq!(sig.unwrap().active_parameter, Some(0));
+    }
+
+    #[test]
+    fn test_extra_commas_in_last_arg() {
+        let text = "X = $(subst a,b,c,d)\n";
+        let sig = get_sig(text, Position::new(0, 18)).unwrap();
+        assert_eq!(sig.active_parameter, Some(2));
+    }
+
+    #[test]
+    fn test_unclosed_call() {
+        let text = "X = $(subst a,\n";
+        let sig = get_sig(text, Position::new(0, 14)).unwrap();
+        assert_eq!(sig.active_parameter, Some(1));
+        assert_eq!(sig.signatures[0].label, "$(subst from,to,text)");
+    }
+
+    #[test]
+    fn test_nested_call_innermost() {
+        let text = "X = $(subst a,$(patsubst %.c,%.o,x),c)\n";
+        // Cursor on '%.o', the second argument of patsubst.
+        let sig = get_sig(text, Position::new(0, 29)).unwrap();
+        assert_eq!(
+            sig.signatures[0].label,
+            "$(patsubst pattern,replacement,text)"
+        );
+        assert_eq!(sig.active_parameter, Some(1));
+    }
+
+    #[test]
+    fn test_nested_variable_uses_enclosing_call() {
+        let text = "X = $(subst a,$(Y),c)\n";
+        let sig = get_sig(text, Position::new(0, 16)).unwrap();
+        assert_eq!(sig.signatures[0].label, "$(subst from,to,text)");
+        assert_eq!(sig.active_parameter, Some(1));
     }
 
     #[test]
