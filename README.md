@@ -55,7 +55,7 @@ Each diagnostic carries a code, so it can be identified in editors:
 | `recursive-variable-reference` | warning | `=` assignment that references itself |
 | `empty-variable-reference` | warning | `$()` or `${}` |
 | `empty-automatic-variable` | warning | `$<`, `$^`, `$+` or `$?` in a rule without prerequisites, or `$*` outside a pattern rule |
-| `automatic-variable-outside-recipe` | warning | automatic variable like `$@` in a target list, prerequisite list, `:=` assignment or conditional, where it is always empty (BSD make sets `$@`, `$*`, `$%` and `$!` in prerequisites and leaves them unexpanded elsewhere, does not expand automatic variables in `:=` assignments, and has no `$^` or `$+`; its long names like `${.TARGET}` are checked too) |
+| `automatic-variable-outside-recipe` | warning | automatic variable like `$@` in a target list, prerequisite list, `:=` assignment or conditional, where it is always empty (BSD make sets `$@`, `$*`, `$%` and `$!` in prerequisites and leaves them unexpanded elsewhere, does not expand automatic variables in `:=` assignments, and has no `$^` or `$+`; its long names like `${.TARGET}` are checked too; in prerequisites nmake sets only `$$@` and `$$(@F)` etc.) |
 | `unused-variable` | hint | variable that is assigned but never referenced |
 | `mixed-assignment-operators` | warning | variable assigned with both `=` and `:=` |
 | `shell-in-recursive-assignment` | warning | `$(shell ...)` in an `=` assignment, which runs on every expansion (GNU make only) |
