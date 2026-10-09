@@ -40,6 +40,8 @@ makefiles it includes (see below); the Makefile is never executed.
 - **On-type formatting** - inserts a tab after pressing enter on a rule line
 - **Command-line checking** - report diagnostics in CI, as text or SARIF
   (see below)
+- **Command-line formatting** - format Makefiles in place, or check that they
+  are formatted (see below)
 - **SCIP indexing** - generate a [SCIP](https://github.com/sourcegraph/scip)
   index for code navigation (see below)
 
@@ -182,6 +184,23 @@ issues that are often intentional. Use `--severity hint` to include them, or
 
 The exit status is 0 when nothing was reported, 1 when diagnostics were
 reported and 2 on usage or I/O errors.
+
+## Formatting from the command line
+
+The `fmt` subcommand applies the same formatting as the language server. Files
+are rewritten in place; directories are searched as for `check`. With no
+arguments, or with `-`, it reads a Makefile from stdin and writes the formatted
+version to stdout:
+
+```sh
+makefile-lsp fmt Makefile build/
+makefile-lsp fmt --check .               # list unformatted files, for CI
+makefile-lsp fmt < Makefile
+```
+
+Files with parse errors are left alone and reported. The exit status is 0 on
+success, 1 when `--check` found unformatted files and 2 on usage, parse or I/O
+errors.
 
 ## SCIP indexing
 

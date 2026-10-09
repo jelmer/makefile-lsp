@@ -52,6 +52,11 @@ pub fn format_document(parsed: &Parse<Makefile>, text: &str) -> Result<Vec<TextE
         .collect())
 }
 
+/// Format the whole document, returning the formatted text.
+pub fn format(parsed: &Parse<Makefile>, text: &str) -> Result<String, FormatError> {
+    Ok(apply_edits(text, &compute_edits(parsed, text)?))
+}
+
 /// Format the lines covered by `range`.
 pub fn format_range(
     parsed: &Parse<Makefile>,
