@@ -1,6 +1,6 @@
 //! Semantic token generation for Makefile syntax highlighting.
 
-use makefile_lossless::{Makefile, MakefileItem, TextRange, TextSize};
+use makefile_lossless::{Makefile, TextRange, TextSize};
 use tower_lsp_server::ls_types::SemanticToken;
 
 use crate::builtins;
@@ -134,12 +134,7 @@ pub fn generate_semantic_tokens(makefile: &Makefile, source_text: &str) -> Vec<S
                 .collect::<Vec<_>>()
         }))
         .chain(makefile.vpaths().filter_map(|vpath| vpath.keyword_range()))
-        // TODO: also find `load` directives in conditionals once
-        // makefile-lossless has a recursive iterator for them.
-        .chain(makefile.items().filter_map(|item| match item {
-            MakefileItem::Load(load) => load.keyword_range(),
-            _ => None,
-        }));
+        .chain(makefile.loads().filter_map(|load| load.keyword_range()));
     tokens.extend(keywords.map(|range| (range, TokenType::Keyword, 0)));
 
     tokens.sort_by_key(|(range, _, _)| range.start());
@@ -429,6 +424,14 @@ mod tests {
         assert_eq!(
             all_tokens("-load foo.so\n"),
             vec![(0, 0, 5, TokenType::Keyword, 0)]
+        );
+        assert_eq!(
+            all_tokens("ifdef A\nload foo.so\nendif\n"),
+            vec![
+                (0, 0, 5, TokenType::Keyword, 0),
+                (1, 0, 4, TokenType::Keyword, 0),
+                (2, 0, 5, TokenType::Keyword, 0),
+            ]
         );
     }
 
