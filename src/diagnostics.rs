@@ -1496,18 +1496,14 @@ fn check_automatic_variable_outside_recipe(
 /// Is `text` a reference to an automatic variable, such as `$@`, `$(<)` or
 /// `${@D}`?
 fn is_automatic_variable_reference(text: &str) -> bool {
-    let Some(body) = text.strip_prefix('$') else {
+    let Ok(reference) = ParsedReference::parse(text, MakefileVariant::GNUMake) else {
         return false;
     };
-    let name = body
-        .strip_prefix('(')
-        .and_then(|b| b.strip_suffix(')'))
-        .or_else(|| body.strip_prefix('{').and_then(|b| b.strip_suffix('}')))
-        .unwrap_or(body);
-    let mut chars = name.chars();
-    chars
-        .next()
-        .is_some_and(|c| matches!(c, '@' | '<' | '^' | '?' | '*' | '+' | '|' | '%'))
+    let mut chars = reference.name.chars();
+    reference.modifiers.is_empty()
+        && chars
+            .next()
+            .is_some_and(|c| matches!(c, '@' | '<' | '^' | '?' | '*' | '+' | '|' | '%'))
         && matches!(chars.as_str(), "" | "D" | "F")
 }
 
