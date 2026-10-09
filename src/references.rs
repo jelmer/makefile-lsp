@@ -1,8 +1,6 @@
 //! Find references for Makefiles.
 
-use makefile_lossless::{
-    ConditionalKind, Makefile, ReferenceLocation, TextRange, TextSize, VariableReference,
-};
+use makefile_lossless::{Makefile, ReferenceLocation, TextRange, TextSize, VariableReference};
 use tower_lsp_server::ls_types::{Location, Position, Uri};
 
 use crate::position::{text_range_to_lsp_range, try_position_to_offset};
@@ -191,37 +189,27 @@ pub(crate) fn variable_references(makefile: &Makefile) -> Vec<(String, TextRange
         .filter(|reference| !reference.is_function_call())
         .filter_map(|reference| Some((reference.name()?, reference.name_range()?)))
         .filter(|(name, _)| !crate::builtins::is_call_parameter(name))
-        .chain(ifdef_references(makefile))
+        .chain(condition_references(makefile))
         .collect()
 }
 
-/// The variable names tested by GNU `ifdef` / `ifndef`, with their ranges.
+/// The variable names tested by name in conditions, such as by `ifdef` or
+/// BSD make's `defined()`, with their ranges.
 ///
-/// make expands the argument to get the name, so only a literal name refers
-/// to that variable; references in an argument such as `$(X)` are ordinary
-/// references.
-fn ifdef_references(makefile: &Makefile) -> Vec<(String, TextRange)> {
+/// make expands a name such as `$(X)` in `ifdef $(X)` to get the variable,
+/// so only literal names refer to that variable; references in it are
+/// ordinary references.
+fn condition_references(makefile: &Makefile) -> Vec<(String, TextRange)> {
     makefile
         .all_conditionals()
         .flat_map(|cond| cond.branches().collect::<Vec<_>>())
-        .filter(|branch| {
-            matches!(
-                branch.conditional_kind(),
-                Some(ConditionalKind::Ifdef | ConditionalKind::Ifndef)
-            )
-        })
-        .filter_map(|branch| Some((branch.condition()?, branch.condition_range()?)))
-        .filter(|(name, range)| {
-            !name.is_empty()
-                && !name.contains(['$', ' ', '\t'])
-                && range.len() == TextSize::of(name.as_str())
-        })
+        .flat_map(|branch| branch.tested_variables())
         .collect()
 }
 
-/// The variable name tested by an `ifdef` / `ifndef` at `offset`.
-pub(crate) fn ifdef_reference_at(makefile: &Makefile, offset: TextSize) -> Option<String> {
-    ifdef_references(makefile)
+/// The variable name tested by a condition at `offset`.
+pub(crate) fn condition_reference_at(makefile: &Makefile, offset: TextSize) -> Option<String> {
+    condition_references(makefile)
         .into_iter()
         .find(|(_, range)| range.contains_inclusive(offset))
         .map(|(name, _)| name)
@@ -688,5 +676,49 @@ mod tests {
         );
         let makefile = Makefile::parse(text).tree();
         assert_eq!(symbol_at(&makefile, 21), None);
+    }
+
+    #[test]
+    fn test_find_variable_references_bsd_condition() {
+        let text = "FOO = 1\n.if defined(FOO) && !empty(FOO:Mx)\n.elifdef FOO\n.endif\n";
+        let expected = vec![
+            Range::new(Position::new(0, 0), Position::new(0, 3)),
+            Range::new(Position::new(1, 12), Position::new(1, 15)),
+            Range::new(Position::new(1, 27), Position::new(1, 30)),
+            Range::new(Position::new(2, 9), Position::new(2, 12)),
+        ];
+        assert_eq!(reference_ranges(text, Position::new(0, 0)), expected);
+        assert_eq!(reference_ranges(text, Position::new(1, 13)), expected);
+        assert_eq!(reference_ranges(text, Position::new(2, 9)), expected);
+    }
+
+    #[test]
+    fn test_find_variable_references_bsd_ifmake() {
+        // A bare word in `.ifmake` is a target.
+        let text = "FOO = 1\n.ifmake FOO\n.endif\n";
+        assert_eq!(
+            reference_ranges(text, Position::new(0, 0)),
+            vec![Range::new(Position::new(0, 0), Position::new(0, 3))]
+        );
+    }
+
+    #[test]
+    fn test_find_variable_references_nmake_condition() {
+        let text = "FOO = 1\n!IFDEF FOO\n!ELSEIF DEFINED(FOO)\n!ENDIF\n";
+        let makefile =
+            Makefile::parse_with_variant(text, makefile_lossless::MakefileVariant::NMake).tree();
+        let ranges: Vec<Range> =
+            find_document_references(&makefile, text, Position::new(0, 0), &test_uri(), true)
+                .into_iter()
+                .map(|l| l.range)
+                .collect();
+        assert_eq!(
+            ranges,
+            vec![
+                Range::new(Position::new(0, 0), Position::new(0, 3)),
+                Range::new(Position::new(1, 7), Position::new(1, 10)),
+                Range::new(Position::new(2, 16), Position::new(2, 19)),
+            ]
+        );
     }
 }

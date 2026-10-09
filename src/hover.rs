@@ -7,7 +7,7 @@ use tower_lsp_server::ls_types::{Hover, HoverContents, MarkupContent, MarkupKind
 
 use crate::builtins;
 use crate::position::try_position_to_offset;
-use crate::references::ifdef_reference_at;
+use crate::references::condition_reference_at;
 use crate::targets::{prerequisite_at_offset, target_at_offset};
 use crate::workspace::{Document, FileSet};
 
@@ -190,7 +190,7 @@ pub fn get_hover(files: &FileSet, position: Position) -> Option<Hover> {
         return variable_hover(files, &reference);
     }
 
-    if let Some(var_name) = ifdef_reference_at(&makefile, offset) {
+    if let Some(var_name) = condition_reference_at(&makefile, offset) {
         return named_variable_hover(files, &var_name);
     }
 
@@ -612,6 +612,14 @@ mod tests {
                 Position::new(2, 12)
             )
             .as_deref(),
+            Some("```makefile\nCC = gcc\n```")
+        );
+    }
+
+    #[test]
+    fn test_hover_variable_in_bsd_condition() {
+        assert_eq!(
+            hover_text("CC = gcc\n.if empty(CC)\n.endif\n", Position::new(1, 10)).as_deref(),
             Some("```makefile\nCC = gcc\n```")
         );
     }
