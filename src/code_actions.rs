@@ -5,8 +5,7 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use makefile_lossless::{
-    Makefile, MakefileVariant, Parse, ReferenceLocation, Rule, SyntaxKind, TextSize,
-    VariableReference,
+    Makefile, MakefileVariant, Parse, ReferenceLocation, SyntaxKind, TextSize, VariableReference,
 };
 use rowan::ast::AstNode;
 use tower_lsp_server::ls_types::{
@@ -16,7 +15,7 @@ use tower_lsp_server::ls_types::{
 
 use crate::builtins;
 use crate::position::{offset_to_position, text_range_to_lsp_range, try_position_to_offset};
-use crate::targets::target_at_offset;
+use crate::targets::{prerequisite_at_offset, target_at_offset};
 use crate::workspace::FileSet;
 
 /// Generate code actions for the given range.
@@ -150,30 +149,17 @@ fn create_target_action(
     uri: &Uri,
     base_dir: &Path,
 ) -> Option<CodeAction> {
-    let offset = text_size::TextSize::from(byte_offset as u32);
     let makefile = parsed.tree();
-    let prerequisite = makefile
-        .syntax()
-        .descendants()
-        .filter(|n| n.kind() == SyntaxKind::PREREQUISITE)
-        .find(|n| n.text_range().contains(offset))?;
-    let rule = prerequisite.ancestors().find_map(Rule::cast)?;
+    let (rule, name) = makefile.rules().find_map(|rule| {
+        let (name, _) = prerequisite_at_offset(&rule, byte_offset)?;
+        Some((rule, name))
+    })?;
     // Prerequisites of special targets such as .SUFFIXES are not files to
     // build, except for .PHONY, whose entries should have a rule.
     if rule.targets().any(|t| t.starts_with('.') && t != ".PHONY") {
         return None;
     }
 
-    // Look the name up as the parser reads it, e.g. with `\#` unescaped.
-    let index = prerequisite
-        .parent()?
-        .children()
-        .filter(|n| n.kind() == SyntaxKind::PREREQUISITE)
-        .position(|n| n == prerequisite)?;
-    let name = rule
-        .prerequisites()
-        .chain(rule.order_only_prerequisites())
-        .nth(index)?;
     if name.contains(['$', '%'])
         || files
             .docs()
@@ -634,22 +620,11 @@ fn remove_from_phony_action(
     byte_offset: usize,
     uri: &Uri,
 ) -> Option<CodeAction> {
-    let offset = text_size::TextSize::from(byte_offset as u32);
-
     let makefile = parsed.tree();
 
-    // Find a .PHONY rule whose PREREQUISITE node contains the cursor.
-    let target_name = makefile.rules_by_target(".PHONY").find_map(|rule| {
-        let prereqs = rule
-            .syntax()
-            .children()
-            .find(|c| c.kind() == SyntaxKind::PREREQUISITES)?;
-        let prereq = prereqs
-            .children()
-            .filter(|c| c.kind() == SyntaxKind::PREREQUISITE)
-            .find(|c| c.text_range().contains(offset))?;
-        Some(prereq.text().to_string().trim().to_string())
-    })?;
+    let (target_name, _) = makefile
+        .rules_by_target(".PHONY")
+        .find_map(|rule| prerequisite_at_offset(&rule, byte_offset))?;
 
     // Skip if the name actually has a target definition somewhere.
     let defined_targets: HashSet<String> = makefile
@@ -1014,19 +989,14 @@ fn inline_prerequisite_action(
     let offset = text_size::TextSize::from(byte_offset as u32);
     let makefile = parsed.tree();
 
-    let mut rule = makefile.rules().find(|r| r.text_range().contains(offset))?;
-
-    // Locate the IDENTIFIER token under the cursor that lives inside a
-    // PREREQUISITES node — that's the prereq we'd remove.
-    let prereqs_node = rule
-        .syntax()
-        .children()
-        .find(|c| c.kind() == SyntaxKind::PREREQUISITES)?;
-    let token = prereqs_node
-        .descendants_with_tokens()
-        .filter_map(|e| e.into_token())
-        .find(|t| t.kind() == SyntaxKind::IDENTIFIER && t.text_range().contains(offset))?;
-    let cursor_prereq = token.text().to_string();
+    // The normal prerequisite under the cursor is the one we'd remove.
+    let (mut rule, cursor_prereq) = makefile.rules().find_map(|rule| {
+        let (name, _) = rule
+            .prerequisites()
+            .zip(rule.prerequisite_ranges())
+            .find(|(_, range)| range.contains(offset))?;
+        Some((rule, name))
+    })?;
 
     let prereqs: Vec<String> = rule.prerequisites().collect();
     if prereqs.len() < 2 || !prereqs.contains(&cursor_prereq) {
@@ -1569,6 +1539,26 @@ mod tests {
         // and 'build' is still there.
         assert!(!result.contains("clean"));
         assert!(result.contains("build"));
+    }
+
+    #[test]
+    fn test_remove_from_phony_escaped() {
+        let text = ".PHONY: a\\#b\n";
+        let actions = parse_and_actions(text, Position::new(0, 9));
+        let action = actions
+            .iter()
+            .find(|a| a.title == "Remove 'a#b' from .PHONY")
+            .expect("expected quickfix");
+        assert_eq!(apply_doc_edit(text, only_edit(action)), "");
+    }
+
+    #[test]
+    fn test_no_remove_from_phony_when_escaped_target_defined() {
+        let text = ".PHONY: a\\#b\na\\#b:\n";
+        let actions = parse_and_actions(text, Position::new(0, 9));
+        assert!(!actions
+            .iter()
+            .any(|a| a.title.starts_with("Remove '") && a.title.contains("from .PHONY")));
     }
 
     #[test]
@@ -2198,6 +2188,26 @@ mod tests {
         assert_eq!(
             find_inline_prereq_action(&actions).map(|a| a.title.as_str()),
             Some("Inline prerequisite 'c' (already via 'b')")
+        );
+    }
+
+    #[test]
+    fn test_inline_prereq_escaped() {
+        let text = "all: a\\#b main\nmain: a\\#b\na\\#b:\n";
+        let actions = parse_and_actions(text, Position::new(0, 6));
+        assert_eq!(
+            find_inline_prereq_action(&actions).map(|a| a.title.as_str()),
+            Some("Inline prerequisite 'a#b' (already via 'main')")
+        );
+    }
+
+    #[test]
+    fn test_inline_prereq_silenced_for_order_only() {
+        let text = "all: lib main | lib\nmain: lib\nlib:\n";
+        let actions = parse_and_actions(text, Position::new(0, 17));
+        assert_eq!(
+            find_inline_prereq_action(&actions).map(|a| a.title.as_str()),
+            None
         );
     }
 
