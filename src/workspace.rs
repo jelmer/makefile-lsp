@@ -25,6 +25,13 @@ const MAX_FILES: usize = 256;
 /// Included files larger than this are not loaded.
 const MAX_FILE_SIZE: u64 = 4 * 1024 * 1024;
 
+/// Upper bound on the number of documents searched for workspace symbols.
+const MAX_WORKSPACE_FILES: usize = 1024;
+
+/// Upper bound on the directory entries looked at when searching the
+/// workspace folders for makefiles.
+const MAX_SCAN_ENTRIES: usize = 20_000;
+
 /// The names make looks for when run without `-f`, in order.
 const DEFAULT_MAKEFILES: &[&str] = &["GNUmakefile", "makefile", "Makefile"];
 
@@ -624,6 +631,60 @@ impl Workspace {
         uris
     }
 
+    /// The open documents and the makefiles in the workspace folders, each
+    /// followed by the files it includes.
+    ///
+    /// Open documents come first, together with the makefiles that include
+    /// them. The search of the workspace folders skips hidden directories
+    /// and stops after `MAX_SCAN_ENTRIES` directory entries; at most
+    /// `MAX_WORKSPACE_FILES` documents are returned.
+    pub fn all_documents(&mut self) -> Vec<Arc<Document>> {
+        let mut docs: Vec<Arc<Document>> = Vec::new();
+        let mut seen: HashSet<Uri> = HashSet::new();
+        let mut add = |docs: &mut Vec<Arc<Document>>, found: Vec<Arc<Document>>| {
+            for doc in found {
+                if seen.insert(doc.uri().clone()) {
+                    docs.push(doc);
+                }
+            }
+        };
+        for uri in self.open_documents() {
+            let current = self.open[&uri].clone();
+            let files = self.build_file_set(current);
+            add(&mut docs, files.docs);
+        }
+        for path in find_makefiles(&self.roots, MAX_SCAN_ENTRIES) {
+            if docs.len() >= MAX_WORKSPACE_FILES {
+                tracing::warn!("not looking at more than {MAX_WORKSPACE_FILES} workspace files");
+                break;
+            }
+            if docs.iter().any(|d| d.path() == Some(&path)) {
+                continue;
+            }
+            if let Some(walk) = self.walk_from(&path) {
+                add(&mut docs, walk.docs);
+            }
+        }
+        docs.truncate(MAX_WORKSPACE_FILES);
+        docs
+    }
+
+    /// A name to show for `doc`: its path relative to the innermost
+    /// workspace folder containing it, its full path when it is outside the
+    /// workspace folders, or its URI when it isn't a local file.
+    pub fn display_name(&self, doc: &Document) -> String {
+        let Some(path) = doc.path() else {
+            return doc.uri().as_str().to_string();
+        };
+        self.roots
+            .iter()
+            .filter_map(|r| path.strip_prefix(r).ok())
+            .min_by_key(|p| p.components().count())
+            .unwrap_or(path)
+            .display()
+            .to_string()
+    }
+
     /// Drop the cached copy of a file that changed on disk.
     pub fn invalidate(&mut self, path: &Path) {
         self.disk.remove(&normalize(path));
@@ -820,6 +881,64 @@ impl Workspace {
         );
         Ok(doc)
     }
+}
+
+/// Whether `name` is a conventional makefile name.
+pub fn is_makefile_name(name: &str) -> bool {
+    DEFAULT_MAKEFILES.contains(&name) || name.ends_with(".mk") || name.ends_with(".mak")
+}
+
+/// Find the makefiles under `roots`, breadth first, looking at no more than
+/// `max_entries` directory entries.
+///
+/// Hidden directories and symbolic links to directories are skipped.
+fn find_makefiles(roots: &[PathBuf], max_entries: usize) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut queue: std::collections::VecDeque<PathBuf> = roots.iter().cloned().collect();
+    let mut remaining = max_entries;
+    while let Some(dir) = queue.pop_front() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) => {
+                tracing::warn!("unable to list {}: {e}", dir.display());
+                continue;
+            }
+        };
+        let mut entries: Vec<_> = match entries.collect::<Result<_, _>>() {
+            Ok(entries) => entries,
+            Err(e) => {
+                tracing::warn!("unable to list {}: {e}", dir.display());
+                continue;
+            }
+        };
+        entries.sort_by_key(|e| e.file_name());
+        for entry in entries {
+            if remaining == 0 {
+                tracing::warn!(
+                    "not searching beyond {max_entries} directory entries for makefiles"
+                );
+                return found;
+            }
+            remaining -= 1;
+            let file_type = match entry.file_type() {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::warn!("unable to stat {}: {e}", entry.path().display());
+                    continue;
+                }
+            };
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if file_type.is_dir() {
+                if !name.starts_with('.') {
+                    queue.push_back(entry.path());
+                }
+            } else if is_makefile_name(&name) {
+                found.push(entry.path());
+            }
+        }
+    }
+    found
 }
 
 /// Replace entries in `into` with more informative ones from `from`.
@@ -1413,5 +1532,88 @@ pub mod tests {
             v.sort_by(|x, y| x.as_str().cmp(y.as_str()));
             v
         });
+    }
+
+    fn relative_names(fx: &Fixture, docs: &[Arc<Document>]) -> Vec<String> {
+        docs.iter()
+            .map(|d| {
+                d.path()
+                    .unwrap()
+                    .strip_prefix(fx.path(""))
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_all_documents() {
+        let fx = Fixture::new(&[
+            ("ws/Makefile", "include common.mk ../outside.mk\n"),
+            ("ws/common.mk", ""),
+            ("ws/sub/GNUmakefile", ""),
+            ("ws/sub/rules.mk", ""),
+            ("ws/.git/hidden.mk", ""),
+            ("ws/README", ""),
+            ("outside.mk", ""),
+            ("other/Makefile", ""),
+            ("elsewhere/open.mk", "include inc.mk\n"),
+            ("elsewhere/inc.mk", ""),
+        ]);
+        let mut ws = Workspace::new();
+        ws.set_roots(vec![fx.path("ws")]);
+        fx.open_in(&mut ws, "ws/sub/rules.mk");
+        fx.open_in(&mut ws, "elsewhere/open.mk");
+        let docs = ws.all_documents();
+        assert_eq!(
+            relative_names(&fx, &docs),
+            vec![
+                "elsewhere/open.mk",
+                "elsewhere/inc.mk",
+                "ws/sub/rules.mk",
+                "ws/Makefile",
+                "ws/common.mk",
+                "outside.mk",
+                "ws/sub/GNUmakefile",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_find_makefiles_limit() {
+        let fx = Fixture::new(&[
+            ("a/deep.mk", ""),
+            ("Makefile", ""),
+            ("b.mk", ""),
+            ("c.txt", ""),
+        ]);
+        let root = vec![fx.path("")];
+        assert_eq!(
+            find_makefiles(&root, 100),
+            vec![fx.path("Makefile"), fx.path("b.mk"), fx.path("a/deep.mk")]
+        );
+        assert_eq!(
+            find_makefiles(&root, 3),
+            vec![fx.path("Makefile"), fx.path("b.mk")]
+        );
+    }
+
+    #[test]
+    fn test_display_name() {
+        let fx = Fixture::new(&[]);
+        let mut ws = Workspace::new();
+        ws.set_roots(vec![fx.path("ws"), fx.path("ws/sub")]);
+        let name = |uri: Uri| ws.display_name(&Document::new(uri, String::new()));
+        assert_eq!(name(fx.uri("ws/a.mk")), "a.mk");
+        assert_eq!(name(fx.uri("ws/sub/b.mk")), "b.mk");
+        assert_eq!(
+            name(fx.uri("outside.mk")),
+            fx.path("outside.mk").display().to_string()
+        );
+        assert_eq!(
+            name("untitled:Untitled-1".parse().unwrap()),
+            "untitled:Untitled-1"
+        );
     }
 }
