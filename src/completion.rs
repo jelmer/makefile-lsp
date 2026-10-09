@@ -406,7 +406,7 @@ fn partial_word_before(source_text: &str, byte_offset: usize) -> &str {
         .unwrap_or(0);
     let segment = &source_text[line_start..byte_offset];
     let start_in_segment = segment
-        .rfind(|c: char| c.is_whitespace() || c == ':')
+        .rfind(|c: char| c.is_ascii_whitespace() || c == ':')
         .map(|i| i + 1)
         .unwrap_or(0);
     &segment[start_in_segment..]
@@ -887,6 +887,12 @@ mod tests {
         assert_eq!(partial_word_before("all: main", 9), "main");
         assert_eq!(partial_word_before("all: ", 5), "");
         assert_eq!(partial_word_before("all: foo bar", 12), "bar");
+    }
+
+    #[test]
+    fn test_partial_word_before_non_ascii_space() {
+        // make does not split words on a no-break space.
+        assert_eq!(partial_word_before("all: a\u{a0}b", 9), "a\u{a0}b");
     }
 
     fn labels_in(fx: &crate::workspace::tests::Fixture, pos: Position) -> Vec<String> {
