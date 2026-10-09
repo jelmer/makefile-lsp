@@ -32,7 +32,11 @@ const PLACEHOLDER: &str = "__make_ref__";
 /// Reported as warnings rather than errors, as a make reference that
 /// expands to shell syntax (say, `then` or `;`) can make a valid line look
 /// broken.
-pub fn check_shell_syntax(source_text: &str, makefile: &Makefile) -> Vec<Diagnostic> {
+pub fn check_shell_syntax(
+    source_text: &str,
+    makefile: &Makefile,
+    variant: MakefileVariant,
+) -> Vec<Diagnostic> {
     // TODO: with .ONESHELL, check each recipe as a single script.
     if makefile.rules_by_target(".ONESHELL").next().is_some() {
         return Vec::new();
@@ -45,7 +49,7 @@ pub fn check_shell_syntax(source_text: &str, makefile: &Makefile) -> Vec<Diagnos
     let mut diagnostics = Vec::new();
     for rule in makefile.rules() {
         for recipe in rule.recipe_nodes() {
-            let script = shell_script(&recipe.shell_text());
+            let script = shell_script(&recipe.shell_text(), variant);
             if script.trim().is_empty() {
                 continue;
             }
@@ -115,11 +119,11 @@ fn shell_program(makefile: &Makefile) -> Option<String> {
 /// `$(Q)` or `$(QUIET_CC)` glued to the command, or expands to whole
 /// commands, so unless an operator follows it becomes the separate command
 /// `:;`. Elsewhere it becomes a placeholder word.
-fn shell_script(shell_text: &str) -> String {
+fn shell_script(shell_text: &str, variant: MakefileVariant) -> String {
     let rest =
         shell_text.trim_start_matches(|c: char| matches!(c, '@' | '-' | '+') || c.is_whitespace());
     let mut out = String::with_capacity(rest.len());
-    for part in split_references(rest, MakefileVariant::GNUMake) {
+    for part in split_references(rest, variant) {
         let range = part.range();
         let text = &rest[range.clone()];
         match part {
@@ -264,7 +268,7 @@ mod tests {
 
     fn check(text: &str) -> Vec<(Range, String)> {
         let parsed = Makefile::parse(text);
-        check_shell_syntax(text, &parsed.tree())
+        check_shell_syntax(text, &parsed.tree(), MakefileVariant::GNUMake)
             .into_iter()
             .map(|d| (d.range, d.message))
             .collect()
@@ -273,7 +277,10 @@ mod tests {
     #[test]
     fn test_shell_script_substitutes_references() {
         assert_eq!(
-            shell_script("@-$(CC) -o $@ ${SRCS} $$HOME $(call f,$(x),(y)) x$(Y)z"),
+            shell_script(
+                "@-$(CC) -o $@ ${SRCS} $$HOME $(call f,$(x),(y)) x$(Y)z",
+                MakefileVariant::GNUMake
+            ),
             ":; -o __make_ref__ __make_ref__ $HOME __make_ref__ x__make_ref__z"
         );
     }
@@ -281,15 +288,26 @@ mod tests {
     #[test]
     fn test_shell_script_bracket_types() {
         assert_eq!(
-            shell_script("echo $(a ${b)} ${c $(d}) $"),
+            shell_script("echo $(a ${b)} ${c $(d}) $", MakefileVariant::GNUMake),
             "echo __make_ref__} __make_ref__) $"
+        );
+    }
+
+    #[test]
+    fn test_shell_script_bsd_modifiers() {
+        assert_eq!(
+            shell_script("echo ${X:S,},x,} done", MakefileVariant::BSDMake),
+            "echo __make_ref__ done"
         );
     }
 
     #[test]
     fn test_shell_script_keeps_lines() {
         assert_eq!(
-            shell_script("echo $(foo \\\n\tbar) \\\n\tbaz $"),
+            shell_script(
+                "echo $(foo \\\n\tbar) \\\n\tbaz $",
+                MakefileVariant::GNUMake
+            ),
             "echo __make_ref__\\\n \\\n\tbaz $"
         );
     }
@@ -297,19 +315,28 @@ mod tests {
     #[test]
     fn test_shell_script_command_position() {
         assert_eq!(
-            shell_script("$(Q)for f in $^; do $(Q)echo $$f; done"),
+            shell_script(
+                "$(Q)for f in $^; do $(Q)echo $$f; done",
+                MakefileVariant::GNUMake
+            ),
             ":;for f in __make_ref__; do __make_ref__echo $f; done"
         );
         assert_eq!(
-            shell_script("$(QUIET) \\\n\t($(foreach x,y,z &&) true) && $(RM) $@"),
+            shell_script(
+                "$(QUIET) \\\n\t($(foreach x,y,z &&) true) && $(RM) $@",
+                MakefileVariant::GNUMake
+            ),
             ":; \\\n\t(:; true) && :; __make_ref__"
         );
         assert_eq!(
-            shell_script("$(CMD) | grep x; $(CMD)"),
+            shell_script("$(CMD) | grep x; $(CMD)", MakefileVariant::GNUMake),
             "__make_ref__ | grep x; __make_ref__"
         );
         assert_eq!(
-            shell_script("{ $(foreach m,$(M),echo $(m);) } > out"),
+            shell_script(
+                "{ $(foreach m,$(M),echo $(m);) } > out",
+                MakefileVariant::GNUMake
+            ),
             "{ :; } > out"
         );
     }
@@ -454,7 +481,11 @@ mod tests {
     fn test_missing_shell() {
         let parsed = Makefile::parse("SHELL = /nonexistent/sh\nall:\n\tls )\n");
         assert_eq!(
-            check_shell_syntax("SHELL = /nonexistent/sh\nall:\n\tls )\n", &parsed.tree()),
+            check_shell_syntax(
+                "SHELL = /nonexistent/sh\nall:\n\tls )\n",
+                &parsed.tree(),
+                MakefileVariant::GNUMake
+            ),
             vec![]
         );
     }

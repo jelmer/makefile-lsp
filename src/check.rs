@@ -272,7 +272,7 @@ pub fn check_file(path: &Path) -> std::io::Result<Vec<Finding>> {
         _ => PathBuf::from("."),
     };
     let diagnostics = crate::diagnostics::get_diagnostics(&text, &parsed, Some(&base_dir));
-    Ok(findings(path, &text, &parsed.tree(), diagnostics))
+    Ok(findings(path, &text, &parsed, diagnostics))
 }
 
 /// Diagnose a file together with the makefiles it includes and those that
@@ -291,7 +291,7 @@ pub fn check_file_with_includes(
     Ok(findings(
         path,
         current.text(),
-        &current.makefile(),
+        current.parsed(),
         diagnostics,
     ))
 }
@@ -301,10 +301,14 @@ pub fn check_file_with_includes(
 fn findings(
     path: &Path,
     text: &str,
-    makefile: &makefile_lossless::Makefile,
+    parsed: &makefile_lossless::Parse<makefile_lossless::Makefile>,
     mut diagnostics: Vec<Diagnostic>,
 ) -> Vec<Finding> {
-    diagnostics.extend(crate::shell_check::check_shell_syntax(text, makefile));
+    diagnostics.extend(crate::shell_check::check_shell_syntax(
+        text,
+        &parsed.tree(),
+        crate::workspace::parsed_variant(parsed),
+    ));
     let mut findings: Vec<Finding> = diagnostics
         .iter()
         .map(|d| Finding::from_diagnostic(path, text, d))

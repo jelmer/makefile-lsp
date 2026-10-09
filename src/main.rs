@@ -184,7 +184,11 @@ impl Backend {
 
             let checked = doc.clone();
             let shell_diagnostics = match tokio::task::spawn_blocking(move || {
-                shell_check::check_shell_syntax(checked.text(), &checked.makefile())
+                shell_check::check_shell_syntax(
+                    checked.text(),
+                    &checked.makefile(),
+                    checked.variant(),
+                )
             })
             .await
             {

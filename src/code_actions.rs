@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use makefile_lossless::{
-    Makefile, MakefileVariant, Parse, ReferenceLocation, TextRange, TextSize, VariableReference,
+    Makefile, Parse, ReferenceLocation, TextRange, TextSize, VariableReference,
 };
 use tower_lsp_server::ls_types::{
     CodeAction, CodeActionKind, Diagnostic, NumberOrString, Position, Range, TextEdit, Uri,
@@ -15,7 +15,7 @@ use tower_lsp_server::ls_types::{
 use crate::builtins;
 use crate::position::{offset_to_position, text_range_to_lsp_range, try_position_to_offset};
 use crate::targets::{prerequisite_at_offset, target_at_offset};
-use crate::workspace::FileSet;
+use crate::workspace::{parsed_variant, FileSet};
 
 /// Generate code actions for the given range.
 ///
@@ -754,6 +754,7 @@ fn inline_variable_action(
     let offset = TextSize::from(byte_offset as u32);
 
     let makefile = parsed.tree();
+    let variant = parsed_variant(parsed);
     let var_def = makefile
         .variable_definitions()
         .find(|v| v.text_range().contains(offset))?;
@@ -769,7 +770,7 @@ fn inline_variable_action(
     // Only inline values that are plain literals: no variable references,
     // function calls, or `$$` escapes. We'd otherwise be reasoning about
     // expansion order.
-    if value.contains('$') || var_def.value_for(MakefileVariant::GNUMake)? != value {
+    if value.contains('$') || var_def.value_for(variant)? != value {
         return None;
     }
 
@@ -786,7 +787,7 @@ fn inline_variable_action(
         }
         // name() leaves out modifiers, so `$(NAME:.c=.o)` matches too.
         let plain = var_ref
-            .parse(MakefileVariant::GNUMake)
+            .parse(variant)
             .is_ok_and(|r| r.name == name && r.modifiers.is_empty());
         if !plain {
             return None;
@@ -1049,6 +1050,7 @@ fn inline_prerequisite_action(
 mod tests {
     use super::*;
     use crate::position::try_lsp_range_to_text_range;
+    use makefile_lossless::MakefileVariant;
 
     fn actions_at(
         uri: &str,
@@ -1757,6 +1759,15 @@ mod tests {
             inline_result("OUT = dist\nall:\n\techo \u{e9}\u{1f600} $(OUT)\n", "OUT"),
             Some("all:\n\techo \u{e9}\u{1f600} dist\n".to_string())
         );
+    }
+
+    #[test]
+    fn test_no_inline_for_nmake_escape() {
+        // nmake stores `a#b`, so the value isn't written as it is stored.
+        let text = "X = a^#b\nall:\n\techo $(X)\n";
+        let parsed = Makefile::parse_with_variant(text, MakefileVariant::NMake);
+        let uri: Uri = "file:///test/Makefile".parse().unwrap();
+        assert_eq!(inline_variable_action(&parsed, text, 0, &uri), None);
     }
 
     #[test]
