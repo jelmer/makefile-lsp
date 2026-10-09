@@ -4,9 +4,8 @@ use std::collections::{HashMap, HashSet};
 
 use makefile_lossless::{
     ConditionalBranch, Makefile, MakefileItem, MakefileVariant, Parse, ParseErrorKind,
-    ParsedReference, PositionedParseError, ReferenceLocation, Rule, VariableReference,
+    ParsedReference, PositionedParseError, ReferenceLocation, Rule, TextRange, VariableReference,
 };
-use text_size::TextRange;
 use tower_lsp_server::ls_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Range};
 
 use crate::builtins;

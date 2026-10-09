@@ -1,6 +1,6 @@
 //! UTF-16 position conversion utilities for LSP protocol compatibility.
 
-use text_size::{TextRange, TextSize};
+use makefile_lossless::{TextRange, TextSize};
 use tower_lsp_server::ls_types::{Position, Range};
 
 /// Return the UTF-16 code unit length of a string.

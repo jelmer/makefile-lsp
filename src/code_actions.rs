@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use makefile_lossless::{
-    Makefile, MakefileVariant, Parse, ReferenceLocation, TextSize, VariableReference,
+    Makefile, MakefileVariant, Parse, ReferenceLocation, TextRange, TextSize, VariableReference,
 };
 use tower_lsp_server::ls_types::{
     CodeAction, CodeActionKind, Diagnostic, NumberOrString, Position, Range, TextEdit, Uri,
@@ -225,7 +225,7 @@ fn make_include_optional_action(
     byte_offset: usize,
     uri: &Uri,
 ) -> Option<CodeAction> {
-    let offset = text_size::TextSize::from(byte_offset as u32);
+    let offset = TextSize::from(byte_offset as u32);
     let include = makefile
         .includes()
         .find(|include| include.text_range().contains(offset))?;
@@ -261,7 +261,7 @@ fn make_include_optional_action(
 /// the edit.
 fn edit_for_node_change(
     source_text: &str,
-    original_range: text_size::TextRange,
+    original_range: TextRange,
     mutated_node: &impl std::fmt::Display,
 ) -> TextEdit {
     TextEdit {
@@ -280,7 +280,7 @@ fn add_phony_action(
     uri: &Uri,
     diagnostics: &[Diagnostic],
 ) -> Option<CodeAction> {
-    let offset = text_size::TextSize::from(byte_offset as u32);
+    let offset = TextSize::from(byte_offset as u32);
     let (target, target_range) = makefile.rules().find_map(|rule| {
         crate::diagnostics::target_name_ranges(&rule)
             .into_iter()
@@ -404,9 +404,7 @@ fn replace_spaces_with_tab_action(
 }
 
 /// Ranges of the leading spaces of recipe lines indented with spaces.
-fn space_indented_recipes(
-    parsed: &Parse<Makefile>,
-) -> impl Iterator<Item = text_size::TextRange> + '_ {
+fn space_indented_recipes(parsed: &Parse<Makefile>) -> impl Iterator<Item = TextRange> + '_ {
     parsed
         .positioned_errors()
         .iter()
@@ -416,7 +414,7 @@ fn space_indented_recipes(
 /// Build a quick fix replacing each of `ranges` with a tab.
 fn tab_edit_action(
     title: &str,
-    ranges: Vec<text_size::TextRange>,
+    ranges: Vec<TextRange>,
     source_text: &str,
     uri: &Uri,
 ) -> Option<CodeAction> {
@@ -454,7 +452,7 @@ fn remove_trailing_whitespace_action(
     byte_offset: usize,
     uri: &Uri,
 ) -> Option<CodeAction> {
-    let offset = text_size::TextSize::from(byte_offset as u32);
+    let offset = TextSize::from(byte_offset as u32);
 
     let makefile = parsed.tree();
     let mut var_def = makefile
@@ -492,7 +490,7 @@ fn convert_to_simply_expanded_action(
     byte_offset: usize,
     uri: &Uri,
 ) -> Option<CodeAction> {
-    let offset = text_size::TextSize::from(byte_offset as u32);
+    let offset = TextSize::from(byte_offset as u32);
 
     let makefile = parsed.tree();
     let mut var_def = makefile
@@ -538,7 +536,7 @@ fn add_missing_endif_action(
     byte_offset: usize,
     uri: &Uri,
 ) -> Option<CodeAction> {
-    let offset = text_size::TextSize::from(byte_offset as u32);
+    let offset = TextSize::from(byte_offset as u32);
 
     let makefile = parsed.tree();
     // Find the innermost Conditional containing the cursor that is missing an
@@ -580,7 +578,7 @@ fn add_missing_endef_action(
     byte_offset: usize,
     uri: &Uri,
 ) -> Option<CodeAction> {
-    let offset = text_size::TextSize::from(byte_offset as u32);
+    let offset = TextSize::from(byte_offset as u32);
 
     let mut define = parsed
         .tree()
@@ -645,11 +643,8 @@ fn remove_from_phony_action(
     let new_text = mutated.to_string();
 
     let doc_range = Range::new(
-        offset_to_position(source_text, text_size::TextSize::from(0)),
-        offset_to_position(
-            source_text,
-            text_size::TextSize::from(source_text.len() as u32),
-        ),
+        offset_to_position(source_text, TextSize::from(0)),
+        offset_to_position(source_text, TextSize::from(source_text.len() as u32)),
     );
     let edit = TextEdit {
         range: doc_range,
@@ -680,7 +675,7 @@ fn sort_phony_prerequisites_action(
     byte_offset: usize,
     uri: &Uri,
 ) -> Option<CodeAction> {
-    let offset = text_size::TextSize::from(byte_offset as u32);
+    let offset = TextSize::from(byte_offset as u32);
 
     let makefile = parsed.tree();
     let mut rule = makefile
@@ -756,7 +751,7 @@ fn inline_variable_action(
     byte_offset: usize,
     uri: &Uri,
 ) -> Option<CodeAction> {
-    let offset = text_size::TextSize::from(byte_offset as u32);
+    let offset = TextSize::from(byte_offset as u32);
 
     let makefile = parsed.tree();
     let var_def = makefile
@@ -986,7 +981,7 @@ fn inline_prerequisite_action(
     byte_offset: usize,
     uri: &Uri,
 ) -> Option<CodeAction> {
-    let offset = text_size::TextSize::from(byte_offset as u32);
+    let offset = TextSize::from(byte_offset as u32);
     let makefile = parsed.tree();
 
     // The normal prerequisite under the cursor is the one we'd remove.

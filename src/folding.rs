@@ -1,6 +1,6 @@
 //! Folding range generation for Makefiles.
 
-use makefile_lossless::Makefile;
+use makefile_lossless::{Makefile, TextRange};
 use tower_lsp_server::ls_types::{FoldingRange, FoldingRangeKind};
 
 use crate::position::offset_to_position;
@@ -8,7 +8,7 @@ use crate::position::offset_to_position;
 /// Create a folding range from a text range, returning `None` if it's a single line.
 fn make_folding_range(
     source_text: &str,
-    text_range: rowan::TextRange,
+    text_range: TextRange,
     kind: FoldingRangeKind,
 ) -> Option<FoldingRange> {
     let start = offset_to_position(source_text, text_range.start());

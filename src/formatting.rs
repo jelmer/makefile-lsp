@@ -13,8 +13,7 @@
 use std::borrow::Cow;
 use std::collections::HashSet;
 
-use makefile_lossless::{Makefile, Parse};
-use text_size::{TextRange, TextSize};
+use makefile_lossless::{Makefile, Parse, TextRange, TextSize};
 use tower_lsp_server::ls_types::{Range, TextEdit};
 
 use crate::position::text_range_to_lsp_range;

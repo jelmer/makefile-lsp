@@ -1,7 +1,8 @@
 //! Hover information for Makefiles.
 
-use makefile_lossless::{Conditional, Makefile, MakefileItem, TextRange, VariableReference};
-use text_size::TextSize;
+use makefile_lossless::{
+    Conditional, Makefile, MakefileItem, TextRange, TextSize, VariableReference,
+};
 use tower_lsp_server::ls_types::{Hover, HoverContents, MarkupContent, MarkupKind, Position};
 
 use crate::builtins;
