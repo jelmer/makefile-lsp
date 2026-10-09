@@ -86,7 +86,10 @@ fn is_computed(doc: &Document, symbol: &Symbol, position: Position) -> bool {
 /// Variables must be defined in one of the files. Prerequisites that aren't
 /// defined as targets anywhere (usually plain files) may be renamed. A symbol
 /// defined only in files outside the workspace can't be renamed.
-fn renameable_symbol(files: &FileSet, position: Position) -> Option<Result<Symbol, RenameError>> {
+pub(crate) fn renameable_symbol(
+    files: &FileSet,
+    position: Position,
+) -> Option<Result<Symbol, RenameError>> {
     let current = files.current();
     let byte_offset: usize = try_position_to_offset(current.text(), position)?.into();
     let symbol = symbol_at(&current.makefile(), byte_offset)?;
