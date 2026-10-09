@@ -13,7 +13,7 @@ use crate::builtins;
 use crate::dep_graph::mutually_exclusive;
 use crate::position::text_range_to_lsp_range;
 use crate::targets::targets_with_ranges;
-use crate::workspace::{FileSet, Resolution, ResolvedInclude};
+use crate::workspace::{parsed_variant, FileSet, Resolution, ResolvedInclude};
 
 fn make_diagnostic(
     range: Range,
@@ -79,13 +79,16 @@ pub fn get_diagnostics(
         Some(dir) => {
             use crate::workspace::{include_paths, resolve_include, LiteralVariables};
 
+            let variant = parsed_variant(parsed);
             let mut vars = LiteralVariables::default();
-            vars.add(&makefile);
+            vars.add(&makefile, variant);
             include_paths(&makefile)
                 .into_iter()
                 .map(|path| {
                     let resolution =
-                        resolve_include(&path, &vars, Some(dir), Some(dir), &|p| p.is_file());
+                        resolve_include(&path, &vars, variant, Some(dir), Some(dir), &|p| {
+                            p.is_file()
+                        });
                     ResolvedInclude { path, resolution }
                 })
                 .collect()
@@ -105,9 +108,12 @@ pub fn get_diagnostics(
 /// Collect diagnostics for the current document of a file set, taking the
 /// definitions and uses in the other makefiles into account.
 pub fn get_file_set_diagnostics(files: &FileSet) -> Vec<Diagnostic> {
-    let others: Vec<Makefile> = files.others().map(|doc| doc.makefile()).collect();
+    let others: Vec<(Makefile, MakefileVariant)> = files
+        .others()
+        .map(|doc| (doc.makefile(), doc.variant()))
+        .collect();
     let mut external = ExternalSymbols::default();
-    for makefile in &others {
+    for (makefile, _) in &others {
         external.add(makefile);
     }
     let current = files.current();
@@ -131,7 +137,7 @@ enum OtherMakefiles<'a> {
     /// Includes weren't followed.
     Unknown,
     /// Every include in the file set was followed.
-    Complete(&'a [Makefile]),
+    Complete(&'a [(Makefile, MakefileVariant)]),
     /// Some include in the file set couldn't be followed.
     Incomplete,
 }
@@ -151,6 +157,7 @@ fn collect_diagnostics(
         .collect();
 
     let makefile = parsed.tree();
+    let variant = parsed_variant(parsed);
     diagnostics.extend(check_undefined_variables(source_text, &makefile, external));
     diagnostics.extend(check_recursive_variable_self_reference(
         source_text,
@@ -188,12 +195,14 @@ fn collect_diagnostics(
     diagnostics.extend(check_automatic_variable_outside_recipe(
         source_text,
         &makefile,
+        variant,
     ));
     if let Some(dir) = base_dir {
         diagnostics.extend(check_missing_phony(source_text, &makefile, external, dir));
         diagnostics.extend(check_unresolved_prerequisites(
             source_text,
             &makefile,
+            variant,
             others,
             dir,
         ));
@@ -1341,6 +1350,7 @@ fn check_missing_phony(
 fn check_unresolved_prerequisites(
     source_text: &str,
     makefile: &Makefile,
+    variant: MakefileVariant,
     others: OtherMakefiles,
     base_dir: &std::path::Path,
 ) -> Vec<Diagnostic> {
@@ -1349,16 +1359,18 @@ fn check_unresolved_prerequisites(
         OtherMakefiles::Complete(others) => (true, others),
         OtherMakefiles::Incomplete => return Vec::new(),
     };
-    let Some(mut targets) = resolvable_target_names(makefile, includes_followed) else {
+    let Some(mut targets) = resolvable_target_names(makefile, variant, includes_followed) else {
         return Vec::new();
     };
-    for other in others {
-        let Some(names) = resolvable_target_names(other, true) else {
+    for (other, other_variant) in others {
+        let Some(names) = resolvable_target_names(other, *other_variant, true) else {
             return Vec::new();
         };
         targets.extend(names);
     }
-    let makefiles: Vec<&Makefile> = std::iter::once(makefile).chain(others).collect();
+    let makefiles: Vec<&Makefile> = std::iter::once(makefile)
+        .chain(others.iter().map(|(other, _)| other))
+        .collect();
 
     let mut diagnostics = Vec::new();
     for rule in makefile.rules() {
@@ -1412,6 +1424,7 @@ fn check_unresolved_prerequisites(
 /// literal, like `$(PROG)`, are expanded.
 fn resolvable_target_names(
     makefile: &Makefile,
+    variant: MakefileVariant,
     includes_followed: bool,
 ) -> Option<HashSet<String>> {
     let defers_elsewhere = (!includes_followed && makefile.includes().next().is_some())
@@ -1446,7 +1459,7 @@ fn resolvable_target_names(
             names.insert(target.trim_start_matches("./").to_string());
             continue;
         }
-        let var = ParsedReference::parse(&target, MakefileVariant::GNUMake)
+        let var = ParsedReference::parse(&target, variant)
             .ok()
             .filter(|r| r.modifiers.is_empty() && is_valid_var_name(&r.name))?
             .name;
@@ -1519,6 +1532,7 @@ fn has_file_with_same_stem(path: &std::path::Path) -> bool {
 fn check_automatic_variable_outside_recipe(
     source_text: &str,
     makefile: &Makefile,
+    variant: MakefileVariant,
 ) -> Vec<Diagnostic> {
     let second_expansion = makefile
         .rules_by_target(".SECONDEXPANSION")
@@ -1529,7 +1543,7 @@ fn check_automatic_variable_outside_recipe(
         .variable_references()
         .filter_map(|var_ref| {
             let text = var_ref.to_string();
-            if !is_automatic_variable_reference(&text) {
+            if !is_automatic_variable_reference(&text, variant) {
                 return None;
             }
             let context = immediate_expansion_context(&var_ref, second_expansion)?;
@@ -1548,8 +1562,8 @@ fn check_automatic_variable_outside_recipe(
 
 /// Is `text` a reference to an automatic variable, such as `$@`, `$(<)`,
 /// `${@D}` or `$(@:.c=.o)`?
-fn is_automatic_variable_reference(text: &str) -> bool {
-    let Ok(reference) = ParsedReference::parse(text, MakefileVariant::GNUMake) else {
+fn is_automatic_variable_reference(text: &str, variant: MakefileVariant) -> bool {
+    let Ok(reference) = ParsedReference::parse(text, variant) else {
         return false;
     };
     let mut chars = reference.name.chars();
@@ -4260,5 +4274,57 @@ endif
     #[test]
     fn test_non_automatic_single_char_variable_ok() {
         assert_eq!(auto_var_messages("X := $A $(@X) $(DD)\n").len(), 0);
+    }
+
+    fn bsd_messages(text: &str, dir: &std::path::Path, code: &str) -> Vec<String> {
+        let parsed = Makefile::parse_with_variant(text, MakefileVariant::BSDMake);
+        get_diagnostics(text, &parsed, Some(dir))
+            .into_iter()
+            .filter(|d| d.code == Some(NumberOrString::String(code.to_string())))
+            .map(|d| d.message)
+            .collect()
+    }
+
+    #[test]
+    fn test_bsd_include_path_uses_bsd_references() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            bsd_messages(
+                "TOP = sub\n.include \"${TOP:}/x.mk\"\n",
+                dir.path(),
+                "missing-include-file"
+            ),
+            vec!["included file '${TOP:}/x.mk' does not exist".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_bsd_target_uses_bsd_references() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            bsd_messages(
+                "PROG = foo\n${PROG:}:\n\ttouch foo\nall: foo missing\n",
+                dir.path(),
+                "unresolved-prerequisite"
+            ),
+            vec!["no rule to make prerequisite 'missing', and no such file exists".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_bsd_automatic_variable_uses_bsd_references() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            bsd_messages(
+                "X := ${@:}\n",
+                dir.path(),
+                "automatic-variable-outside-recipe"
+            ),
+            vec![
+                "automatic variable '${@:}' is only set in recipes and is empty in \
+                 an immediately-expanded assignment"
+                    .to_string()
+            ]
+        );
     }
 }

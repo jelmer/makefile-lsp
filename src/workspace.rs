@@ -77,6 +77,17 @@ impl Document {
     pub fn makefile(&self) -> Makefile {
         self.parsed.tree()
     }
+
+    pub fn variant(&self) -> MakefileVariant {
+        parsed_variant(&self.parsed)
+    }
+}
+
+/// The make variant `parsed` was parsed for. [`Makefile::parse`] accepts
+/// both GNU and BSD syntax without recording a variant; references in its
+/// result end where GNU make ends them, so it is treated as GNU make.
+pub fn parsed_variant(parsed: &Parse<Makefile>) -> MakefileVariant {
+    parsed.variant().unwrap_or(MakefileVariant::GNUMake)
 }
 
 /// The normalized local path of a `file://` URI.
@@ -162,12 +173,12 @@ pub struct LiteralVariables {
 }
 
 impl LiteralVariables {
-    pub fn add(&mut self, makefile: &Makefile) {
+    pub fn add(&mut self, makefile: &Makefile, variant: MakefileVariant) {
         for def in makefile.variable_definitions() {
             let Some(name) = def.name() else {
                 continue;
             };
-            let literal = literal_value(&def);
+            let literal = literal_value(&def, variant);
             self.values
                 .entry(name)
                 .and_modify(|existing| {
@@ -188,7 +199,10 @@ impl LiteralVariables {
     }
 }
 
-fn literal_value(def: &makefile_lossless::VariableDefinition) -> Option<String> {
+fn literal_value(
+    def: &makefile_lossless::VariableDefinition,
+    variant: MakefileVariant,
+) -> Option<String> {
     let op = def.assignment_operator()?;
     if !matches!(op.as_str(), "=" | ":=" | "::=" | ":::=") || def.is_define() {
         return None;
@@ -196,7 +210,7 @@ fn literal_value(def: &makefile_lossless::VariableDefinition) -> Option<String> 
     if def.is_target_specific() || !def.enclosing_branches().is_empty() {
         return None;
     }
-    let value = def.value_for(MakefileVariant::GNUMake)?;
+    let value = def.value_for(variant)?;
     if value.is_empty() || value.contains(['$', ' ', '\t', '\n']) {
         return None;
     }
@@ -207,9 +221,14 @@ fn literal_value(def: &makefile_lossless::VariableDefinition) -> Option<String> 
 /// if it uses anything other than simple references to literal variables.
 ///
 /// `CURDIR` expands to `cwd` unless the makefiles assign it.
-fn expand(name: &str, vars: &LiteralVariables, cwd: Option<&Path>) -> Option<String> {
+fn expand(
+    name: &str,
+    vars: &LiteralVariables,
+    variant: MakefileVariant,
+    cwd: Option<&Path>,
+) -> Option<String> {
     let mut out = String::new();
-    for part in split_references(name, MakefileVariant::GNUMake) {
+    for part in split_references(name, variant) {
         let reference = match part {
             TextPart::Literal(range) => {
                 out.push_str(&name[range]);
@@ -270,7 +289,8 @@ pub struct ResolvedInclude {
     pub resolution: Resolution,
 }
 
-/// Resolve an include file name.
+/// Resolve an include file name, reading its references as `variant`, the
+/// variant the including file was parsed as.
 ///
 /// GNU make resolves relative names against its working directory, which is
 /// normally the directory of the top-level makefile (`cwd`). Names are also
@@ -282,11 +302,12 @@ pub struct ResolvedInclude {
 pub fn resolve_include(
     path: &IncludePath,
     vars: &LiteralVariables,
+    variant: MakefileVariant,
     cwd: Option<&Path>,
     dir: Option<&Path>,
     exists: &dyn Fn(&Path) -> bool,
 ) -> Resolution {
-    let Some(mut expanded) = expand(&path.name, vars, cwd) else {
+    let Some(mut expanded) = expand(&path.name, vars, variant, cwd) else {
         return Resolution::Unresolved;
     };
     if path.gnu {
@@ -716,13 +737,14 @@ impl Workspace {
         }
         walk.docs.push(doc.clone());
         let makefile = doc.makefile();
-        walk.vars.add(&makefile);
+        walk.vars.add(&makefile, doc.variant());
 
         let mut resolved = Vec::new();
         let mut children = BTreeSet::new();
         for path in include_paths(&makefile) {
             let exists = |p: &Path| self.open_paths.contains_key(p) || p.is_file();
-            let mut resolution = resolve_include(&path, &walk.vars, cwd, doc.dir(), &exists);
+            let mut resolution =
+                resolve_include(&path, &walk.vars, doc.variant(), cwd, doc.dir(), &exists);
             if let Resolution::Found(target) = &resolution {
                 let target = target.clone();
                 children.insert(target.clone());
@@ -978,7 +1000,7 @@ pub mod tests {
 
     fn vars(text: &str) -> LiteralVariables {
         let mut vars = LiteralVariables::default();
-        vars.add(&Makefile::parse(text).tree());
+        vars.add(&Makefile::parse(text).tree(), MakefileVariant::GNUMake);
         vars
     }
 
@@ -1000,28 +1022,79 @@ pub mod tests {
         let v = vars("TOP = ../top\nT = t\n");
         let cwd = Path::new("/src");
         assert_eq!(
-            expand("$(TOP)/rules.mk", &v, Some(cwd)),
+            expand("$(TOP)/rules.mk", &v, MakefileVariant::GNUMake, Some(cwd)),
             Some("../top/rules.mk".to_string())
         );
         assert_eq!(
-            expand("${TOP}/x", &v, Some(cwd)),
+            expand("${TOP}/x", &v, MakefileVariant::GNUMake, Some(cwd)),
             Some("../top/x".to_string())
         );
         assert_eq!(
-            expand("$(CURDIR)/x.mk", &v, Some(cwd)),
+            expand("$(CURDIR)/x.mk", &v, MakefileVariant::GNUMake, Some(cwd)),
             Some("/src/x.mk".to_string())
         );
-        assert_eq!(expand("$(OTHER)/x.mk", &v, Some(cwd)), None);
-        assert_eq!(expand("$(wildcard x)", &v, Some(cwd)), None);
-        assert_eq!(expand("*.mk", &v, Some(cwd)), None);
-        assert_eq!(expand("$@", &v, Some(cwd)), None);
-        assert_eq!(expand("$T/x.mk", &v, Some(cwd)), Some("t/x.mk".to_string()));
-        assert_eq!(expand("$$T/x.mk", &v, Some(cwd)), None);
-        assert_eq!(expand("$(TOP:%=%/)x.mk", &v, Some(cwd)), None);
-        assert_eq!(expand("$(TOP", &v, Some(cwd)), None);
-        assert_eq!(expand("$(TO P)", &v, Some(cwd)), None);
-        assert_eq!(expand("$(T$(T))", &v, Some(cwd)), None);
-        assert_eq!(expand("x.mk$", &v, Some(cwd)), None);
+        assert_eq!(
+            expand("$(OTHER)/x.mk", &v, MakefileVariant::GNUMake, Some(cwd)),
+            None
+        );
+        assert_eq!(
+            expand("$(wildcard x)", &v, MakefileVariant::GNUMake, Some(cwd)),
+            None
+        );
+        assert_eq!(
+            expand("*.mk", &v, MakefileVariant::GNUMake, Some(cwd)),
+            None
+        );
+        assert_eq!(expand("$@", &v, MakefileVariant::GNUMake, Some(cwd)), None);
+        assert_eq!(
+            expand("$T/x.mk", &v, MakefileVariant::GNUMake, Some(cwd)),
+            Some("t/x.mk".to_string())
+        );
+        assert_eq!(
+            expand("$$T/x.mk", &v, MakefileVariant::GNUMake, Some(cwd)),
+            None
+        );
+        assert_eq!(
+            expand("$(TOP:%=%/)x.mk", &v, MakefileVariant::GNUMake, Some(cwd)),
+            None
+        );
+        assert_eq!(
+            expand("$(TOP", &v, MakefileVariant::GNUMake, Some(cwd)),
+            None
+        );
+        assert_eq!(
+            expand("$(TO P)", &v, MakefileVariant::GNUMake, Some(cwd)),
+            None
+        );
+        assert_eq!(
+            expand("$(T$(T))", &v, MakefileVariant::GNUMake, Some(cwd)),
+            None
+        );
+        assert_eq!(
+            expand("x.mk$", &v, MakefileVariant::GNUMake, Some(cwd)),
+            None
+        );
+    }
+
+    #[test]
+    fn test_literal_variables_variant() {
+        let mut v = LiteralVariables::default();
+        let parsed = Makefile::parse_with_variant("X = a^#b\n", MakefileVariant::NMake);
+        v.add(&parsed.tree(), MakefileVariant::NMake);
+        assert_eq!(v.get("X"), Some("a#b"));
+    }
+
+    #[test]
+    fn test_expand_variant() {
+        let v = vars("TOP = ../top\n");
+        assert_eq!(
+            expand("${TOP:}/x.mk", &v, MakefileVariant::BSDMake, None),
+            Some("../top/x.mk".to_string())
+        );
+        assert_eq!(
+            expand("${TOP:}/x.mk", &v, MakefileVariant::GNUMake, None),
+            None
+        );
     }
 
     #[test]
@@ -1048,6 +1121,7 @@ pub mod tests {
             resolve_include(
                 &gnu_path("x.mk"),
                 &v,
+                MakefileVariant::GNUMake,
                 Some(Path::new("/top")),
                 Some(Path::new("/top/sub")),
                 &exists
@@ -1058,6 +1132,7 @@ pub mod tests {
             resolve_include(
                 &gnu_path("x.mk"),
                 &v,
+                MakefileVariant::GNUMake,
                 Some(Path::new("/elsewhere")),
                 Some(Path::new("/top/sub")),
                 &exists
@@ -1068,6 +1143,7 @@ pub mod tests {
             resolve_include(
                 &gnu_path("y.mk"),
                 &v,
+                MakefileVariant::GNUMake,
                 Some(Path::new("/top")),
                 None,
                 &exists
@@ -1075,7 +1151,14 @@ pub mod tests {
             Resolution::Missing(PathBuf::from("/top/y.mk"))
         );
         assert_eq!(
-            resolve_include(&gnu_path("y.mk"), &v, None, None, &exists),
+            resolve_include(
+                &gnu_path("y.mk"),
+                &v,
+                MakefileVariant::GNUMake,
+                None,
+                None,
+                &exists
+            ),
             Resolution::Unresolved
         );
     }
@@ -1092,6 +1175,7 @@ pub mod tests {
                 .map(|p| resolve_include(
                     p,
                     &LiteralVariables::default(),
+                    MakefileVariant::BSDMake,
                     Some(Path::new("/top")),
                     None,
                     &exists
