@@ -76,6 +76,7 @@ Each diagnostic carries a code, so it can be identified in editors:
 | `orphan-recipe-line` | error | recipe line outside of any rule |
 | `invalid-shell-syntax` | warning | recipe line rejected by `sh -n` (or the shell `SHELL` names); checked on open and save only |
 | `unterminated-conditional` | error | `ifdef`/`ifeq` without a matching `endif` |
+| `malformed-condition` | error | BSD make `.if` or nmake `!IF` condition that does not parse |
 | `include-missing-path` | error | `include` without a path |
 | `missing-include-file` | warning | `include` of a file that does not exist |
 | `unreadable-include-file` | warning | `include` of a file that exists but cannot be read |

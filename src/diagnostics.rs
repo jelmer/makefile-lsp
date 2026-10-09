@@ -184,6 +184,7 @@ fn collect_diagnostics(
     diagnostics.extend(check_shell_in_recursive_assignment(source_text, &makefile));
     diagnostics.extend(check_empty_automatic_variables(source_text, &makefile));
     diagnostics.extend(check_unterminated_conditionals(source_text, &makefile));
+    diagnostics.extend(check_malformed_conditions(source_text, &makefile));
     diagnostics.extend(check_unused_variables(source_text, &makefile, external));
     diagnostics.extend(check_mixed_assignment_operators(source_text, &makefile));
     diagnostics.extend(check_empty_rule_probably_phony(
@@ -705,13 +706,11 @@ fn tested_variables(branch: &ConditionalBranch) -> Vec<String> {
         // A bare word is a variable name for these, but a target for
         // `.ifmake`.
         Some(ConditionalKind::BsdIf | ConditionalKind::BsdIfdef | ConditionalKind::BsdIfndef) => {
-            // TODO: report conditions that fail to parse.
             if let Some(Ok(condition)) = branch.bsd_condition() {
                 bsd_tested_variables(&condition, &mut names);
             }
         }
         Some(ConditionalKind::NmakeIf) => {
-            // TODO: report conditions that fail to parse.
             if let Some(Ok(condition)) = branch.nmake_condition() {
                 nmake_tested_variables(&condition, &mut names);
             }
@@ -1027,6 +1026,32 @@ fn check_unterminated_conditionals(source_text: &str, makefile: &Makefile) -> Ve
     }
 
     diagnostics
+}
+
+/// Check for BSD make `.if` and nmake `!IF` conditions that don't parse.
+fn check_malformed_conditions(source_text: &str, makefile: &Makefile) -> Vec<Diagnostic> {
+    makefile
+        .all_conditionals()
+        .flat_map(|cond| cond.branches().collect::<Vec<_>>())
+        .filter_map(|branch| {
+            let message = match (branch.bsd_condition(), branch.nmake_condition()) {
+                (Some(Err(error)), _) => error.message,
+                (_, Some(Err(error))) => error.message,
+                _ => return None,
+            };
+            let range = branch.condition_range()?;
+            // The parser already reports a missing condition.
+            if range.is_empty() {
+                return None;
+            }
+            Some(make_diagnostic(
+                text_range_to_lsp_range(source_text, range),
+                DiagnosticSeverity::ERROR,
+                "malformed-condition",
+                format!("malformed condition: {message}"),
+            ))
+        })
+        .collect()
 }
 
 /// Check for `$(shell ...)` inside a recursively-expanded (`=`) assignment.
@@ -3577,6 +3602,74 @@ endif
             Range::new(Position::new(0, 0), Position::new(1, 0))
         );
         assert_eq!(unt[0].severity, Some(DiagnosticSeverity::ERROR));
+    }
+
+    fn malformed_conditions(parsed: &Parse<Makefile>, text: &str) -> Vec<(Range, String)> {
+        get_diagnostics(text, parsed, None)
+            .into_iter()
+            .filter(|d| d.code == Some(NumberOrString::String("malformed-condition".to_string())))
+            .map(|d| (d.range, d.message))
+            .collect()
+    }
+
+    fn lsp_range(line: u32, start: u32, end: u32) -> Range {
+        Range::new(Position::new(line, start), Position::new(line, end))
+    }
+
+    #[test]
+    fn test_malformed_bsd_condition() {
+        let text = ".if a & b\nX = 1\n.elif (x\n.endif\n";
+        assert_eq!(
+            malformed_conditions(&Makefile::parse(text), text),
+            vec![
+                (
+                    lsp_range(0, 4, 9),
+                    "malformed condition: unknown operator \"&\"".to_string()
+                ),
+                (
+                    lsp_range(2, 6, 8),
+                    "malformed condition: unclosed \"(\"".to_string()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_malformed_bsd_ifdef_condition() {
+        let text = ".ifdef A ||\n.endif\n";
+        assert_eq!(
+            malformed_conditions(&Makefile::parse(text), text),
+            vec![(
+                lsp_range(0, 7, 11),
+                "malformed condition: missing operand".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn test_malformed_nmake_condition() {
+        let text = "!IF $(X) ==\n!ELSEIF DEFINED(X)\n!ENDIF\n";
+        let parsed = Makefile::parse_with_variant(text, MakefileVariant::NMake);
+        assert_eq!(
+            malformed_conditions(&parsed, text),
+            vec![(
+                lsp_range(0, 4, 11),
+                "malformed condition: Missing operand".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn test_well_formed_conditions_ok() {
+        let text = ".if defined(A) && ${B} == 1\n.elifdef C\n.endif\nifdef D\nendif\n";
+        assert_eq!(malformed_conditions(&Makefile::parse(text), text), vec![]);
+    }
+
+    #[test]
+    fn test_missing_condition_not_double_flagged() {
+        // The parser already reports a missing condition.
+        let text = ".if\n.endif\n";
+        assert_eq!(malformed_conditions(&Makefile::parse(text), text), vec![]);
     }
 
     fn missing_phony_diags(text: &str, dir: &std::path::Path) -> Vec<Diagnostic> {
