@@ -58,8 +58,8 @@ Each diagnostic carries a code, so it can be identified in editors:
 | `automatic-variable-outside-recipe` | warning | automatic variable like `$@` in a target list, prerequisite list, `:=` assignment or conditional, where it is always empty |
 | `unused-variable` | hint | variable that is assigned but never referenced |
 | `mixed-assignment-operators` | warning | variable assigned with both `=` and `:=` |
-| `shell-in-recursive-assignment` | warning | `$(shell ...)` in an `=` assignment, which runs on every expansion |
-| `trailing-whitespace-in-value` | warning | trailing whitespace that becomes part of a variable value |
+| `shell-in-recursive-assignment` | warning | `$(shell ...)` in an `=` assignment, which runs on every expansion (GNU make only) |
+| `trailing-whitespace-in-value` | warning | trailing whitespace that becomes part of a variable value (not for BSD make, which strips it) |
 | `duplicate-target` | warning | target defined by more than one single-colon rule |
 | `mixed-rule-separator` | error | target with both `:` and `::` rules |
 | `self-dependency` | warning | target that lists itself as a prerequisite |
@@ -80,6 +80,9 @@ Each diagnostic carries a code, so it can be identified in editors:
 | `include-missing-path` | error | `include` without a path |
 | `missing-include-file` | warning | `include` of a file that does not exist |
 | `unreadable-include-file` | warning | `include` of a file that exists but cannot be read |
+
+nmake has no `.PHONY`, so the checks for phony targets are skipped for nmake
+makefiles.
 
 ### Code actions
 

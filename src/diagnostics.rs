@@ -168,30 +168,41 @@ fn collect_diagnostics(
     diagnostics.extend(check_circular_dependencies(source_text, &makefile));
     diagnostics.extend(check_duplicate_targets(source_text, &makefile));
     diagnostics.extend(check_mixed_rule_separators(source_text, &makefile));
-    diagnostics.extend(check_missing_phony_targets(
-        source_text,
-        &makefile,
-        external,
-    ));
-    diagnostics.extend(check_unused_phony_targets(source_text, &makefile, external));
+    // nmake has no .PHONY: a target that is not a file is always built.
+    let has_phony = variant != MakefileVariant::NMake;
+    if has_phony {
+        diagnostics.extend(check_missing_phony_targets(
+            source_text,
+            &makefile,
+            external,
+        ));
+        diagnostics.extend(check_unused_phony_targets(source_text, &makefile, external));
+    }
     diagnostics.extend(check_include_missing_path(source_text, &makefile));
-    diagnostics.extend(check_trailing_whitespace_in_value(source_text, &makefile));
+    // BSD make strips trailing whitespace from variable values.
+    if variant != MakefileVariant::BSDMake {
+        diagnostics.extend(check_trailing_whitespace_in_value(source_text, &makefile));
+    }
     diagnostics.extend(check_duplicate_prerequisites(source_text, &makefile));
     diagnostics.extend(check_redundant_transitive_prerequisites(
         source_text,
         &makefile,
     ));
-    diagnostics.extend(check_shell_in_recursive_assignment(source_text, &makefile));
+    if variant == MakefileVariant::GNUMake {
+        diagnostics.extend(check_shell_in_recursive_assignment(source_text, &makefile));
+    }
     diagnostics.extend(check_empty_automatic_variables(source_text, &makefile));
     diagnostics.extend(check_unterminated_conditionals(source_text, &makefile));
     diagnostics.extend(check_malformed_conditions(source_text, &makefile));
     diagnostics.extend(check_unused_variables(source_text, &makefile, external));
     diagnostics.extend(check_mixed_assignment_operators(source_text, &makefile));
-    diagnostics.extend(check_empty_rule_probably_phony(
-        source_text,
-        &makefile,
-        external,
-    ));
+    if has_phony {
+        diagnostics.extend(check_empty_rule_probably_phony(
+            source_text,
+            &makefile,
+            external,
+        ));
+    }
     diagnostics.extend(check_include_files(source_text, includes));
     diagnostics.extend(check_automatic_variable_outside_recipe(
         source_text,
@@ -199,7 +210,9 @@ fn collect_diagnostics(
         variant,
     ));
     if let Some(dir) = base_dir {
-        diagnostics.extend(check_missing_phony(source_text, &makefile, external, dir));
+        if has_phony {
+            diagnostics.extend(check_missing_phony(source_text, &makefile, external, dir));
+        }
         diagnostics.extend(check_unresolved_prerequisites(
             source_text,
             &makefile,
@@ -4418,6 +4431,76 @@ endif
                  an immediately-expanded assignment"
                     .to_string()
             ]
+        );
+    }
+
+    /// Codes of the diagnostics for `text`, which `Makefile::parse` detects
+    /// as an nmake makefile.
+    fn nmake_codes(text: &str, dir: &std::path::Path) -> Vec<String> {
+        let parsed = Makefile::parse(text);
+        assert_eq!(parsed.variant(), Some(MakefileVariant::NMake));
+        get_diagnostics(text, &parsed, Some(dir))
+            .into_iter()
+            .filter_map(|d| d.code)
+            .map(|c| match c {
+                NumberOrString::String(s) => s,
+                NumberOrString::Number(n) => n.to_string(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_nmake_no_phony_checks() {
+        // nmake has no .PHONY; a target that is not a file is always built.
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            nmake_codes(
+                "!IFDEF X\n!ENDIF\nall: clean\nclean:\n\tdel x\nempty:\n",
+                dir.path()
+            ),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            nmake_codes(
+                "!IFDEF X\n!ENDIF\n.PHONY: missing unused\nunused:\n",
+                dir.path()
+            ),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn test_nmake_shell_not_flagged() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            nmake_codes(
+                "!IFDEF X\n!ENDIF\nS = $(shell ls)\nall:\n\techo $(S)\n",
+                dir.path()
+            ),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn test_bsd_shell_not_flagged() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            bsd_messages(
+                "S = $(shell ls)\n",
+                dir.path(),
+                "shell-in-recursive-assignment"
+            ),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn test_bsd_trailing_whitespace_not_flagged() {
+        // BSD make strips trailing whitespace from the value.
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            bsd_messages("A = b  \n", dir.path(), "trailing-whitespace-in-value"),
+            Vec::<String>::new()
         );
     }
 }
