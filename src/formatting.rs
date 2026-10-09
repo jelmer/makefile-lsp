@@ -13,8 +13,7 @@
 use std::borrow::Cow;
 use std::collections::HashSet;
 
-use makefile_lossless::{Makefile, Parse, SyntaxKind};
-use rowan::ast::AstNode;
+use makefile_lossless::{Makefile, Parse};
 use text_size::{TextRange, TextSize};
 use tower_lsp_server::ls_types::{Range, TextEdit};
 
@@ -121,6 +120,12 @@ fn compute_edits(parsed: &Parse<Makefile>, text: &str) -> Result<Vec<ByteEdit>, 
     // single script and could contain e.g. here-documents, so leave it alone.
     let oneshell = makefile.rules_by_target(".ONESHELL").next().is_some();
     let continued = continued_line_starts(&makefile);
+    let recipes: Vec<TextRange> = makefile.recipe_nodes().map(|r| r.text_range()).collect();
+    // This includes target-specific assignments (`target: VAR = value `).
+    let definitions: Vec<TextRange> = makefile
+        .variable_definitions()
+        .map(|d| d.text_range())
+        .collect();
 
     // The conversion only changes the start of lines, so the trailing
     // whitespace of each line is the same in both texts.
@@ -141,7 +146,8 @@ fn compute_edits(parsed: &Parse<Makefile>, text: &str) -> Result<Vec<ByteEdit>, 
         if ws_start < line_end
             && !text[..ws_start].ends_with('\\')
             && may_trim(
-                &makefile,
+                &recipes,
+                &definitions,
                 &continued,
                 converted_start,
                 converted_ws_start,
@@ -216,37 +222,22 @@ fn continued_line_starts(makefile: &Makefile) -> HashSet<TextSize> {
     makefile.line_continuations().map(|r| r.end()).collect()
 }
 
-/// Whether the trailing whitespace at `ws_start` can be removed.
+/// Whether the trailing whitespace at `ws_start` can be removed, given the
+/// ranges of the recipes and variable definitions.
 fn may_trim(
-    makefile: &Makefile,
+    recipes: &[TextRange],
+    definitions: &[TextRange],
     continued: &HashSet<TextSize>,
     line_start: usize,
     ws_start: usize,
     oneshell: bool,
 ) -> bool {
-    let Some(token) = makefile
-        .syntax()
-        .token_at_offset(TextSize::from(ws_start as u32))
-        .right_biased()
-    else {
+    let offset = TextSize::from(ws_start as u32);
+    if recipes.iter().any(|range| range.contains(offset)) {
+        return !oneshell;
+    }
+    if definitions.iter().any(|range| range.contains(offset)) {
         return false;
-    };
-    for node in token.parent_ancestors() {
-        match node.kind() {
-            SyntaxKind::RECIPE => return !oneshell,
-            SyntaxKind::VARIABLE => return false,
-            // Target-specific variable assignments (`target: VAR = value `)
-            // are parsed as prerequisites; their trailing whitespace is part
-            // of the value.
-            SyntaxKind::PREREQUISITES
-                if node
-                    .children_with_tokens()
-                    .any(|c| c.kind() == SyntaxKind::OPERATOR) =>
-            {
-                return false
-            }
-            _ => {}
-        }
     }
     // A continued line outside of a recipe may be part of a variable value.
     !continued.contains(&TextSize::from(line_start as u32))
@@ -443,6 +434,12 @@ mod tests {
             "# c  \nall: foo  \n\techo hi \t\n",
             "# c\nall: foo\n\techo hi\n",
         );
+    }
+
+    #[test]
+    fn test_trims_order_only_prerequisites() {
+        assert_formats("all: a | b  \n", "all: a | b\n");
+        assert_formats("all: | b \n", "all: | b\n");
     }
 
     #[test]
