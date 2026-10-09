@@ -3654,7 +3654,7 @@ endif
             malformed_conditions(&parsed, text),
             vec![(
                 lsp_range(0, 4, 11),
-                "malformed condition: Missing operand".to_string()
+                "malformed condition: missing operand".to_string()
             )]
         );
     }
