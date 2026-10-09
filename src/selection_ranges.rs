@@ -58,6 +58,7 @@ fn enclosing_ranges(makefile: &Makefile, offset: TextSize) -> Vec<TextRange> {
             items.push(branch.text_range());
             parts.push(branch.directive_range());
             parts.extend(branch.keyword_range());
+            parts.extend(branch.condition_range());
         }
         parts.extend(cond.endif_range());
     }
@@ -209,6 +210,19 @@ mod tests {
                 (0, 0, 5, 0),
                 (0, 0, 6, 0)
             ]
+        );
+    }
+
+    #[test]
+    fn test_selection_range_in_condition() {
+        let text = "ifeq ($(A),b) # c\nX = 1\nelse ifdef B\nendif\n";
+        assert_eq!(
+            chain(text, Position::new(0, 11)),
+            vec![(0, 5, 0, 13), (0, 0, 0, 17), (0, 0, 2, 0), (0, 0, 4, 0)]
+        );
+        assert_eq!(
+            chain(text, Position::new(2, 11)),
+            vec![(2, 11, 2, 12), (2, 0, 2, 12), (2, 0, 3, 0), (0, 0, 4, 0)]
         );
     }
 
