@@ -7,7 +7,6 @@ use std::path::Path;
 use makefile_lossless::{
     Makefile, MakefileVariant, Parse, ReferenceLocation, SyntaxKind, TextSize, VariableReference,
 };
-use rowan::ast::AstNode;
 use tower_lsp_server::ls_types::{
     CodeAction, CodeActionKind, Diagnostic, NumberOrString, Position, Range, TextEdit, Uri,
     WorkspaceEdit,
@@ -583,10 +582,11 @@ fn add_missing_endef_action(
 ) -> Option<CodeAction> {
     let offset = text_size::TextSize::from(byte_offset as u32);
 
-    let mut define = parsed.tree().variable_definitions().find(|v| {
-        v.is_define() && !v.has_endef() && v.syntax().text_range().contains_inclusive(offset)
-    })?;
-    let original_range = define.syntax().text_range();
+    let mut define = parsed
+        .tree()
+        .variable_definitions()
+        .find(|v| v.is_define() && !v.has_endef() && v.text_range().contains_inclusive(offset))?;
+    let original_range = define.text_range();
     if !define.add_endef().expect("a define block") {
         return None;
     }
