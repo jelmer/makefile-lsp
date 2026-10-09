@@ -51,15 +51,15 @@ Each diagnostic carries a code, so it can be identified in editors:
 
 | Code | Severity | Description |
 |------|----------|-------------|
-| `undefined-variable` | warning | reference to a variable that is never assigned |
+| `undefined-variable` | warning | reference to a variable that is never assigned and not built in (for nmake, its predefined and filename macros) |
 | `recursive-variable-reference` | warning | `=` assignment that references itself |
 | `empty-variable-reference` | warning | `$()` or `${}` |
 | `empty-automatic-variable` | warning | `$<`, `$^`, `$+` or `$?` in a rule without prerequisites, or `$*` outside a pattern rule |
-| `automatic-variable-outside-recipe` | warning | automatic variable like `$@` in a target list, prerequisite list, `:=` assignment or conditional, where it is always empty |
+| `automatic-variable-outside-recipe` | warning | automatic variable like `$@` in a target list, prerequisite list, `:=` assignment or conditional, where it is always empty (BSD make sets `$@`, `$*` and `$%` in prerequisites, and does not expand them in `:=` assignments) |
 | `unused-variable` | hint | variable that is assigned but never referenced |
 | `mixed-assignment-operators` | warning | variable assigned with both `=` and `:=` |
-| `shell-in-recursive-assignment` | warning | `$(shell ...)` in an `=` assignment, which runs on every expansion |
-| `trailing-whitespace-in-value` | warning | trailing whitespace that becomes part of a variable value |
+| `shell-in-recursive-assignment` | warning | `$(shell ...)` in an `=` assignment, which runs on every expansion (GNU make only) |
+| `trailing-whitespace-in-value` | warning | trailing whitespace that becomes part of a variable value (not for BSD make, which strips it) |
 | `duplicate-target` | warning | target defined by more than one single-colon rule |
 | `mixed-rule-separator` | error | target with both `:` and `::` rules |
 | `self-dependency` | warning | target that lists itself as a prerequisite |
@@ -80,6 +80,9 @@ Each diagnostic carries a code, so it can be identified in editors:
 | `include-missing-path` | error | `include` without a path |
 | `missing-include-file` | warning | `include` of a file that does not exist |
 | `unreadable-include-file` | warning | `include` of a file that exists but cannot be read |
+
+nmake has no `.PHONY`, so the checks for phony targets are skipped for nmake
+makefiles.
 
 ### Code actions
 

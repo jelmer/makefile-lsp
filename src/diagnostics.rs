@@ -157,7 +157,12 @@ fn collect_diagnostics(
 
     let makefile = parsed.tree();
     let variant = parsed_variant(parsed);
-    diagnostics.extend(check_undefined_variables(source_text, &makefile, external));
+    diagnostics.extend(check_undefined_variables(
+        source_text,
+        &makefile,
+        variant,
+        external,
+    ));
     diagnostics.extend(check_recursive_variable_self_reference(
         source_text,
         &makefile,
@@ -167,30 +172,41 @@ fn collect_diagnostics(
     diagnostics.extend(check_circular_dependencies(source_text, &makefile));
     diagnostics.extend(check_duplicate_targets(source_text, &makefile));
     diagnostics.extend(check_mixed_rule_separators(source_text, &makefile));
-    diagnostics.extend(check_missing_phony_targets(
-        source_text,
-        &makefile,
-        external,
-    ));
-    diagnostics.extend(check_unused_phony_targets(source_text, &makefile, external));
+    // nmake has no .PHONY: a target that is not a file is always built.
+    let has_phony = variant != MakefileVariant::NMake;
+    if has_phony {
+        diagnostics.extend(check_missing_phony_targets(
+            source_text,
+            &makefile,
+            external,
+        ));
+        diagnostics.extend(check_unused_phony_targets(source_text, &makefile, external));
+    }
     diagnostics.extend(check_include_missing_path(source_text, &makefile));
-    diagnostics.extend(check_trailing_whitespace_in_value(source_text, &makefile));
+    // BSD make strips trailing whitespace from variable values.
+    if variant != MakefileVariant::BSDMake {
+        diagnostics.extend(check_trailing_whitespace_in_value(source_text, &makefile));
+    }
     diagnostics.extend(check_duplicate_prerequisites(source_text, &makefile));
     diagnostics.extend(check_redundant_transitive_prerequisites(
         source_text,
         &makefile,
     ));
-    diagnostics.extend(check_shell_in_recursive_assignment(source_text, &makefile));
+    if variant == MakefileVariant::GNUMake {
+        diagnostics.extend(check_shell_in_recursive_assignment(source_text, &makefile));
+    }
     diagnostics.extend(check_empty_automatic_variables(source_text, &makefile));
     diagnostics.extend(check_unterminated_conditionals(source_text, &makefile));
     diagnostics.extend(check_malformed_conditions(source_text, &makefile));
     diagnostics.extend(check_unused_variables(source_text, &makefile, external));
     diagnostics.extend(check_mixed_assignment_operators(source_text, &makefile));
-    diagnostics.extend(check_empty_rule_probably_phony(
-        source_text,
-        &makefile,
-        external,
-    ));
+    if has_phony {
+        diagnostics.extend(check_empty_rule_probably_phony(
+            source_text,
+            &makefile,
+            external,
+        ));
+    }
     diagnostics.extend(check_include_files(source_text, includes));
     diagnostics.extend(check_automatic_variable_outside_recipe(
         source_text,
@@ -198,7 +214,9 @@ fn collect_diagnostics(
         variant,
     ));
     if let Some(dir) = base_dir {
-        diagnostics.extend(check_missing_phony(source_text, &makefile, external, dir));
+        if has_phony {
+            diagnostics.extend(check_missing_phony(source_text, &makefile, external, dir));
+        }
         diagnostics.extend(check_unresolved_prerequisites(
             source_text,
             &makefile,
@@ -245,6 +263,7 @@ fn parse_error_diagnostic(source_text: &str, error: &PositionedParseError) -> Di
 fn check_undefined_variables(
     source_text: &str,
     makefile: &Makefile,
+    variant: MakefileVariant,
     external: &ExternalSymbols,
 ) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
@@ -265,7 +284,12 @@ fn check_undefined_variables(
         let Some(name) = var_ref.name() else {
             continue;
         };
-        if builtins::is_known_variable(&name) || defined_vars.contains(&name) {
+        // TODO: know the variables BSD make defines, such as .CURDIR.
+        let known = match variant {
+            MakefileVariant::NMake => builtins::is_nmake_known_macro(&name),
+            _ => builtins::is_known_variable(&name),
+        };
+        if known || defined_vars.contains(&name) {
             continue;
         }
         let range = text_range_to_lsp_range(source_text, var_ref.text_range());
@@ -1487,6 +1511,10 @@ fn has_file_with_same_stem(path: &std::path::Path) -> bool {
 /// variables and `define` bodies may be expanded later in a recipe, and
 /// arguments to `$(eval)` and `$(call)` usually build text that is, so those
 /// are left alone.
+///
+/// BSD make sets `$@` (`.TARGET`), `$*` (`.PREFIX`) and `$%` (`.MEMBER`) in
+/// prerequisites too, and leaves references to undefined variables in a
+/// `:=` assignment unexpanded.
 fn check_automatic_variable_outside_recipe(
     source_text: &str,
     makefile: &Makefile,
@@ -1501,10 +1529,13 @@ fn check_automatic_variable_outside_recipe(
         .variable_references()
         .filter_map(|var_ref| {
             let text = var_ref.to_string();
-            if !is_automatic_variable_reference(&text, variant) {
-                return None;
-            }
-            let context = immediate_expansion_context(&var_ref, second_expansion)?;
+            let name = automatic_variable_name(&text, variant)?;
+            // TODO: nmake's `$$@` is the target on a dependency line, but its
+            // reference can't be told apart from a plain `$@` yet.
+            let set_in_prerequisites = second_expansion
+                || variant == MakefileVariant::NMake
+                || (variant == MakefileVariant::BSDMake && matches!(name, '@' | '*' | '%'));
+            let context = immediate_expansion_context(&var_ref, set_in_prerequisites, variant)?;
             Some(make_diagnostic(
                 text_range_to_lsp_range(source_text, var_ref.text_range()),
                 DiagnosticSeverity::WARNING,
@@ -1518,28 +1549,27 @@ fn check_automatic_variable_outside_recipe(
         .collect()
 }
 
-/// Is `text` a reference to an automatic variable, such as `$@`, `$(<)`,
-/// `${@D}` or `$(@:.c=.o)`?
-fn is_automatic_variable_reference(text: &str, variant: MakefileVariant) -> bool {
-    let Ok(reference) = ParsedReference::parse(text, variant) else {
-        return false;
-    };
+/// If `text` is a reference to an automatic variable, such as `$@`, `$(<)`,
+/// `${@D}` or `$(@:.c=.o)`, the character naming the variable.
+fn automatic_variable_name(text: &str, variant: MakefileVariant) -> Option<char> {
+    let reference = ParsedReference::parse(text, variant).ok()?;
     let mut chars = reference.name.chars();
-    reference
+    let name = chars
+        .next()
+        .filter(|c| matches!(c, '@' | '<' | '^' | '?' | '*' | '+' | '|' | '%'))?;
+    let only_substitutions = reference
         .modifiers
         .iter()
-        .all(|m| matches!(m, Modifier::SysVSubstitute { .. }))
-        && chars
-            .next()
-            .is_some_and(|c| matches!(c, '@' | '<' | '^' | '?' | '*' | '+' | '|' | '%'))
-        && matches!(chars.as_str(), "" | "D" | "F")
+        .all(|m| matches!(m, Modifier::SysVSubstitute { .. }));
+    (only_substitutions && matches!(chars.as_str(), "" | "D" | "F")).then_some(name)
 }
 
 /// Describe the immediately-expanded context `var_ref` sits in, or `None` if
 /// it may be expanded later (or we can't tell).
 fn immediate_expansion_context(
     var_ref: &VariableReference,
-    second_expansion: bool,
+    set_in_prerequisites: bool,
+    variant: MakefileVariant,
 ) -> Option<&'static str> {
     let mut current = var_ref.clone();
     loop {
@@ -1554,7 +1584,7 @@ fn immediate_expansion_context(
             }
             ReferenceLocation::Target(_) => return Some("a target list"),
             ReferenceLocation::Prerequisite(_) => {
-                return (!second_expansion).then_some("a prerequisite list");
+                return (!set_in_prerequisites).then_some("a prerequisite list");
             }
             ReferenceLocation::VariableName(var_def)
             | ReferenceLocation::VariableValue(var_def) => {
@@ -1562,7 +1592,11 @@ fn immediate_expansion_context(
                     return None;
                 }
                 let op = var_def.assignment_operator()?;
-                let immediate = matches!(op.as_str(), ":=" | "::=" | ":::=" | "!=");
+                let immediate = match op.as_str() {
+                    ":=" => variant != MakefileVariant::BSDMake,
+                    "::=" | ":::=" | "!=" => true,
+                    _ => false,
+                };
                 return immediate.then_some("an immediately-expanded assignment");
             }
             ReferenceLocation::Condition(_) => return Some("a conditional directive"),
@@ -4342,7 +4376,7 @@ endif
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(
             bsd_messages(
-                "X := ${@:}\n",
+                "X != echo ${@:}\n",
                 dir.path(),
                 "automatic-variable-outside-recipe"
             ),
@@ -4351,6 +4385,141 @@ endif
                  an immediately-expanded assignment"
                     .to_string()
             ]
+        );
+    }
+
+    /// Codes of the diagnostics for `text`, which `Makefile::parse` detects
+    /// as an nmake makefile.
+    fn nmake_codes(text: &str, dir: &std::path::Path) -> Vec<String> {
+        let parsed = Makefile::parse(text);
+        assert_eq!(parsed.variant(), Some(MakefileVariant::NMake));
+        get_diagnostics(text, &parsed, Some(dir))
+            .into_iter()
+            .filter_map(|d| d.code)
+            .map(|c| match c {
+                NumberOrString::String(s) => s,
+                NumberOrString::Number(n) => n.to_string(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_nmake_no_phony_checks() {
+        // nmake has no .PHONY; a target that is not a file is always built.
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            nmake_codes(
+                "!IFDEF X\n!ENDIF\nall: clean\nclean:\n\tdel x\nempty:\n",
+                dir.path()
+            ),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            nmake_codes(
+                "!IFDEF X\n!ENDIF\n.PHONY: missing unused\nunused:\n",
+                dir.path()
+            ),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn test_nmake_shell_not_flagged() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            nmake_codes(
+                "!IFDEF X\n!ENDIF\nS = $(shell ls)\nall:\n\techo $(S)\n",
+                dir.path()
+            ),
+            // nmake has no functions, so `$(shell ls)` is not a call.
+            vec!["undefined-variable".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_bsd_shell_not_flagged() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            bsd_messages(
+                "S = $(shell ls)\n",
+                dir.path(),
+                "shell-in-recursive-assignment"
+            ),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn test_bsd_trailing_whitespace_not_flagged() {
+        // BSD make strips trailing whitespace from the value.
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            bsd_messages("A = b  \n", dir.path(), "trailing-whitespace-in-value"),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn test_bsd_target_variables_in_prerequisites() {
+        // BSD make sets .TARGET, .PREFIX, .ARCHIVE and .MEMBER for the
+        // sources of a dependency line, but not .IMPSRC.
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            bsd_messages(
+                "all: $@.c $(@F).h $*.o $<.x\n",
+                dir.path(),
+                "automatic-variable-outside-recipe"
+            ),
+            vec![
+                "automatic variable '$<' is only set in recipes and is empty in \
+                 a prerequisite list"
+                    .to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn test_bsd_automatic_variable_in_immediate_assignment() {
+        // BSD make does not expand references to undefined variables in a
+        // `:=` assignment, so they are expanded when the variable is used.
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            bsd_messages(
+                "X := $@ $<\n",
+                dir.path(),
+                "automatic-variable-outside-recipe"
+            ),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn test_nmake_target_as_dependent() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            nmake_codes(
+                "!IFDEF X\n!ENDIF\na.obj: $$@.c $$(@F).h\n\tcl $**\n",
+                dir.path()
+            ),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn test_nmake_predefined_macros() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = "!IFDEF X\n!ENDIF\nD = $(MAKEDIR) $(CFLAGS) $(RFLAGS) $(CURDIR)\n\
+                    all: $$(@B).c\n\techo $(D)\n";
+        let parsed = Makefile::parse(text);
+        assert_eq!(parsed.variant(), Some(MakefileVariant::NMake));
+        let messages: Vec<String> = get_diagnostics(text, &parsed, Some(dir.path()))
+            .into_iter()
+            .filter(|d| d.code == Some(NumberOrString::String("undefined-variable".to_string())))
+            .map(|d| d.message)
+            .collect();
+        assert_eq!(
+            messages,
+            vec!["variable 'CURDIR' is not defined".to_string()]
         );
     }
 }
