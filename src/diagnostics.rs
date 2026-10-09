@@ -3,9 +3,9 @@
 use std::collections::{HashMap, HashSet};
 
 use makefile_lossless::{
-    BsdCondition, BsdFunction, ConditionalBranch, ConditionalKind, Makefile, MakefileItem,
-    MakefileVariant, Modifier, NmakeCondition, Parse, ParseErrorKind, ParsedReference,
-    PositionedParseError, ReferenceLocation, Rule, TextRange, VariableReference,
+    BsdCondition, BsdFunction, ConditionalBranch, ConditionalKind, Makefile, MakefileVariant,
+    Modifier, NmakeCondition, Parse, ParseErrorKind, ParsedReference, PositionedParseError,
+    ReferenceLocation, Rule, TextRange, VariableReference,
 };
 use tower_lsp_server::ls_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Range};
 
@@ -591,18 +591,16 @@ fn check_unused_phony_targets(
 fn check_include_missing_path(source_text: &str, makefile: &Makefile) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
 
-    for item in makefile.items() {
-        if let MakefileItem::Include(inc) = item {
-            let path = inc.path().unwrap_or_default();
-            if path.is_empty() {
-                let range = text_range_to_lsp_range(source_text, inc.text_range());
-                diagnostics.push(make_diagnostic(
-                    range,
-                    DiagnosticSeverity::ERROR,
-                    "include-missing-path",
-                    "include directive has no file path".to_string(),
-                ));
-            }
+    for inc in makefile.includes() {
+        let path = inc.path().unwrap_or_default();
+        if path.is_empty() {
+            let range = text_range_to_lsp_range(source_text, inc.text_range());
+            diagnostics.push(make_diagnostic(
+                range,
+                DiagnosticSeverity::ERROR,
+                "include-missing-path",
+                "include directive has no file path".to_string(),
+            ));
         }
     }
 
@@ -2152,6 +2150,40 @@ mod tests {
         let text = "include config.mk\n";
         let codes = diag_codes(text);
         assert!(!codes.contains(&"include-missing-path".to_string()));
+    }
+
+    fn include_missing_path_lines(text: &str) -> Vec<u32> {
+        get_diags(text)
+            .into_iter()
+            .filter(|d| d.code == Some(NumberOrString::String("include-missing-path".into())))
+            .map(|d| d.range.start.line)
+            .collect()
+    }
+
+    #[test]
+    fn test_include_missing_path() {
+        assert_eq!(
+            include_missing_path_lines(
+                "include
+"
+            ),
+            vec![0]
+        );
+    }
+
+    #[test]
+    fn test_include_missing_path_in_conditional() {
+        let text = "ifdef A
+include
+else ifdef B
+include
+else
+ifdef C
+include
+endif
+endif
+";
+        assert_eq!(include_missing_path_lines(text), vec![1, 3, 6]);
     }
 
     // Spaces instead of tab tests
