@@ -158,7 +158,12 @@ fn collect_diagnostics(
 
     let makefile = parsed.tree();
     let variant = parsed_variant(parsed);
-    diagnostics.extend(check_undefined_variables(source_text, &makefile, external));
+    diagnostics.extend(check_undefined_variables(
+        source_text,
+        &makefile,
+        variant,
+        external,
+    ));
     diagnostics.extend(check_recursive_variable_self_reference(
         source_text,
         &makefile,
@@ -259,6 +264,7 @@ fn parse_error_diagnostic(source_text: &str, error: &PositionedParseError) -> Di
 fn check_undefined_variables(
     source_text: &str,
     makefile: &Makefile,
+    variant: MakefileVariant,
     external: &ExternalSymbols,
 ) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
@@ -279,7 +285,12 @@ fn check_undefined_variables(
         let Some(name) = var_ref.name() else {
             continue;
         };
-        if builtins::is_known_variable(&name) || defined_vars.contains(&name) {
+        // TODO: know the variables BSD make defines, such as .CURDIR.
+        let known = match variant {
+            MakefileVariant::NMake => builtins::is_nmake_known_macro(&name),
+            _ => builtins::is_known_variable(&name),
+        };
+        if known || defined_vars.contains(&name) {
             continue;
         }
         let range = text_range_to_lsp_range(source_text, var_ref.text_range());
@@ -4487,7 +4498,8 @@ endif
                 "!IFDEF X\n!ENDIF\nS = $(shell ls)\nall:\n\techo $(S)\n",
                 dir.path()
             ),
-            Vec::<String>::new()
+            // nmake has no functions, so `$(shell ls)` is not a call.
+            vec!["undefined-variable".to_string()]
         );
     }
 
@@ -4557,6 +4569,24 @@ endif
                 dir.path()
             ),
             Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn test_nmake_predefined_macros() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = "!IFDEF X\n!ENDIF\nD = $(MAKEDIR) $(CFLAGS) $(RFLAGS) $(CURDIR)\n\
+                    all: $$(@B).c\n\techo $(D)\n";
+        let parsed = Makefile::parse(text);
+        assert_eq!(parsed.variant(), Some(MakefileVariant::NMake));
+        let messages: Vec<String> = get_diagnostics(text, &parsed, Some(dir.path()))
+            .into_iter()
+            .filter(|d| d.code == Some(NumberOrString::String("undefined-variable".to_string())))
+            .map(|d| d.message)
+            .collect();
+        assert_eq!(
+            messages,
+            vec!["variable 'CURDIR' is not defined".to_string()]
         );
     }
 }

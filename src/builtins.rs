@@ -476,6 +476,38 @@ pub fn is_known_variable(name: &str) -> bool {
         || is_builtin_function(name)
 }
 
+/// The macros nmake defines itself.
+const NMAKE_PREDEFINED_MACROS: &[&str] = &[
+    "MAKE",
+    "MAKEDIR",
+    "MAKEFLAGS",
+    "AS",
+    "BC",
+    "CC",
+    "COBOL",
+    "CPP",
+    "CXX",
+    "FOR",
+    "PASCAL",
+    "RC",
+    "AFLAGS",
+    "BFLAGS",
+    "CFLAGS",
+    "COBFLAGS",
+    "CPPFLAGS",
+    "CXXFLAGS",
+    "FFLAGS",
+    "PFLAGS",
+    "RFLAGS",
+];
+
+/// Check if `name` is a macro nmake defines: a predefined macro, or a
+/// filename macro such as `@`, `**` or `@B`.
+pub fn is_nmake_known_macro(name: &str) -> bool {
+    let base = name.strip_suffix(['D', 'B', 'F', 'R']).unwrap_or(name);
+    NMAKE_PREDEFINED_MACROS.contains(&name) || matches!(base, "@" | "*" | "**" | "?" | "<")
+}
+
 /// Check if a name is a parameter of a `$(call)`, such as `1` in `$(1)`.
 pub fn is_call_parameter(name: &str) -> bool {
     !name.is_empty() && name.bytes().all(|b| b.is_ascii_digit())

@@ -51,7 +51,7 @@ Each diagnostic carries a code, so it can be identified in editors:
 
 | Code | Severity | Description |
 |------|----------|-------------|
-| `undefined-variable` | warning | reference to a variable that is never assigned |
+| `undefined-variable` | warning | reference to a variable that is never assigned and not built in (for nmake, its predefined and filename macros) |
 | `recursive-variable-reference` | warning | `=` assignment that references itself |
 | `empty-variable-reference` | warning | `$()` or `${}` |
 | `empty-automatic-variable` | warning | `$<`, `$^`, `$+` or `$?` in a rule without prerequisites, or `$*` outside a pattern rule |
