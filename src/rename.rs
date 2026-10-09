@@ -2,8 +2,7 @@
 
 use std::collections::HashMap;
 
-use makefile_lossless::Makefile;
-use text_size::TextRange;
+use makefile_lossless::{Makefile, TextRange};
 use tower_lsp_server::ls_types::{
     Position, PrepareRenameResponse, Range, TextEdit, Uri, WorkspaceEdit,
 };

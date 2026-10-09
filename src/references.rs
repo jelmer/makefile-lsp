@@ -1,7 +1,6 @@
 //! Find references for Makefiles.
 
-use makefile_lossless::{Makefile, ReferenceLocation, TextRange, VariableReference};
-use text_size::TextSize;
+use makefile_lossless::{Makefile, ReferenceLocation, TextRange, TextSize, VariableReference};
 use tower_lsp_server::ls_types::{Location, Position, Uri};
 
 use crate::position::{text_range_to_lsp_range, try_position_to_offset};
