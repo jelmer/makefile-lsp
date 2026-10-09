@@ -3,8 +3,9 @@
 use std::collections::{HashMap, HashSet};
 
 use makefile_lossless::{
-    ConditionalBranch, Makefile, MakefileItem, MakefileVariant, Modifier, Parse, ParseErrorKind,
-    ParsedReference, PositionedParseError, ReferenceLocation, Rule, TextRange, VariableReference,
+    ConditionalBranch, ConditionalKind, Makefile, MakefileItem, MakefileVariant, Modifier, Parse,
+    ParseErrorKind, ParsedReference, PositionedParseError, ReferenceLocation, Rule, TextRange,
+    VariableReference,
 };
 use tower_lsp_server::ls_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Range};
 
@@ -668,13 +669,13 @@ fn referenced_variables(makefile: &Makefile) -> HashSet<String> {
     // `ifdef NAME` / `ifndef NAME` reference NAME but don't show up as
     // references because the argument is a bare identifier.
     for cond in makefile.all_conditionals() {
-        match cond.conditional_type().as_deref() {
-            Some("ifdef") | Some("ifndef") => {
-                if let Some(name) = cond.condition() {
-                    referenced.insert(name);
-                }
+        for branch in cond.branches() {
+            if matches!(
+                branch.conditional_kind(),
+                Some(ConditionalKind::Ifdef | ConditionalKind::Ifndef)
+            ) {
+                referenced.extend(branch.condition());
             }
-            _ => {}
         }
     }
 
@@ -2718,6 +2719,33 @@ mod tests {
         // FOO is referenced by `ifdef FOO`. VAR is inside a conditional, so
         // skipped from the unused check.
         assert!(!codes.contains(&"unused-variable".to_string()));
+    }
+
+    #[test]
+    fn test_used_in_else_branch_condition_ok() {
+        let empty: Vec<String> = vec![];
+        assert_eq!(
+            unused_variable_messages("X = 1\nifdef A\nelse ifdef X\nendif\n"),
+            empty
+        );
+        assert_eq!(
+            unused_variable_messages("X = 1\nifdef A\nelse ifndef X\nendif\n"),
+            empty
+        );
+        assert_eq!(
+            unused_variable_messages("X = 1\nifdef A\nelse ifeq ($(X),1)\nendif\n"),
+            empty
+        );
+        assert_eq!(
+            unused_variable_messages("X = 1\nifdef A\nifdef B\nelse ifdef X\nendif\nendif\n"),
+            empty
+        );
+        assert_eq!(
+            unused_variable_messages(
+                "X = 1\nall:\nifdef A\n\techo a\nelse ifdef X\n\techo x\nendif\n"
+            ),
+            empty
+        );
     }
 
     #[test]
