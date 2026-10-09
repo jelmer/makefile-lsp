@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 
 use makefile_lossless::{
-    ConditionalBranch, Makefile, MakefileItem, MakefileVariant, Parse, ParseErrorKind,
+    ConditionalBranch, Makefile, MakefileItem, MakefileVariant, Modifier, Parse, ParseErrorKind,
     ParsedReference, PositionedParseError, ReferenceLocation, Rule, TextRange, VariableReference,
 };
 use tower_lsp_server::ls_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Range};
@@ -1484,14 +1484,17 @@ fn check_automatic_variable_outside_recipe(
         .collect()
 }
 
-/// Is `text` a reference to an automatic variable, such as `$@`, `$(<)` or
-/// `${@D}`?
+/// Is `text` a reference to an automatic variable, such as `$@`, `$(<)`,
+/// `${@D}` or `$(@:.c=.o)`?
 fn is_automatic_variable_reference(text: &str) -> bool {
     let Ok(reference) = ParsedReference::parse(text, MakefileVariant::GNUMake) else {
         return false;
     };
     let mut chars = reference.name.chars();
-    reference.modifiers.is_empty()
+    reference
+        .modifiers
+        .iter()
+        .all(|m| matches!(m, Modifier::SysVSubstitute { .. }))
         && chars
             .next()
             .is_some_and(|c| matches!(c, '@' | '<' | '^' | '?' | '*' | '+' | '|' | '%'))
@@ -4018,6 +4021,38 @@ mod tests {
         assert_eq!(
             auto_var_messages(".SECONDEXPANSION:\nfoo: $$(@D)/x $(@D)/y\n\ttouch $@\n").len(),
             0
+        );
+    }
+
+    #[test]
+    fn test_automatic_variable_substitution_reference() {
+        assert_eq!(
+            auto_var_messages("X := $(@:.c=.o) ${@:.c=.o} $(^:%.c=%.o) $(@D:%=%/x)\n"),
+            vec![
+                "automatic variable '$(@:.c=.o)' is only set in recipes and is empty in an \
+                 immediately-expanded assignment",
+                "automatic variable '${@:.c=.o}' is only set in recipes and is empty in an \
+                 immediately-expanded assignment",
+                "automatic variable '$(^:%.c=%.o)' is only set in recipes and is empty in an \
+                 immediately-expanded assignment",
+                "automatic variable '$(@D:%=%/x)' is only set in recipes and is empty in an \
+                 immediately-expanded assignment",
+            ]
+        );
+        assert_eq!(
+            auto_var_messages("foo: $(@:.c=.o)\n\ttrue\n"),
+            vec![
+                "automatic variable '$(@:.c=.o)' is only set in recipes and is empty in a \
+                 prerequisite list"
+            ]
+        );
+    }
+
+    #[test]
+    fn test_automatic_variable_substitution_reference_in_recipe_ok() {
+        assert_eq!(
+            diag_codes("%.o: %.c\n\techo $(@:.c=.o) $(@D) $(<F) $(^:%.c=%.o) ${@:.c=.o}\n"),
+            Vec::<String>::new()
         );
     }
 
