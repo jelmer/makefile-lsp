@@ -561,4 +561,20 @@ mod tests {
             RenameError::UsedOutsideWorkspace("VAR".to_string(), fx.uri("sys.mk"))
         );
     }
+
+    #[test]
+    fn test_rename_variable_in_ifdef() {
+        let text = "FOO = 1\nifdef FOO\nendif\n";
+        let ranges: Vec<Range> = get_edits(text, Position::new(1, 6), "BAR")
+            .into_iter()
+            .map(|e| e.range)
+            .collect();
+        assert_eq!(
+            ranges,
+            vec![
+                Range::new(Position::new(0, 0), Position::new(0, 3)),
+                Range::new(Position::new(1, 6), Position::new(1, 9)),
+            ]
+        );
+    }
 }

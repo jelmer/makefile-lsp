@@ -7,6 +7,7 @@ use tower_lsp_server::ls_types::{Hover, HoverContents, MarkupContent, MarkupKind
 
 use crate::builtins;
 use crate::position::try_position_to_offset;
+use crate::references::ifdef_reference_at;
 use crate::targets::{prerequisite_at_offset, target_at_offset};
 use crate::workspace::{Document, FileSet};
 
@@ -142,10 +143,16 @@ fn variable_hover(files: &FileSet, reference: &VariableReference) -> Option<Hove
         return Some(function_hover(f));
     }
 
+    named_variable_hover(files, &var_name)
+}
+
+/// Describe the variable `var_name`, from its definition or as a built-in
+/// variable.
+fn named_variable_hover(files: &FileSet, var_name: &str) -> Option<Hover> {
     // User-defined variables take precedence over built-in ones
     let definition = files.docs().find_map(|doc| {
         doc.makefile()
-            .variable_definitions_by_name(&var_name)
+            .variable_definitions_by_name(var_name)
             .next()
             .map(|v| (doc, v))
     });
@@ -165,7 +172,7 @@ fn variable_hover(files: &FileSet, reference: &VariableReference) -> Option<Hove
         return Some(markdown_hover(info));
     }
 
-    let doc = builtins::find_builtin_variable(&var_name)?;
+    let doc = builtins::find_builtin_variable(var_name)?;
     Some(markdown_hover(format!("**`{}`**: {}", var_name, doc)))
 }
 
@@ -181,6 +188,10 @@ pub fn get_hover(files: &FileSet, position: Position) -> Option<Hover> {
     let makefile = files.current().makefile();
     if let Some(reference) = makefile.variable_reference_at(offset) {
         return variable_hover(files, &reference);
+    }
+
+    if let Some(var_name) = ifdef_reference_at(&makefile, offset) {
+        return named_variable_hover(files, &var_name);
     }
 
     if let Some(d) = directive_keyword_at(&makefile, offset)
@@ -586,6 +597,22 @@ mod tests {
                 "**`build`**\n\nPrerequisites: `gen`\n\n```makefile\n\techo ok\n```\n\nDefined in `rules.mk`"
                     .to_string()
             )
+        );
+    }
+
+    #[test]
+    fn test_hover_variable_in_ifdef() {
+        assert_eq!(
+            hover_text("CC = gcc\nifdef CC\nendif\n", Position::new(1, 6)).as_deref(),
+            Some("```makefile\nCC = gcc\n```")
+        );
+        assert_eq!(
+            hover_text(
+                "CC = gcc\nifdef CC\nelse ifndef CC\nendif\n",
+                Position::new(2, 12)
+            )
+            .as_deref(),
+            Some("```makefile\nCC = gcc\n```")
         );
     }
 }

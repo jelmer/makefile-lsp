@@ -119,4 +119,27 @@ mod tests {
         let highlights = get_hl(text, Position::new(1, 2));
         assert!(highlights.is_empty());
     }
+
+    #[test]
+    fn test_highlight_variable_in_ifdef() {
+        let text = "FOO = 1\nifdef FOO\nendif\n";
+        let highlights: Vec<(Range, Option<DocumentHighlightKind>)> =
+            get_hl(text, Position::new(1, 7))
+                .into_iter()
+                .map(|h| (h.range, h.kind))
+                .collect();
+        assert_eq!(
+            highlights,
+            vec![
+                (
+                    Range::new(Position::new(0, 0), Position::new(0, 3)),
+                    Some(DocumentHighlightKind::WRITE)
+                ),
+                (
+                    Range::new(Position::new(1, 6), Position::new(1, 9)),
+                    Some(DocumentHighlightKind::READ)
+                ),
+            ]
+        );
+    }
 }
