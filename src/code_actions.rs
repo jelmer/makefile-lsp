@@ -907,7 +907,7 @@ fn reference_contexts(var_ref: &VariableReference) -> Vec<InlineContext> {
             ReferenceLocation::Recipe(_) => break None,
             ReferenceLocation::TargetSpecificValue(_) => break Some(InlineContext::RuleLine),
             ReferenceLocation::Target(_) | ReferenceLocation::Prerequisite(_)
-                if !in_archive_members(&current) =>
+                if current.archive_members().is_none() =>
             {
                 break Some(InlineContext::RuleLine)
             }
@@ -916,17 +916,6 @@ fn reference_contexts(var_ref: &VariableReference) -> Vec<InlineContext> {
     };
     contexts.extend(outermost);
     contexts
-}
-
-/// Whether `var_ref` is in the member list of an archive, as in
-/// `lib.a($(OBJS))`.
-// TODO: use makefile-lossless API once ReferenceLocation tells archive
-// members apart.
-fn in_archive_members(var_ref: &VariableReference) -> bool {
-    var_ref
-        .syntax()
-        .ancestors()
-        .any(|node| node.kind() == SyntaxKind::ARCHIVE_MEMBERS)
 }
 
 /// Offer "Add '<target>' as prerequisite of '<goal>'" when the cursor is on
@@ -1975,6 +1964,15 @@ mod tests {
             None
         );
         assert_eq!(inline_result("FOO = a;b\nall: Y = $(FOO)\n", "FOO"), None);
+    }
+
+    #[test]
+    fn test_no_inline_spaces_into_archive_members() {
+        assert_eq!(inline_result("FOO = a b\nlib.a($(FOO)): x\n", "FOO"), None);
+        assert_eq!(
+            inline_result("FOO = a b\nall: lib.a($(FOO))\n", "FOO"),
+            None
+        );
     }
 
     #[test]
