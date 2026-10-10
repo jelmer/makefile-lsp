@@ -23,7 +23,8 @@
 //!
 //! The check is skipped entirely when the set of used names can't be known:
 //! when `MAKECMDGOALS` is consulted, when rules may be generated with
-//! `$(eval)` and when a prerequisite expands anything but plain variables.
+//! `$(eval)` and when a prerequisite expands anything but variables,
+//! substitution references and functions that only rearrange words.
 //!
 //! TODO: a parent directory's makefile may run `$(MAKE) -C dir target`,
 //! which isn't seen.
@@ -32,7 +33,10 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use makefile_lossless::{split_references, Makefile, MakefileVariant, ParsedReference, TextPart};
+use makefile_lossless::{
+    split_references, FunctionCall, Makefile, MakefileVariant, Modifier, ModifierArg,
+    ModifierArgPart, ParsedReference, ReferenceError, TextPart,
+};
 use tower_lsp_server::ls_types::{Diagnostic, DiagnosticSeverity, DiagnosticTag, NumberOrString};
 
 use crate::position::text_range_to_lsp_range;
@@ -182,9 +186,14 @@ impl UsedNames {
                         used.add_text(target, variant);
                     }
                 }
+                let expander = Expander {
+                    values: &values,
+                    variant,
+                };
                 for prereq in &prereqs {
-                    if !expands_to_words(prereq, &values, variant, &mut HashSet::new()) {
-                        return None;
+                    for text in expander.expand(prereq, &mut HashSet::new())? {
+                        used.words
+                            .extend(text.split_whitespace().map(|w| normalize(w).to_string()));
                     }
                     used.add_text(prereq, variant);
                 }
@@ -289,39 +298,240 @@ fn normalize(name: &str) -> &str {
     name.trim_start_matches("./")
 }
 
-/// Whether `text` only references variables that are assigned somewhere and
-/// whose values in turn only do so, so that the words it expands to appear
-/// literally in the makefiles.
+/// The most texts an expansion may have, beyond which the check is skipped.
+const MAX_EXPANSIONS: usize = 64;
+
+/// Expands text using the values variables are assigned anywhere in the
+/// makefiles.
 ///
-/// TODO: expand substitution references like `$(SRCS:.c=.o)` and simple
-/// functions like `$(addprefix)`.
-fn expands_to_words(
-    text: &str,
-    values: &HashMap<String, Vec<String>>,
+/// Since a variable may have several values, depending on conditionals and
+/// appends, text expands to each combination of them. Only plain references,
+/// substitution references and a few GNU make functions that just rearrange
+/// words are expanded.
+struct Expander<'a> {
+    values: &'a HashMap<String, Vec<String>>,
     variant: MakefileVariant,
-    visiting: &mut HashSet<String>,
-) -> bool {
-    split_references(text, variant).into_iter().all(|part| {
-        let reference: ParsedReference = match part {
-            TextPart::Literal(_) => return true,
-            TextPart::Reference {
-                parsed: Ok(reference),
-                ..
-            } if reference.modifiers.is_empty() => reference,
-            _ => return false,
-        };
-        let Some(defs) = values.get(&reference.name) else {
-            return false;
-        };
-        if !visiting.insert(reference.name.clone()) {
-            return true;
+}
+
+impl Expander<'_> {
+    /// The texts `text` may expand to, or `None` if it uses anything that
+    /// can't be expanded. A reference to a variable that is being expanded
+    /// expands to nothing.
+    fn expand(&self, text: &str, visiting: &mut HashSet<String>) -> Option<Vec<String>> {
+        let mut texts = vec![String::new()];
+        for part in split_references(text, self.variant) {
+            let expansions = match part {
+                TextPart::Literal(range) => vec![text[range].to_string()],
+                TextPart::Reference {
+                    parsed: Ok(reference),
+                    ..
+                } => self.expand_reference(&reference, visiting)?,
+                TextPart::Reference {
+                    range,
+                    parsed: Err(ReferenceError::FunctionCall { .. }),
+                } => self.expand_function(&text[range], visiting)?,
+                _ => return None,
+            };
+            texts = combine(&[texts, expansions], |[a, b]| Some(format!("{a}{b}")))?;
         }
-        let ok = defs
+        Some(texts)
+    }
+
+    fn expand_reference(
+        &self,
+        reference: &ParsedReference,
+        visiting: &mut HashSet<String>,
+    ) -> Option<Vec<String>> {
+        let name = &reference.name;
+        let defs = self.values.get(name)?;
+        let mut values = Vec::new();
+        if visiting.insert(name.clone()) {
+            for def in defs {
+                values.extend(self.expand(def, visiting)?);
+            }
+            visiting.remove(name);
+        } else {
+            values.push(String::new());
+        }
+        dedup(&mut values);
+        match reference.modifiers.as_slice() {
+            [] => Some(values),
+            [Modifier::SysVSubstitute { from, to }] => {
+                let from = self.expand_arg(from, visiting)?;
+                let to = self.expand_arg(to, visiting)?;
+                combine(&[values, from, to], |[value, from, to]| {
+                    substitution_reference(value, from, to)
+                })
+            }
+            _ => None,
+        }
+    }
+
+    fn expand_arg(&self, arg: &ModifierArg, visiting: &mut HashSet<String>) -> Option<Vec<String>> {
+        let mut texts = vec![String::new()];
+        for part in arg.parts() {
+            let expansions = match part {
+                ModifierArgPart::Literal(text) => vec![text.clone()],
+                ModifierArgPart::Expr(text) => self.expand(text, visiting)?,
+                _ => return None,
+            };
+            texts = combine(&[texts, expansions], |[a, b]| Some(format!("{a}{b}")))?;
+        }
+        Some(texts)
+    }
+
+    /// Expand a call of a GNU make function, from `$` to the closing brace.
+    fn expand_function(&self, text: &str, visiting: &mut HashSet<String>) -> Option<Vec<String>> {
+        let (call, _) = FunctionCall::parse_prefix(text).ok()??;
+        let args = call
+            .arguments
             .iter()
-            .all(|value| expands_to_words(value, values, variant, visiting));
-        visiting.remove(&reference.name);
-        ok
-    })
+            .map(|range| self.expand(&text[range.clone()], visiting))
+            .collect::<Option<Vec<_>>>()?;
+        let results = match (call.name.as_str(), args.len()) {
+            ("subst", 3) => combine(&args, |[from, to, text]| Some(subst(from, to, text)))?,
+            ("patsubst", 3) => combine(&args, |[pattern, replacement, text]| {
+                map_words(text, |w| patsubst_word(pattern, replacement, w))
+            })?,
+            ("addprefix", 2) => combine(&args, |[prefix, names]| {
+                map_words(names, |w| Some(format!("{prefix}{w}")))
+            })?,
+            ("addsuffix", 2) => combine(&args, |[suffix, names]| {
+                map_words(names, |w| Some(format!("{w}{suffix}")))
+            })?,
+            ("filter" | "filter-out", 2) => {
+                let keep = call.name == "filter";
+                combine(&args, |[patterns, text]| {
+                    let mut words = Vec::new();
+                    for word in text.split_whitespace() {
+                        let mut matches = false;
+                        for pattern in patterns.split_whitespace() {
+                            matches |= pattern_stem(pattern, word)?.is_some();
+                        }
+                        if matches == keep {
+                            words.push(word);
+                        }
+                    }
+                    Some(words.join(" "))
+                })?
+            }
+            ("sort", 1) => combine(&args, |[list]| {
+                let words: std::collections::BTreeSet<&str> = list.split_whitespace().collect();
+                Some(words.into_iter().collect::<Vec<_>>().join(" "))
+            })?,
+            ("strip", 1) => combine(&args, |[text]| map_words(text, |w| Some(w.to_string())))?,
+            ("notdir", 1) => combine(&args, |[names]| {
+                map_words(names, |w| Some(w.rsplit('/').next()?.to_string()))
+            })?,
+            ("dir", 1) => combine(&args, |[names]| {
+                map_words(names, |w| {
+                    Some(w.rfind('/').map_or("./", |slash| &w[..=slash]).to_string())
+                })
+            })?,
+            ("basename", 1) => combine(&args, |[names]| {
+                map_words(names, |w| {
+                    let start = w.rfind('/').map_or(0, |slash| slash + 1);
+                    let end = w[start..].rfind('.').map_or(w.len(), |dot| start + dot);
+                    Some(w[..end].to_string())
+                })
+            })?,
+            _ => return None,
+        };
+        Some(results)
+    }
+}
+
+/// Call `f` with each combination of one text from each of `lists`, or
+/// return `None` if there are too many or `f` does.
+fn combine<const N: usize>(
+    lists: &[Vec<String>],
+    f: impl Fn([&str; N]) -> Option<String>,
+) -> Option<Vec<String>> {
+    if lists.len() != N || lists.iter().map(Vec::len).product::<usize>() > MAX_EXPANSIONS {
+        return None;
+    }
+    let mut results = Vec::new();
+    let mut indices = [0; N];
+    loop {
+        results.push(f(std::array::from_fn(|i| lists[i][indices[i]].as_str()))?);
+        let Some(i) = (0..N).rev().find(|&i| indices[i] + 1 < lists[i].len()) else {
+            break;
+        };
+        indices[i] += 1;
+        indices[i + 1..].fill(0);
+    }
+    dedup(&mut results);
+    Some(results)
+}
+
+fn dedup(texts: &mut Vec<String>) {
+    let mut seen = HashSet::new();
+    texts.retain(|t| seen.insert(t.clone()));
+}
+
+/// Apply `f` to each word of `text`, joining the results with spaces as GNU
+/// make does.
+fn map_words(text: &str, f: impl Fn(&str) -> Option<String>) -> Option<String> {
+    Some(
+        text.split_whitespace()
+            .map(f)
+            .collect::<Option<Vec<_>>>()?
+            .join(" "),
+    )
+}
+
+/// GNU make's `$(subst)`, which appends `to` if `from` is empty.
+fn subst(from: &str, to: &str, text: &str) -> String {
+    if from.is_empty() {
+        format!("{text}{to}")
+    } else {
+        text.replace(from, to)
+    }
+}
+
+/// The part of `word` matched by the first `%` in `pattern`, or `Some(None)`
+/// if it doesn't match. Without a `%`, `pattern` has to match the whole word
+/// and the stem is empty. Returns `None` for patterns with a backslash,
+/// which may quote the `%`.
+fn pattern_stem<'a>(pattern: &str, word: &'a str) -> Option<Option<&'a str>> {
+    if pattern.contains('\\') {
+        return None;
+    }
+    let Some((prefix, suffix)) = pattern.split_once('%') else {
+        return Some((word == pattern).then_some(""));
+    };
+    Some(
+        (word.len() >= prefix.len() + suffix.len()
+            && word.starts_with(prefix)
+            && word.ends_with(suffix))
+        .then(|| &word[prefix.len()..word.len() - suffix.len()]),
+    )
+}
+
+/// `$(patsubst)` of a single word: the first `%` in `replacement` is
+/// replaced by the stem, if `pattern` has one.
+fn patsubst_word(pattern: &str, replacement: &str, word: &str) -> Option<String> {
+    if replacement.contains('\\') {
+        return None;
+    }
+    let Some(stem) = pattern_stem(pattern, word)? else {
+        return Some(word.to_string());
+    };
+    if !pattern.contains('%') {
+        return Some(replacement.to_string());
+    }
+    Some(replacement.replacen('%', stem, 1))
+}
+
+/// A substitution reference `$(VAR:from=to)`. Without a `%` in `from` it
+/// replaces `from` at the end of each word, as if both started with a `%`.
+fn substitution_reference(value: &str, from: &str, to: &str) -> Option<String> {
+    let (from, to) = if from.contains('%') {
+        (from.to_string(), to.to_string())
+    } else {
+        (format!("%{from}"), format!("%{to}"))
+    };
+    map_words(value, |w| patsubst_word(&from, &to, w))
 }
 
 #[cfg(test)]
@@ -559,7 +769,12 @@ mod tests {
         let text =
             format!("{PHONY}all: prog\nprog: $(patsubst %.c,%.o,$(wildcard *.c))\nstale.o: x\n");
         assert_eq!(makefile(&text), none());
-        let text = format!("{PHONY}all: prog\nprog: $(SRCS:.c=.o)\nSRCS = a.c\nstale.o: x\n");
+        let text =
+            format!("{PHONY}all: prog\nprog: $(SRCS:.c=.o)\nSRCS = $(wildcard *.c)\nstale.o: x\n");
+        assert_eq!(makefile(&text), none());
+        let text = format!("{PHONY}all: prog\nprog: $(SRCS:\\%.c=%.o)\nSRCS = a.c\nstale.o: x\n");
+        assert_eq!(makefile(&text), none());
+        let text = format!("{PHONY}all: prog\nprog: $(sort $(SRCS) $(SRCS) $(SRCS) $(SRCS) $(SRCS) $(SRCS) $(SRCS))\nSRCS = a.c\nSRCS = b.c\nstale.o: x\n");
         assert_eq!(makefile(&text), none());
         let text = format!("{PHONY}all: prog\nprog: $(UNDEFINED)\nstale.o: x\n");
         assert_eq!(makefile(&text), none());
@@ -567,6 +782,134 @@ mod tests {
         assert_eq!(makefile(&text), none());
         let text = format!("{PHONY}.SECONDEXPANSION:\nall: prog\nprog: $$@.o\nstale.o: x\n");
         assert_eq!(makefile(&text), none());
+    }
+
+    #[test]
+    fn test_substitution_reference_prerequisites() {
+        let rules = "build/a.o: a.c\nbuild/b.o: b.c\nstale.o: x\n";
+        let text =
+            format!("{PHONY}all: prog\nSRCS = a.c b.c\nprog: $(SRCS:%.c=build/%.o)\n{rules}");
+        assert_eq!(makefile(&text), vec![(6, "stale.o".to_string())]);
+        let text = format!(
+            "{PHONY}all: prog\nSRCS = a.c b.c\nB = build\nprog: $(SRCS:%.c=$(B)/%.o)\n{rules}"
+        );
+        assert_eq!(makefile(&text), vec![(7, "stale.o".to_string())]);
+        let text = format!(
+            "{PHONY}all: prog\nSRCS = a.c b.c\nOBJS = $(SRCS:%.c=build/%.o)\nprog: $(OBJS)\n{rules}"
+        );
+        assert_eq!(makefile(&text), vec![(7, "stale.o".to_string())]);
+        // The suffix form only replaces at the end of words.
+        let text = format!(
+            "{PHONY}all: prog\nSRCS = a.c b.c.c\nprog: $(SRCS:.c=_t.o)\na_t.o: x\nb.c_t.o: y\nb_t.o.c: z\n"
+        );
+        assert_eq!(makefile(&text), vec![(6, "b_t.o.c".to_string())]);
+        let text = format!("{PHONY}all: prog\nSRCS = a.c\nprog: ${{SRCS:.c=_t.o}}\na_t.o: x\n");
+        assert_eq!(
+            unreachable(&[("BSDmakefile", &text)], "BSDmakefile"),
+            none()
+        );
+        // BSD make modifiers other than substitution references aren't
+        // expanded.
+        let text = format!("{PHONY}all: prog\nSRCS = a.c\nprog: ${{SRCS:R}}\nstale.o: x\n");
+        assert_eq!(
+            unreachable(&[("BSDmakefile", &text)], "BSDmakefile"),
+            none()
+        );
+    }
+
+    #[test]
+    fn test_function_prerequisites() {
+        let check = |prereqs: &str, targets: &str| {
+            let text = format!(
+                "{PHONY}all: prog\nSRCS = src/a.c src/b.h\nprog: {prereqs}\n{targets}: x\n"
+            );
+            makefile(&text)
+        };
+        let stale = |target: &str| vec![(4, target.to_string())];
+        assert_eq!(
+            check("$(patsubst src/%.c,obj/%.o,$(SRCS))", "obj/a.o"),
+            none()
+        );
+        assert_eq!(
+            check("$(patsubst src/%.c,obj/%.o,$(SRCS))", "obj/b.o"),
+            stale("obj/b.o")
+        );
+        assert_eq!(check("$(subst src/,obj/,$(SRCS))", "obj/b.h"), none());
+        assert_eq!(check("$(addprefix out/,$(SRCS))", "out/src/b.h"), none());
+        assert_eq!(check("$(addsuffix .gz,$(SRCS))", "src/a.c.gz"), none());
+        assert_eq!(
+            check("$(addsuffix .gz,$(filter %.c,$(SRCS)))", "src/a.c.gz"),
+            none()
+        );
+        assert_eq!(
+            check("$(addsuffix .gz,$(filter %.c,$(SRCS)))", "src/b.h.gz"),
+            stale("src/b.h.gz")
+        );
+        assert_eq!(
+            check("$(addsuffix .gz,$(filter-out %.c,$(SRCS)))", "src/b.h.gz"),
+            none()
+        );
+        assert_eq!(
+            check("$(addsuffix .gz,$(filter-out %.c,$(SRCS)))", "src/a.c.gz"),
+            stale("src/a.c.gz")
+        );
+        assert_eq!(
+            check("$(addprefix d/,$(sort $(strip $(SRCS))))", "d/src/a.c"),
+            none()
+        );
+        assert_eq!(check("$(addprefix d/,$(notdir $(SRCS)))", "d/a.c"), none());
+        assert_eq!(check("$(addsuffix x.t,$(dir $(SRCS)))", "src/x.t"), none());
+        assert_eq!(
+            check("$(addsuffix .gz,$(basename $(SRCS)))", "src/a.gz"),
+            none()
+        );
+    }
+
+    #[test]
+    fn test_expand() {
+        // As GNU make 4.4.1 expands them.
+        let values = HashMap::from([
+            (
+                "X".to_string(),
+                vec!["  a.c  b.c\t.c  c.h d.cc  ".to_string()],
+            ),
+            ("P".to_string(), vec!["a".to_string(), "b".to_string()]),
+        ]);
+        let expander = Expander {
+            values: &values,
+            variant: MakefileVariant::GNUMake,
+        };
+        let expand = |text: &str| expander.expand(text, &mut HashSet::new());
+        let one = |text: &str| Some(vec![text.to_string()]);
+        assert_eq!(expand("$(X:.c=.o)"), one("a.o b.o .o c.h d.cc"));
+        assert_eq!(expand("$(X:%.c=o/%.o)"), one("o/a.o o/b.o o/.o c.h d.cc"));
+        assert_eq!(expand("$(X:.c=%.o)"), one("a%.o b%.o %.o c.h d.cc"));
+        assert_eq!(expand("$(X:%.c=%%.o)"), one("a%.o b%.o %.o c.h d.cc"));
+        assert_eq!(expand("$(X:=.x)"), one("a.c.x b.c.x .c.x c.h.x d.cc.x"));
+        assert_eq!(expand("$(X:a%=%z)"), one(".cz b.c .c c.h d.cc"));
+        assert_eq!(expand("$(X:%.c=x)"), one("x x x c.h d.cc"));
+        assert_eq!(expand("$(patsubst a.c,b.o,a.c xa.c)"), one("b.o xa.c"));
+        assert_eq!(expand("$(patsubst %.c ,x,a.c)"), one("a.c"));
+        assert_eq!(expand("$(subst ,Z,ab)"), one("abZ"));
+        assert_eq!(expand("$(filter a%b%,a1b2 a1b%)"), one("a1b%"));
+        assert_eq!(expand("$(sort b a  b c)"), one("a b c"));
+        assert_eq!(expand("$(notdir a/b c/ d)"), one("b  d"));
+        assert_eq!(expand("$(dir a/b c/ d)"), one("a/ c/ ./"));
+        assert_eq!(
+            expand("$(basename a.b/c d.e f.g.h .i)"),
+            one("a.b/c d f.g ")
+        );
+        assert_eq!(
+            expand("pre$(P)post"),
+            Some(vec!["preapost".to_string(), "prebpost".to_string()])
+        );
+        assert_eq!(
+            expand("$(addprefix $(P)/,x)"),
+            Some(vec!["a/x".to_string(), "b/x".to_string()])
+        );
+        assert_eq!(expand("$(patsubst \\%.c,x,%.c)"), None);
+        assert_eq!(expand("$(wildcard *.c)"), None);
+        assert_eq!(expand("$(addprefix a,b,c)"), one("ab,c"));
     }
 
     #[test]
