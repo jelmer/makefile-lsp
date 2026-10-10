@@ -387,6 +387,8 @@ pub struct FileSet {
     /// Whether every include directive in the documents was resolved to a
     /// file that could be loaded.
     complete: bool,
+    /// The topmost makefiles found to include the current document.
+    includers: Vec<PathBuf>,
 }
 
 impl FileSet {
@@ -398,6 +400,7 @@ impl FileSet {
             editable: vec![true],
             includes: Vec::new(),
             complete: false,
+            includers: Vec::new(),
         }
     }
 
@@ -428,6 +431,12 @@ impl FileSet {
     /// The include directives of the current document.
     pub fn includes(&self) -> &[ResolvedInclude] {
         &self.includes
+    }
+
+    /// The topmost makefiles found to (transitively) include the current
+    /// document, in path order.
+    pub fn includers(&self) -> &[PathBuf] {
+        &self.includers
     }
 
     /// Whether the set holds every makefile that its documents include, so
@@ -555,6 +564,7 @@ impl Workspace {
         let mut complete = walk.is_complete();
         let mut docs = walk.docs;
         let mut includes = walk.includes.remove(&uri).unwrap_or_default();
+        let mut includers = Vec::new();
 
         if let Some(path) = current.path() {
             self.probe_includers(path);
@@ -568,6 +578,7 @@ impl Workspace {
                     continue;
                 }
                 complete &= root_walk.is_complete();
+                includers.push(root);
                 for doc in root_walk.docs {
                     if !docs.iter().any(|d| d.uri() == doc.uri()) {
                         docs.push(doc);
@@ -585,6 +596,7 @@ impl Workspace {
             editable,
             includes,
             complete,
+            includers,
         }
     }
 

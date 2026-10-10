@@ -44,6 +44,16 @@
           "default": "",
           "description": "Path to makefile-lsp executable. Leave empty to use the bundled server, or set to a custom path."
         },
+        "makefile.codeLens.runTarget": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show a code lens above each target that runs it with make. Takes effect when the server restarts."
+        },
+        "makefile.makeProgram": {
+          "type": "string",
+          "default": "make",
+          "description": "The make program used to run targets, such as make, gmake, bmake or nmake."
+        },
         "makefile.trace.server": {
           "type": "string",
           "enum": [
@@ -56,6 +66,44 @@
         }
       }
     },
+    "commands": [
+      {
+        "command": "makefile-lsp.runTarget",
+        "title": "Run Target",
+        "category": "Makefile"
+      }
+    ],
+    "menus": {
+      "commandPalette": [
+        {
+          "command": "makefile-lsp.runTarget",
+          "when": "false"
+        }
+      ]
+    },
+    "taskDefinitions": [
+      {
+        "type": "makefile-lsp",
+        "required": [
+          "target",
+          "makefile"
+        ],
+        "properties": {
+          "target": {
+            "type": "string",
+            "description": "The target to build"
+          },
+          "makefile": {
+            "type": "string",
+            "description": "The makefile to pass to make with -f"
+          },
+          "directory": {
+            "type": "string",
+            "description": "The directory to run make in; defaults to the directory of the makefile"
+          }
+        }
+      }
+    ],
     "configurationDefaults": {
       "[makefile]": {
         "editor.formatOnType": true

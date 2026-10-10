@@ -32,6 +32,8 @@ makefiles it includes (see below); the Makefile is never executed.
   the same file along with it
 - **Call hierarchy** - the prerequisites of a target (outgoing) and the
   targets that depend on it (incoming)
+- **Code lenses** - a "Run" lens above each target, for clients that can run
+  make (see below)
 - **Document links** - `include`, `-include` and `sinclude` paths are clickable
 - **Inlay hints** - the value of simply-expanded (`:=`) variables at their
   references, and the dependency depth of top-level targets
@@ -163,11 +165,44 @@ vim.api.nvim_create_autocmd("FileType", {
 
 The `vscode-makefile` directory contains a VS Code extension that runs
 `makefile-lsp`. Set `makefile.serverPath` to use a specific binary.
+`makefile.makeProgram` (default `make`) is the program used to run targets
+from their code lenses, which run as VS Code tasks;
+`makefile.codeLens.runTarget` turns these lenses off.
 
 ### coc.nvim
 
 The `coc-make` directory contains a [coc.nvim](https://github.com/neoclide/coc.nvim)
 extension; see its README for details.
+
+### Running targets
+
+The server doesn't run make itself. Instead, a "Run" code lens on a target
+invokes the `makefile-lsp.runTarget` command, which the client has to
+implement. Lenses are only offered to clients that pass
+`{"codeLens": {"runTarget": true}}` as initialization options; the VS Code
+and coc.nvim extensions do this.
+
+The command gets a single argument with the absolute path of the `makefile`
+to pass to make with `-f`, the `directory` to run make in and the `target`.
+For a makefile that is included by another one, such as `rules.mk` included
+from `Makefile`, the including makefile is used. Lenses are left out for
+pattern rules, suffix rules, special targets such as `.PHONY` and targets
+containing variable references.
+
+With Neovim, the command can be implemented like this:
+
+```lua
+vim.lsp.commands["makefile-lsp.runTarget"] = function(command)
+  local args = command.arguments[1]
+  vim.cmd("botright new")
+  vim.fn.jobstart({ "make", "-f", args.makefile, args.target },
+    { term = true, cwd = args.directory })
+end
+```
+
+and passing `init_options = { codeLens = { runTarget = true } }` to
+`vim.lsp.start`. Neovim only shows code lenses after
+`vim.lsp.codelens.refresh()`.
 
 ## Checking from the command line
 

@@ -12,6 +12,7 @@ mod builtins;
 mod call_hierarchy;
 mod check;
 mod code_actions;
+mod code_lens;
 mod completion;
 mod dep_graph;
 mod diagnostics;
@@ -65,6 +66,8 @@ struct Backend {
     watch_files: AtomicBool,
     /// Whether the client supports snippets in completion items.
     snippet_support: AtomicBool,
+    /// Whether the client implements the command run by "Run" code lenses.
+    run_target_lens: AtomicBool,
 }
 
 impl Backend {
@@ -75,6 +78,7 @@ impl Backend {
             diagnostics: Arc::new(Mutex::new(HashMap::new())),
             watch_files: AtomicBool::new(false),
             snippet_support: AtomicBool::new(false),
+            run_target_lens: AtomicBool::new(false),
         }
     }
 
@@ -280,6 +284,10 @@ impl LanguageServer for Backend {
             .unwrap_or(false);
         self.snippet_support
             .store(snippet_support, Ordering::Relaxed);
+        let run_target_lens = code_lens::run_target_enabled(params.initialization_options.as_ref())
+            .map_err(Error::invalid_params)?;
+        self.run_target_lens
+            .store(run_target_lens, Ordering::Relaxed);
 
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
@@ -314,6 +322,9 @@ impl LanguageServer for Backend {
                     work_done_progress_options: Default::default(),
                 })),
                 code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
+                code_lens_provider: run_target_lens.then_some(CodeLensOptions {
+                    resolve_provider: Some(false),
+                }),
                 inlay_hint_provider: Some(OneOf::Left(true)),
                 document_highlight_provider: Some(OneOf::Left(true)),
                 linked_editing_range_provider: Some(LinkedEditingRangeServerCapabilities::Simple(
@@ -612,6 +623,16 @@ impl LanguageServer for Backend {
                     .collect(),
             ))
         }
+    }
+
+    async fn code_lens(&self, params: CodeLensParams) -> Result<Option<Vec<CodeLens>>> {
+        if !self.run_target_lens.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
+        let Some(files) = self.file_set(&params.text_document.uri).await else {
+            return Ok(None);
+        };
+        Ok(Some(code_lens::run_target_lenses(&files)))
     }
 
     async fn document_link(&self, params: DocumentLinkParams) -> Result<Option<Vec<DocumentLink>>> {

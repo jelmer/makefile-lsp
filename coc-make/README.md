@@ -21,6 +21,11 @@ Settings in `coc-settings.json`:
 
 - `make.enable` (boolean, default `true`): enable the extension
 - `make.serverPath` (string, default `"makefile-lsp"`): path to the LSP binary
+- `make.codeLens.runTarget` (boolean, default `true`): show a "Run" code lens
+  above each target, which runs it in a terminal; coc.nvim only shows code
+  lenses when `codeLens.enable` is set
+- `make.makeProgram` (string, default `"make"`): the make program used to run
+  targets, such as `gmake`, `bmake` or `nmake`
 
 ## Development
 
