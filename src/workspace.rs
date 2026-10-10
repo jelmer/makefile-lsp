@@ -255,11 +255,213 @@ fn expand(
         };
         out.push_str(&value);
     }
-    // TODO: support wildcards, which GNU make expands in include directives.
-    if out.contains(['*', '?', '[']) {
-        return None;
-    }
     Some(out)
+}
+
+/// Upper bound on the files one wildcard in an include file name may match.
+const MAX_GLOB_MATCHES: usize = MAX_FILES;
+
+/// Upper bound on the directory entries read while expanding one wildcard.
+const MAX_GLOB_ENTRIES: usize = 10_000;
+
+/// Whether `name` contains an unescaped wildcard character.
+pub fn has_wildcard(name: &str) -> bool {
+    let mut chars = name.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => {
+                chars.next();
+            }
+            '*' | '?' | '[' => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// One element of a file name pattern.
+#[derive(Debug, PartialEq, Eq)]
+enum GlobToken {
+    Literal(char),
+    /// `?`
+    Any,
+    /// `*`
+    Star,
+    /// `[...]`: inclusive character ranges, and whether the set is negated.
+    Class(Vec<(char, char)>, bool),
+}
+
+impl GlobToken {
+    fn matches(&self, c: char) -> bool {
+        match self {
+            GlobToken::Literal(l) => *l == c,
+            GlobToken::Any => true,
+            GlobToken::Star => false,
+            GlobToken::Class(ranges, negated) => {
+                ranges.iter().any(|(lo, hi)| (*lo..=*hi).contains(&c)) != *negated
+            }
+        }
+    }
+}
+
+/// Split one path component of a pattern into tokens, as glob(3) reads it:
+/// a backslash quotes the next character and a `[` without a closing `]`
+/// is literal.
+///
+/// TODO: support POSIX character classes such as `[[:alpha:]]`.
+fn glob_tokens(pattern: &str) -> Vec<GlobToken> {
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut tokens = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let token = match chars[i] {
+            '\\' if i + 1 < chars.len() => {
+                i += 1;
+                GlobToken::Literal(chars[i])
+            }
+            '*' => GlobToken::Star,
+            '?' => GlobToken::Any,
+            '[' => match glob_class(&chars[i + 1..]) {
+                Some((class, len)) => {
+                    i += len;
+                    class
+                }
+                None => GlobToken::Literal('['),
+            },
+            c => GlobToken::Literal(c),
+        };
+        tokens.push(token);
+        i += 1;
+    }
+    tokens
+}
+
+/// Parse the rest of a `[...]` set, returning it and the number of
+/// characters it used including the closing `]`.
+fn glob_class(chars: &[char]) -> Option<(GlobToken, usize)> {
+    let mut i = 0;
+    let negated = matches!(chars.first(), Some('!' | '^'));
+    if negated {
+        i += 1;
+    }
+    let mut ranges = Vec::new();
+    let mut first = true;
+    loop {
+        let mut lo = *chars.get(i)?;
+        if lo == ']' && !first {
+            return Some((GlobToken::Class(ranges, negated), i + 1));
+        }
+        first = false;
+        if lo == '\\' {
+            i += 1;
+            lo = *chars.get(i)?;
+        }
+        i += 1;
+        let mut hi = lo;
+        if chars.get(i) == Some(&'-') && chars.get(i + 1).is_some_and(|c| *c != ']') {
+            i += 1;
+            hi = chars[i];
+            if hi == '\\' {
+                i += 1;
+                hi = *chars.get(i)?;
+            }
+            i += 1;
+        }
+        ranges.push((lo, hi));
+    }
+}
+
+/// Whether the file name `name` matches the pattern `tokens`.
+///
+/// As with glob(3), a leading `.` must be matched by a literal `.`.
+fn glob_match(tokens: &[GlobToken], name: &str) -> bool {
+    let name: Vec<char> = name.chars().collect();
+    if name.first() == Some(&'.') && tokens.first() != Some(&GlobToken::Literal('.')) {
+        return false;
+    }
+    let (mut t, mut n) = (0, 0);
+    // Where to resume after the last `*`: the token after it and the
+    // position in `name` it has consumed up to.
+    let mut star: Option<(usize, usize)> = None;
+    while n < name.len() {
+        match tokens.get(t) {
+            Some(GlobToken::Star) => {
+                star = Some((t + 1, n));
+                t += 1;
+                continue;
+            }
+            Some(token) if token.matches(name[n]) => {
+                t += 1;
+                n += 1;
+                continue;
+            }
+            _ => {}
+        }
+        let Some((resume, consumed)) = star else {
+            return false;
+        };
+        t = resume;
+        n = consumed + 1;
+        star = Some((resume, consumed + 1));
+    }
+    tokens[t..].iter().all(|t| *t == GlobToken::Star)
+}
+
+/// More files or directory entries than the limits allow.
+#[derive(Debug, PartialEq, Eq)]
+struct TooManyMatches;
+
+/// Expand the wildcards in `pattern` like glob(3) does for GNU make, with
+/// relative patterns taken relative to `base`. The result is sorted by
+/// byte value; make sorts it according to the locale.
+///
+/// Directories that can't be read contribute no matches, as with glob(3).
+fn glob(base: &Path, pattern: &str) -> Result<Vec<PathBuf>, TooManyMatches> {
+    let mut paths = vec![if pattern.starts_with('/') {
+        PathBuf::from("/")
+    } else {
+        base.to_path_buf()
+    }];
+    let mut budget = MAX_GLOB_ENTRIES;
+    for component in pattern.split('/').filter(|c| !c.is_empty()) {
+        let tokens = glob_tokens(component);
+        let literal: Option<String> = tokens
+            .iter()
+            .map(|t| match t {
+                GlobToken::Literal(c) => Some(*c),
+                _ => None,
+            })
+            .collect();
+        if let Some(literal) = literal {
+            for path in &mut paths {
+                path.push(&literal);
+            }
+            continue;
+        }
+        let mut matched = Vec::new();
+        for dir in &paths {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                budget = budget.checked_sub(1).ok_or(TooManyMatches)?;
+                let name = entry.file_name();
+                // TODO: match names that aren't valid UTF-8.
+                if name.to_str().is_some_and(|n| glob_match(&tokens, n)) {
+                    matched.push(dir.join(name));
+                }
+            }
+        }
+        if matched.len() > MAX_GLOB_MATCHES {
+            return Err(TooManyMatches);
+        }
+        paths = matched;
+    }
+    paths.retain(|p| p.exists());
+    let mut paths: Vec<PathBuf> = paths.iter().map(|p| normalize(p)).collect();
+    paths.sort_by(|a, b| a.as_os_str().cmp(b.as_os_str()));
+    paths.dedup();
+    Ok(paths)
 }
 
 /// The outcome of resolving an include file name.
@@ -289,7 +491,8 @@ impl Resolution {
     }
 }
 
-/// An include file name together with what it resolved to.
+/// An include file name together with what it resolved to. A name with
+/// wildcards that match several files has one of these per file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedInclude {
     pub path: IncludePath,
@@ -304,6 +507,9 @@ pub struct ResolvedInclude {
 /// tried relative to the including file's directory (`dir`), since fragments
 /// are often written that way.
 ///
+/// GNU make expands wildcards in the name, giving one resolution per
+/// matching file. A pattern that matches nothing is used as a file name.
+///
 /// TODO: try `-I` directories and make's default include directories; those
 /// aren't known to the server.
 pub fn resolve_include(
@@ -313,19 +519,44 @@ pub fn resolve_include(
     cwd: Option<&Path>,
     dir: Option<&Path>,
     exists: &dyn Fn(&Path) -> bool,
-) -> Resolution {
+) -> Vec<Resolution> {
     let Some(mut expanded) = expand(&path.name, vars, variant, cwd) else {
-        return Resolution::Unresolved;
+        return vec![Resolution::Unresolved];
     };
     if path.gnu {
         // `path` is a single name and literal values contain no blanks, so
         // this only unescapes blanks.
         let Ok([name]) = <[String; 1]>::try_from(Include::split_file_names(&expanded)) else {
-            return Resolution::Unresolved;
+            return vec![Resolution::Unresolved];
         };
         expanded = name;
+        if has_wildcard(&expanded) {
+            let mut bases: Vec<&Path> = [cwd, dir].into_iter().flatten().collect();
+            bases.dedup();
+            if Path::new(&expanded).is_absolute() {
+                bases.truncate(1);
+            }
+            for base in bases {
+                match glob(base, &expanded) {
+                    Ok(matches) if matches.is_empty() => {}
+                    Ok(matches) => return matches.into_iter().map(Resolution::Found).collect(),
+                    Err(TooManyMatches) => {
+                        tracing::warn!("too many files match {expanded} in {}", base.display());
+                        return vec![Resolution::Unresolved];
+                    }
+                }
+            }
+        }
     }
-    let expanded = Path::new(&expanded);
+    vec![resolve_name(Path::new(&expanded), cwd, dir, exists)]
+}
+
+fn resolve_name(
+    expanded: &Path,
+    cwd: Option<&Path>,
+    dir: Option<&Path>,
+    exists: &dyn Fn(&Path) -> bool,
+) -> Resolution {
     let candidates: Vec<PathBuf> = if expanded.is_absolute() {
         vec![normalize(expanded)]
     } else {
@@ -436,11 +667,12 @@ impl FileSet {
         self.complete
     }
 
-    /// The include file name at `offset` in the current document.
-    pub fn include_at(&self, offset: TextSize) -> Option<&ResolvedInclude> {
+    /// The resolutions of the include file name at `offset` in the current
+    /// document.
+    pub fn includes_at(&self, offset: TextSize) -> impl Iterator<Item = &ResolvedInclude> {
         self.includes
             .iter()
-            .find(|i| i.path.range.contains_inclusive(offset))
+            .filter(move |i| i.path.range.contains_inclusive(offset))
     }
 }
 
@@ -804,25 +1036,30 @@ impl Workspace {
         let mut children = BTreeSet::new();
         for path in include_paths(&makefile) {
             let exists = |p: &Path| self.open_paths.contains_key(p) || p.is_file();
-            let mut resolution =
+            let resolutions =
                 resolve_include(&path, &walk.vars, doc.variant(), cwd, doc.dir(), &exists);
-            if let Resolution::Found(target) = &resolution {
-                let target = target.clone();
-                children.insert(target.clone());
-                if walk.seen.insert(target.clone()) {
-                    match self.load(&target) {
-                        Ok(child) => self.visit(child, cwd, walk),
-                        Err(e) => {
-                            tracing::warn!("unable to load {}: {e}", target.display());
-                            walk.failed.insert(target.clone(), e.to_string());
+            for mut resolution in resolutions {
+                if let Resolution::Found(target) = &resolution {
+                    let target = target.clone();
+                    children.insert(target.clone());
+                    if walk.seen.insert(target.clone()) {
+                        match self.load(&target) {
+                            Ok(child) => self.visit(child, cwd, walk),
+                            Err(e) => {
+                                tracing::warn!("unable to load {}: {e}", target.display());
+                                walk.failed.insert(target.clone(), e.to_string());
+                            }
                         }
                     }
+                    if let Some(error) = walk.failed.get(&target) {
+                        resolution = Resolution::Unreadable(target, error.clone());
+                    }
                 }
-                if let Some(error) = walk.failed.get(&target) {
-                    resolution = Resolution::Unreadable(target, error.clone());
-                }
+                resolved.push(ResolvedInclude {
+                    path: path.clone(),
+                    resolution,
+                });
             }
-            resolved.push(ResolvedInclude { path, resolution });
         }
 
         if let Some(path) = doc.path() {
@@ -941,13 +1178,22 @@ fn find_makefiles(roots: &[PathBuf], max_entries: usize) -> Vec<PathBuf> {
     found
 }
 
-/// Replace entries in `into` with more informative ones from `from`.
-fn merge_includes(into: &mut [ResolvedInclude], from: &[ResolvedInclude]) {
-    for (a, b) in into.iter_mut().zip(from) {
-        if a.path == b.path && b.resolution.rank() > a.resolution.rank() {
-            a.resolution = b.resolution.clone();
+/// Replace the resolutions of names in `into` with more informative ones
+/// from `from`. Both list the same names in the same order, but a name with
+/// wildcards may have matched a different number of files.
+fn merge_includes(into: &mut Vec<ResolvedInclude>, from: &[ResolvedInclude]) {
+    let rank = |group: &[ResolvedInclude]| group.iter().map(|i| i.resolution.rank()).min();
+    let mut merged = Vec::with_capacity(into.len());
+    let mut from_groups = from.chunk_by(|a, b| a.path == b.path);
+    for group in into.chunk_by(|a, b| a.path == b.path) {
+        match from_groups.next() {
+            Some(other) if other[0].path == group[0].path && rank(other) > rank(group) => {
+                merged.extend_from_slice(other)
+            }
+            _ => merged.extend_from_slice(group),
         }
     }
+    *into = merged;
 }
 
 #[cfg(test)]
@@ -1162,7 +1408,7 @@ pub mod tests {
         );
         assert_eq!(
             expand("*.mk", &v, MakefileVariant::GNUMake, Some(cwd)),
-            None
+            Some("*.mk".to_string())
         );
         assert_eq!(expand("$@", &v, MakefileVariant::GNUMake, Some(cwd)), None);
         assert_eq!(
@@ -1245,7 +1491,7 @@ pub mod tests {
                 Some(Path::new("/top/sub")),
                 &exists
             ),
-            Resolution::Found(PathBuf::from("/top/x.mk"))
+            vec![Resolution::Found(PathBuf::from("/top/x.mk"))]
         );
         assert_eq!(
             resolve_include(
@@ -1256,7 +1502,7 @@ pub mod tests {
                 Some(Path::new("/top/sub")),
                 &exists
             ),
-            Resolution::Found(PathBuf::from("/top/sub/x.mk"))
+            vec![Resolution::Found(PathBuf::from("/top/sub/x.mk"))]
         );
         assert_eq!(
             resolve_include(
@@ -1267,7 +1513,7 @@ pub mod tests {
                 None,
                 &exists
             ),
-            Resolution::Missing(PathBuf::from("/top/y.mk"))
+            vec![Resolution::Missing(PathBuf::from("/top/y.mk"))]
         );
         assert_eq!(
             resolve_include(
@@ -1278,7 +1524,7 @@ pub mod tests {
                 None,
                 &exists
             ),
-            Resolution::Unresolved
+            vec![Resolution::Unresolved]
         );
     }
 
@@ -1291,7 +1537,7 @@ pub mod tests {
         assert_eq!(
             paths
                 .iter()
-                .map(|p| resolve_include(
+                .flat_map(|p| resolve_include(
                     p,
                     &LiteralVariables::default(),
                     MakefileVariant::BSDMake,
@@ -1301,6 +1547,198 @@ pub mod tests {
                 ))
                 .collect::<Vec<_>>(),
             vec![Resolution::Found(PathBuf::from("/top/a b.mk"))]
+        );
+    }
+
+    fn matches(pattern: &str, name: &str) -> bool {
+        glob_match(&glob_tokens(pattern), name)
+    }
+
+    #[test]
+    fn test_glob_match() {
+        assert!(matches("*.mk", "a.mk"));
+        assert!(!matches("*.mk", ".mk.mk"));
+        assert!(matches(".*.mk", ".h.mk"));
+        assert!(!matches("[.]h.mk", ".h.mk"));
+        assert!(matches("*", "abc"));
+        assert!(matches("a*b*c", "aXbYbc"));
+        assert!(!matches("a*b*c", "aXbYbcd"));
+        assert!(matches("?.mk", "x.mk"));
+        assert!(!matches("?.mk", "xy.mk"));
+        assert!(matches("[ab].mk", "b.mk"));
+        assert!(!matches("[ab].mk", "c.mk"));
+        assert!(matches("[a-c].mk", "c.mk"));
+        assert!(matches("[!a-c].mk", "d.mk"));
+        assert!(!matches("[^a-c].mk", "b.mk"));
+        assert!(matches("[]x]", "]"));
+        assert!(matches("[a-]", "-"));
+        assert!(matches("[", "["));
+        assert!(matches("[ab", "[ab"));
+        assert!(matches("\\*.mk", "*.mk"));
+        assert!(!matches("\\*.mk", "a.mk"));
+    }
+
+    #[test]
+    fn test_has_wildcard() {
+        assert!(!has_wildcard("a.mk"));
+        assert!(has_wildcard("*.mk"));
+        assert!(has_wildcard("a?.mk"));
+        assert!(has_wildcard("[ab].mk"));
+        assert!(!has_wildcard("\\*.mk"));
+    }
+
+    fn include_targets(fx: &Fixture, set: &FileSet) -> Vec<(String, Resolution)> {
+        let relative = |p: &Path| p.strip_prefix(fx.path("")).unwrap().to_path_buf();
+        set.includes()
+            .iter()
+            .map(|i| {
+                let resolution = match &i.resolution {
+                    Resolution::Found(p) => Resolution::Found(relative(p)),
+                    Resolution::Missing(p) => Resolution::Missing(relative(p)),
+                    other => other.clone(),
+                };
+                (i.path.name.clone(), resolution)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_file_set_include_wildcard() {
+        let fx = Fixture::new(&[
+            ("Makefile", "include *.mk\n"),
+            ("b.mk", "B = 1\n"),
+            ("a.mk", "A = 1\n"),
+            (".hidden.mk", ""),
+            ("sub/c.mk", ""),
+        ]);
+        let set = fx.file_set("Makefile");
+        assert_eq!(fx.names(&set), vec!["Makefile", "a.mk", "b.mk"]);
+        assert_eq!(
+            include_targets(&fx, &set),
+            vec![
+                ("*.mk".to_string(), Resolution::Found("a.mk".into())),
+                ("*.mk".to_string(), Resolution::Found("b.mk".into())),
+            ]
+        );
+        assert!(set.is_complete());
+    }
+
+    #[test]
+    fn test_file_set_include_wildcard_with_variable() {
+        let fx = Fixture::new(&[
+            (
+                "Makefile",
+                "D = mk\ninclude $(D)/?.mk $(D)/[!b]x.mk */rules.mk\n",
+            ),
+            ("mk/a.mk", ""),
+            ("mk/ab.mk", ""),
+            ("mk/ax.mk", ""),
+            ("mk/bx.mk", ""),
+            ("x/rules.mk", ""),
+            ("y/rules.mk", ""),
+            ("z/other.mk", ""),
+        ]);
+        let set = fx.file_set("Makefile");
+        assert_eq!(
+            fx.names(&set),
+            vec![
+                "Makefile",
+                "mk/a.mk",
+                "mk/ax.mk",
+                "x/rules.mk",
+                "y/rules.mk"
+            ]
+        );
+    }
+
+    #[test]
+    fn test_file_set_include_wildcard_no_match() {
+        let fx = Fixture::new(&[("Makefile", "include none*.mk\n-include *.inc\n")]);
+        let set = fx.file_set("Makefile");
+        assert_eq!(fx.names(&set), vec!["Makefile"]);
+        // make uses a pattern that matches nothing as the file name.
+        assert_eq!(
+            include_targets(&fx, &set),
+            vec![
+                (
+                    "none*.mk".to_string(),
+                    Resolution::Missing("none*.mk".into())
+                ),
+                ("*.inc".to_string(), Resolution::Missing("*.inc".into())),
+            ]
+        );
+        assert!(!set.is_complete());
+    }
+
+    #[test]
+    fn test_file_set_include_wildcard_directory() {
+        let fx = Fixture::new(&[("Makefile", "include *.d\n")]);
+        std::fs::create_dir(fx.path("x.d")).unwrap();
+        let set = fx.file_set("Makefile");
+        assert_eq!(
+            set.includes()
+                .iter()
+                .map(|i| i.resolution.clone())
+                .collect::<Vec<_>>(),
+            vec![Resolution::Unreadable(
+                fx.path("x.d"),
+                "not a regular file".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn test_file_set_include_wildcard_too_many() {
+        let fx = Fixture::new(&[("Makefile", "include d/*.mk\n")]);
+        std::fs::create_dir(fx.path("d")).unwrap();
+        for i in 0..=MAX_GLOB_MATCHES {
+            std::fs::write(fx.path(&format!("d/{i}.mk")), "").unwrap();
+        }
+        let set = fx.file_set("Makefile");
+        assert_eq!(fx.names(&set), vec!["Makefile"]);
+        assert_eq!(
+            include_targets(&fx, &set),
+            vec![("d/*.mk".to_string(), Resolution::Unresolved)]
+        );
+    }
+
+    #[test]
+    fn test_bsd_include_not_globbed() {
+        let fx = Fixture::new(&[("Makefile", ".include \"*.mk\"\n"), ("a.mk", "")]);
+        let set = fx.file_set("Makefile");
+        assert_eq!(fx.names(&set), vec!["Makefile"]);
+        assert_eq!(
+            include_targets(&fx, &set),
+            vec![("*.mk".to_string(), Resolution::Missing("*.mk".into()))]
+        );
+    }
+
+    #[test]
+    fn test_merge_includes_wildcard() {
+        let include = |name: &str, start: u32, resolution: Resolution| ResolvedInclude {
+            path: IncludePath {
+                range: TextRange::at(start.into(), (name.len() as u32).into()),
+                ..gnu_path(name)
+            },
+            resolution,
+        };
+        let mut into = vec![
+            include("*.mk", 0, Resolution::Missing("/a/*.mk".into())),
+            include("x.mk", 5, Resolution::Missing("/a/x.mk".into())),
+        ];
+        let from = vec![
+            include("*.mk", 0, Resolution::Found("/b/1.mk".into())),
+            include("*.mk", 0, Resolution::Found("/b/2.mk".into())),
+            include("x.mk", 5, Resolution::Unresolved),
+        ];
+        merge_includes(&mut into, &from);
+        assert_eq!(
+            into,
+            vec![
+                include("*.mk", 0, Resolution::Found("/b/1.mk".into())),
+                include("*.mk", 0, Resolution::Found("/b/2.mk".into())),
+                include("x.mk", 5, Resolution::Missing("/a/x.mk".into())),
+            ]
         );
     }
 

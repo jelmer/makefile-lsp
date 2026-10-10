@@ -117,8 +117,8 @@ targets and variables from included makefiles. Paths are resolved relative
 to the directory of the top-level makefile and of the including file.
 Variable references in include paths are expanded when the variable has a
 single plain value, as in `TOPDIR := ..` followed by `include
-$(TOPDIR)/rules.mk`; other paths, wildcards and `-I` directories are not
-resolved.
+$(TOPDIR)/rules.mk`, and wildcards in GNU make includes such as `include
+*.mk` are expanded; other paths and `-I` directories are not resolved.
 
 A fragment such as `rules.mk` opened on its own also sees the makefile that
 includes it, if that makefile is open or is the `GNUmakefile`, `makefile`
