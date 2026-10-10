@@ -85,7 +85,7 @@ Each diagnostic carries a code, so it can be identified in editors:
 | `missing-phony` | hint | conventional non-file target like `clean` or `install` that is not declared `.PHONY` |
 | `spaces-instead-of-tab` | error | recipe line indented with spaces |
 | `orphan-recipe-line` | error | recipe line outside of any rule |
-| `invalid-shell-syntax` | warning | recipe line rejected by `sh -n` (or the shell `SHELL` names); checked on open and save only |
+| `invalid-shell-syntax` | warning | recipe line (whole recipe with `.ONESHELL`) rejected by `sh -n` (or the shell `SHELL` names); checked on open and save only |
 | `unterminated-conditional` | error | `ifdef`/`ifeq` without a matching `endif` |
 | `malformed-condition` | error | BSD make `.if` or nmake `!IF` condition that does not parse |
 | `include-missing-path` | error | `include` without a path |

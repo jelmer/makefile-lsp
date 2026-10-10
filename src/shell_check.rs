@@ -1,8 +1,9 @@
 //! Check recipe lines for shell syntax errors by running them through
 //! `sh -n`.
 //!
-//! This spawns a process per recipe line, so it is only run when a document
-//! is opened or saved, not on every change.
+//! This spawns a process per recipe line (or per recipe with `.ONESHELL`),
+//! so it is only run when a document is opened or saved, not on every
+//! change.
 
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
@@ -10,8 +11,11 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 
-use makefile_lossless::{split_references, Makefile, MakefileVariant, Recipe, TextPart};
-use tower_lsp_server::ls_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Range};
+use makefile_lossless::{
+    split_references, ConditionalItem, Makefile, MakefileItem, MakefileVariant, Recipe, Rule,
+    TextPart,
+};
+use tower_lsp_server::ls_types::{Diagnostic, DiagnosticSeverity, NumberOrString};
 
 use crate::position::text_range_to_lsp_range;
 
@@ -24,10 +28,12 @@ const PLACEHOLDER: &str = "__make_ref__";
 /// The shell is `/bin/sh` unless `SHELL` is set to a known Bourne-style
 /// shell. Each logical recipe line (continuations included) is checked on
 /// its own, as make runs each in a separate shell, after rewriting it as
-/// described for `shell_script`.
+/// described for `shell_script`. With GNU make's `.ONESHELL`, all lines of
+/// a recipe are checked together as one script.
 ///
 /// Skipped entirely when `SHELL` can't be determined statically or isn't a
-/// Bourne-style shell, and with `.ONESHELL`.
+/// Bourne-style shell, or when `.ONESHELL` is only set conditionally. With
+/// `.ONESHELL`, recipes with conditionals in them are skipped.
 ///
 /// Reported as warnings rather than errors, as a make reference that
 /// expands to shell syntax (say, `then` or `;`) can make a valid line look
@@ -37,10 +43,9 @@ pub fn check_shell_syntax(
     makefile: &Makefile,
     variant: MakefileVariant,
 ) -> Vec<Diagnostic> {
-    // TODO: with .ONESHELL, check each recipe as a single script.
-    if makefile.rules_by_target(".ONESHELL").next().is_some() {
+    let Some(oneshell) = oneshell(makefile, variant) else {
         return Vec::new();
-    }
+    };
     let Some(shell) = shell_program(makefile) else {
         return Vec::new();
     };
@@ -48,8 +53,21 @@ pub fn check_shell_syntax(
     let mut cache: HashMap<String, Option<(usize, String)>> = HashMap::new();
     let mut diagnostics = Vec::new();
     for rule in makefile.rules() {
-        for recipe in rule.recipe_nodes() {
-            let script = shell_script(&recipe.shell_text(), variant);
+        let scripts = if oneshell {
+            oneshell_recipes(&rule).into_iter().collect()
+        } else {
+            rule.recipe_nodes()
+                .map(|recipe| vec![recipe])
+                .collect::<Vec<_>>()
+        };
+        for recipes in scripts {
+            // With .ONESHELL and a Bourne-style shell, GNU make strips the
+            // prefix characters from every line, not just the first.
+            let script = recipes
+                .iter()
+                .map(|recipe| shell_script(&recipe.shell_text(), variant))
+                .collect::<Vec<_>>()
+                .join("\n");
             if script.trim().is_empty() {
                 continue;
             }
@@ -67,8 +85,9 @@ pub fn check_shell_syntax(
             let Some((line, message)) = result else {
                 continue;
             };
+            let ranges: Vec<_> = recipes.iter().flat_map(Recipe::line_ranges).collect();
             diagnostics.push(Diagnostic {
-                range: recipe_line_range(source_text, &recipe, line),
+                range: text_range_to_lsp_range(source_text, ranges[line.min(ranges.len() - 1)]),
                 severity: Some(DiagnosticSeverity::WARNING),
                 code: Some(NumberOrString::String("invalid-shell-syntax".to_string())),
                 source: Some("makefile-lsp".to_string()),
@@ -78,6 +97,40 @@ pub fn check_shell_syntax(
         }
     }
     diagnostics
+}
+
+/// Whether each recipe runs as a single script, or `None` if that depends
+/// on a conditional.
+///
+/// GNU make honours `.ONESHELL` wherever it appears in the makefile. BSD
+/// make (as of bmake 20200710) has no `.ONESHELL`, and although its jobs
+/// mode runs a recipe in one shell, it still wraps each line separately.
+fn oneshell(makefile: &Makefile, variant: MakefileVariant) -> Option<bool> {
+    if !matches!(
+        variant,
+        MakefileVariant::GNUMake | MakefileVariant::POSIXMake
+    ) {
+        return Some(false);
+    }
+    let mut conditional = false;
+    for rule in makefile.rules_by_target(".ONESHELL") {
+        if MakefileItem::Rule(rule).enclosing_branches().is_empty() {
+            return Some(true);
+        }
+        conditional = true;
+    }
+    (!conditional).then_some(false)
+}
+
+/// The recipe lines of `rule`, or `None` if its body has conditionals, as
+/// which lines make passes to the shell is then unknown.
+fn oneshell_recipes(rule: &Rule) -> Option<Vec<Recipe>> {
+    rule.body_items()
+        .map(|item| match item {
+            ConditionalItem::Recipe(recipe) => Some(recipe),
+            _ => None,
+        })
+        .collect()
 }
 
 /// The shell make would run recipes with, or `None` if it can't be
@@ -253,18 +306,10 @@ fn parse_shell_error(stderr: &str) -> (usize, String) {
     (0, first.to_string())
 }
 
-/// The range of the `line`th line of the command of `recipe`, clamped to
-/// its last line, excluding the recipe prefix and line ending.
-fn recipe_line_range(source_text: &str, recipe: &Recipe, line: usize) -> Range {
-    let ranges: Vec<_> = recipe.line_ranges().collect();
-    let range = ranges[line.min(ranges.len() - 1)];
-    text_range_to_lsp_range(source_text, range)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tower_lsp_server::ls_types::Position;
+    use tower_lsp_server::ls_types::{Position, Range};
 
     fn check(text: &str) -> Vec<(Range, String)> {
         let parsed = Makefile::parse(text);
@@ -472,9 +517,121 @@ mod tests {
         );
     }
 
+    fn check_variant(text: &str, variant: MakefileVariant) -> Vec<(Range, String)> {
+        let parsed = Makefile::parse(text);
+        check_shell_syntax(text, &parsed.tree(), variant)
+            .into_iter()
+            .map(|d| (d.range, d.message))
+            .collect()
+    }
+
     #[test]
-    fn test_oneshell_skipped() {
-        assert_eq!(check(".ONESHELL:\nall:\n\tif true; then\n\tfi\n"), vec![]);
+    fn test_oneshell_split_if() {
+        let body = "all:\n\t@if true; then\n\t  -echo yes\n\tfi\n";
+        assert_eq!(
+            check(body),
+            vec![
+                (
+                    Range::new(Position::new(1, 1), Position::new(1, 15)),
+                    "shell syntax error: Syntax error: end of file unexpected (expecting \"fi\")"
+                        .to_string()
+                ),
+                (
+                    Range::new(Position::new(3, 1), Position::new(3, 3)),
+                    "shell syntax error: Syntax error: \"fi\" unexpected".to_string()
+                ),
+            ]
+        );
+        // .ONESHELL applies to the whole makefile, wherever it appears.
+        assert_eq!(check(&format!(".ONESHELL:\n{}", body)), vec![]);
+        assert_eq!(check(&format!("{}.ONESHELL:\n", body)), vec![]);
+    }
+
+    #[test]
+    fn test_oneshell_error_range() {
+        let text = concat!(
+            ".ONESHELL:\n",
+            "all: ; echo start\n",
+            "\tif true; then \\\n",
+            "\t  echo a\n",
+            "\n",
+            "\techo b\n",
+            "\tls )\n",
+            "\tfi\n",
+        );
+        assert_eq!(
+            check(text),
+            vec![(
+                Range::new(Position::new(6, 1), Position::new(6, 5)),
+                "shell syntax error: Syntax error: \")\" unexpected (expecting \"fi\")".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn test_oneshell_unterminated() {
+        let text = ".ONESHELL:\nall:\n\tif true; then\n\techo x\nother:\n\ttrue\n";
+        assert_eq!(
+            check(text),
+            vec![(
+                Range::new(Position::new(3, 1), Position::new(3, 7)),
+                "shell syntax error: Syntax error: end of file unexpected (expecting \"fi\")"
+                    .to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn test_oneshell_heredoc() {
+        // Inside an unquoted here-document `'` doesn't quote, so `$(` starts
+        // a command substitution: valid line by line, not as one script.
+        let body = "all:\n\tcat <<EOF\n\techo '$$('\n\tEOF\n";
+        assert_eq!(check(body), vec![]);
+        assert_eq!(
+            check(&format!(".ONESHELL:\n{}", body)),
+            vec![(
+                Range::new(Position::new(4, 1), Position::new(4, 4)),
+                "shell syntax error: Syntax error: Unterminated quoted string".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn test_oneshell_conditional() {
+        // Which branch make uses is unknown.
+        assert_eq!(
+            check(
+                ".ONESHELL:\nall:\nifdef V\n\tif true; then\nelse\n\tif false; then\nendif\n\tfi\n"
+            ),
+            vec![]
+        );
+        assert_eq!(
+            check("ifdef ONE\n.ONESHELL:\nendif\nall:\n\tif true; then\n\tfi\n"),
+            vec![]
+        );
+    }
+
+    #[test]
+    fn test_oneshell_bsd_make() {
+        // bmake has no .ONESHELL, and even with -j an `if` split over lines
+        // fails.
+        assert_eq!(
+            check_variant(
+                ".ONESHELL:\nall:\n\tif true; then\n\tfi\n",
+                MakefileVariant::BSDMake
+            ),
+            vec![
+                (
+                    Range::new(Position::new(2, 1), Position::new(2, 14)),
+                    "shell syntax error: Syntax error: end of file unexpected (expecting \"fi\")"
+                        .to_string()
+                ),
+                (
+                    Range::new(Position::new(3, 1), Position::new(3, 3)),
+                    "shell syntax error: Syntax error: \"fi\" unexpected".to_string()
+                ),
+            ]
+        );
     }
 
     #[test]
