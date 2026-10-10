@@ -154,9 +154,12 @@ fn collect_diagnostics(
     others: OtherMakefiles,
     base_dir: Option<&std::path::Path>,
 ) -> Vec<Diagnostic> {
+    // Missing endifs are reported by check_unterminated_conditionals, at the
+    // opening directive rather than at the end of the file.
     let mut diagnostics: Vec<Diagnostic> = parsed
         .positioned_errors()
         .iter()
+        .filter(|error| error.kind() != ParseErrorKind::MissingEndif)
         .map(|error| parse_error_diagnostic(source_text, error))
         .collect();
 
@@ -201,7 +204,11 @@ fn collect_diagnostics(
         diagnostics.extend(check_shell_in_recursive_assignment(source_text, &makefile));
     }
     diagnostics.extend(check_empty_automatic_variables(source_text, &makefile));
-    diagnostics.extend(check_unterminated_conditionals(source_text, &makefile));
+    diagnostics.extend(check_unterminated_conditionals(
+        source_text,
+        &makefile,
+        variant,
+    ));
     diagnostics.extend(check_malformed_conditions(source_text, &makefile));
     diagnostics.extend(check_unused_variables(source_text, &makefile, external));
     diagnostics.extend(check_mixed_assignment_operators(source_text, &makefile));
@@ -953,11 +960,17 @@ fn check_mixed_assignment_operators(source_text: &str, makefile: &Makefile) -> V
 
 /// Check for conditional blocks that are missing their `endif`.
 ///
-/// Bare `else` or `endif` outside a conditional are already reported by the
-/// parser as "unknown conditional directive". The case the parser silently
-/// accepts is an `ifdef`/`ifeq` that runs to end-of-file without a matching
-/// `endif`.
-fn check_unterminated_conditionals(source_text: &str, makefile: &Makefile) -> Vec<Diagnostic> {
+/// Bare `else` or `endif` outside a conditional are reported by the parser.
+fn check_unterminated_conditionals(
+    source_text: &str,
+    makefile: &Makefile,
+    variant: MakefileVariant,
+) -> Vec<Diagnostic> {
+    let endif = match variant {
+        MakefileVariant::BSDMake => ".endif",
+        MakefileVariant::NMake => "!ENDIF",
+        _ => "endif",
+    };
     let mut diagnostics = Vec::new();
 
     for cond in makefile.all_conditionals() {
@@ -983,7 +996,7 @@ fn check_unterminated_conditionals(source_text: &str, makefile: &Makefile) -> Ve
             range,
             DiagnosticSeverity::ERROR,
             "unterminated-conditional",
-            format!("'{}' is missing a matching 'endif'", kind),
+            format!("'{kind}' is missing a matching '{endif}'"),
         ));
     }
 
@@ -3609,6 +3622,56 @@ endif
         let text = "else\nFOO = bar\n";
         let codes = diag_codes(text);
         assert!(!codes.contains(&"unterminated-conditional".to_string()));
+    }
+
+    fn code_messages(text: &str, variant: MakefileVariant) -> Vec<(String, String)> {
+        let parsed = Makefile::parse_with_variant(text, variant);
+        get_diagnostics(text, &parsed, None)
+            .into_iter()
+            .filter_map(|d| match d.code {
+                Some(NumberOrString::String(code)) => Some((code, d.message)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_unterminated_conditional_reported_once() {
+        let pair = |code: &str, message: &str| (code.to_string(), message.to_string());
+        assert_eq!(
+            code_messages("ifdef A\nifdef B\n", MakefileVariant::GNUMake),
+            vec![
+                pair(
+                    "unterminated-conditional",
+                    "'ifdef' is missing a matching 'endif'"
+                ),
+                pair(
+                    "unterminated-conditional",
+                    "'ifdef' is missing a matching 'endif'"
+                ),
+            ]
+        );
+        assert_eq!(
+            code_messages(".if 1\n", MakefileVariant::BSDMake),
+            vec![pair(
+                "unterminated-conditional",
+                "'.if' is missing a matching '.endif'"
+            )]
+        );
+        assert_eq!(
+            code_messages(".for x in a\n.if 1\n.endfor\n", MakefileVariant::BSDMake),
+            vec![pair(
+                "unterminated-conditional",
+                "'.if' is missing a matching '.endif'"
+            )]
+        );
+        assert_eq!(
+            code_messages("!IFDEF X\n", MakefileVariant::NMake),
+            vec![pair(
+                "unterminated-conditional",
+                "'!IFDEF' is missing a matching '!ENDIF'"
+            )]
+        );
     }
 
     #[test]
