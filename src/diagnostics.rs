@@ -83,12 +83,15 @@ pub fn get_diagnostics(
             vars.add(&makefile, variant);
             include_paths(&makefile)
                 .into_iter()
-                .map(|path| {
-                    let resolution =
-                        resolve_include(&path, &vars, variant, Some(dir), Some(dir), &|p| {
-                            p.is_file()
-                        });
-                    ResolvedInclude { path, resolution }
+                .flat_map(|path| {
+                    resolve_include(&path, &vars, variant, Some(dir), Some(dir), &|p| {
+                        p.is_file()
+                    })
+                    .into_iter()
+                    .map(move |resolution| ResolvedInclude {
+                        path: path.clone(),
+                        resolution,
+                    })
                 })
                 .collect()
         }
@@ -3157,6 +3160,27 @@ endif
                 "included file 'b.mk' does not exist".to_string()
             )]
         );
+    }
+
+    #[test]
+    fn test_include_wildcard() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.mk"), "").unwrap();
+        let missing = |text: &str| -> Vec<String> {
+            diags_with_dir(text, dir.path())
+                .into_iter()
+                .filter(|d| {
+                    d.code == Some(NumberOrString::String("missing-include-file".to_string()))
+                })
+                .map(|d| d.message)
+                .collect()
+        };
+        assert_eq!(missing("include *.mk\n"), Vec::<String>::new());
+        assert_eq!(
+            missing("include *.inc\n"),
+            vec!["included file '*.inc' does not exist".to_string()]
+        );
+        assert_eq!(missing("-include *.inc\n"), Vec::<String>::new());
     }
 
     #[test]

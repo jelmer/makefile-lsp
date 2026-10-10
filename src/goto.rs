@@ -36,18 +36,31 @@ pub fn goto_definition(files: &FileSet, position: Position) -> Option<GotoDefini
         });
     }
 
-    if let Some(inc) = files.include_at(offset) {
-        let (Resolution::Found(path) | Resolution::Unreadable(path, _)) = &inc.resolution else {
-            return None;
+    let includes: Vec<_> = files.includes_at(offset).collect();
+    if !includes.is_empty() {
+        let mut locations: Vec<Location> = includes
+            .iter()
+            .filter_map(|inc| {
+                let (Resolution::Found(path) | Resolution::Unreadable(path, _)) = &inc.resolution
+                else {
+                    return None;
+                };
+                let Some(uri) = Uri::from_file_path(path) else {
+                    tracing::warn!("unable to convert {} to a URI", path.display());
+                    return None;
+                };
+                Some(Location {
+                    uri,
+                    range: Range::default(),
+                })
+            })
+            .collect();
+        // A name with wildcards may match several files.
+        return match locations.len() {
+            0 => None,
+            1 => locations.pop().map(GotoDefinitionResponse::Scalar),
+            _ => Some(GotoDefinitionResponse::Array(locations)),
         };
-        let Some(uri) = Uri::from_file_path(path) else {
-            tracing::warn!("unable to convert {} to a URI", path.display());
-            return None;
-        };
-        return Some(GotoDefinitionResponse::Scalar(Location {
-            uri,
-            range: Range::default(),
-        }));
     }
 
     let (prerequisite, _) = makefile
@@ -235,6 +248,24 @@ mod tests {
         );
         // a.mk doesn't exist.
         assert_eq!(goto(&fx, "Makefile", Position::new(0, 9)), None);
+    }
+
+    #[test]
+    fn test_goto_include_wildcard() {
+        let fx = Fixture::new(&[("Makefile", "include *.mk\n"), ("b.mk", ""), ("a.mk", "")]);
+        assert_eq!(
+            goto_definition(&fx.file_set("Makefile"), Position::new(0, 9)),
+            Some(GotoDefinitionResponse::Array(vec![
+                Location {
+                    uri: fx.uri("a.mk"),
+                    range: Range::default(),
+                },
+                Location {
+                    uri: fx.uri("b.mk"),
+                    range: Range::default(),
+                },
+            ]))
+        );
     }
 
     #[test]

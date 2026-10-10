@@ -5,21 +5,26 @@
 use tower_lsp_server::ls_types::{DocumentLink, Uri};
 
 use crate::position::text_range_to_lsp_range;
-use crate::workspace::{FileSet, Resolution};
+use crate::workspace::{has_wildcard, FileSet, Resolution};
 
 /// Generate document links for include directives.
 ///
 /// Links point at the file make would read, or would try to read if it
-/// doesn't exist. Names that can't be resolved statically get no link.
+/// doesn't exist. Names that can't be resolved statically get no link, and
+/// neither do wildcards unless they match exactly one file.
 pub fn get_document_links(files: &FileSet) -> Vec<DocumentLink> {
     let doc = files.current();
     files
         .includes()
-        .iter()
-        .filter_map(|inc| {
+        .chunk_by(|a, b| a.path == b.path)
+        .filter_map(|group| {
+            let [inc] = group else {
+                return None;
+            };
             let path = match &inc.resolution {
-                Resolution::Found(p) | Resolution::Missing(p) | Resolution::Unreadable(p, _) => p,
-                Resolution::Unresolved => return None,
+                Resolution::Found(p) | Resolution::Unreadable(p, _) => p,
+                Resolution::Missing(p) if !p.to_str().is_some_and(has_wildcard) => p,
+                Resolution::Missing(_) | Resolution::Unresolved => return None,
             };
             let Some(target) = Uri::from_file_path(path) else {
                 tracing::warn!("unable to convert {} to a URI", path.display());
@@ -39,6 +44,7 @@ pub fn get_document_links(files: &FileSet) -> Vec<DocumentLink> {
 mod tests {
     use super::*;
 
+    use crate::workspace::tests::Fixture;
     use crate::workspace::Workspace;
 
     fn get_links(text: &str) -> Vec<DocumentLink> {
@@ -112,6 +118,21 @@ mod tests {
                 (13, 17, "file:///home/user/project/b.mk".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn test_wildcard_links() {
+        let fx = Fixture::new(&[
+            ("Makefile", "include a*.mk b*.mk c*.mk\n"),
+            ("a1.mk", ""),
+            ("b1.mk", ""),
+            ("b2.mk", ""),
+        ]);
+        let links: Vec<(u32, Uri)> = get_document_links(&fx.file_set("Makefile"))
+            .into_iter()
+            .map(|l| (l.range.start.character, l.target.unwrap()))
+            .collect();
+        assert_eq!(links, vec![(8, fx.uri("a1.mk"))]);
     }
 
     #[test]
