@@ -216,7 +216,11 @@ fn collect_diagnostics(
     if variant == MakefileVariant::GNUMake {
         diagnostics.extend(check_shell_in_recursive_assignment(source_text, &makefile));
     }
-    diagnostics.extend(check_empty_automatic_variables(source_text, &makefile));
+    diagnostics.extend(check_empty_automatic_variables(
+        source_text,
+        &makefile,
+        variant,
+    ));
     diagnostics.extend(check_unterminated_conditionals(
         source_text,
         &makefile,
@@ -746,20 +750,109 @@ fn check_include_missing_path(source_text: &str, makefile: &Makefile) -> Vec<Dia
     diagnostics
 }
 
+/// The suffix list GNU make starts with, as shown by `make -p -f /dev/null`.
+const GNU_DEFAULT_SUFFIXES: &[&str] = &[
+    ".out", ".a", ".ln", ".o", ".c", ".cc", ".C", ".cpp", ".p", ".f", ".F", ".m", ".r", ".y", ".l",
+    ".ym", ".yl", ".s", ".S", ".mod", ".sym", ".def", ".h", ".info", ".dvi", ".tex", ".texinfo",
+    ".texi", ".txinfo", ".w", ".ch", ".web", ".sh", ".elc", ".el",
+];
+
+/// The suffix list GNU make has after reading `makefile`, or `None` if it
+/// isn't known because a `.SUFFIXES` prerequisite references a variable.
+///
+/// Suffixes added inside conditionals are included and lists cleared inside
+/// conditionals are kept, so that the result has all suffixes that may be
+/// known.
+fn gnu_suffixes(makefile: &Makefile) -> Option<Vec<String>> {
+    let mut suffixes: Vec<String> = GNU_DEFAULT_SUFFIXES.iter().map(|s| s.to_string()).collect();
+    for rule in makefile
+        .rules()
+        .filter(|rule| rule.targets().any(|t| t == ".SUFFIXES"))
+    {
+        let added: Vec<String> = rule.prerequisites().collect();
+        if added.iter().any(|s| s.contains('$')) {
+            return None;
+        }
+        if added.is_empty() {
+            if rule.parent().is_none() {
+                suffixes.clear();
+            }
+        } else {
+            suffixes.extend(added);
+        }
+    }
+    Some(suffixes)
+}
+
+/// Whether `target` names a suffix rule such as `.c.o` or `.c`. With an
+/// unknown suffix list, any target starting with a `.` may be one.
+fn is_suffix_rule_target(target: &str, suffixes: Option<&[String]>) -> bool {
+    let Some(suffixes) = suffixes else {
+        return target.starts_with('.') && !target.contains('/');
+    };
+    suffixes.iter().any(|source| {
+        target
+            .strip_prefix(source.as_str())
+            .is_some_and(|rest| rest.is_empty() || suffixes.iter().any(|s| s == rest))
+    })
+}
+
+/// Whether GNU make sets `$*` in an explicit rule for `target`: it's the
+/// target, or the member of an archive member target like `lib.a(m.o)`,
+/// minus a known suffix, and empty if there is no such suffix.
+fn explicit_target_has_stem(target: &str, suffixes: Option<&[String]>) -> bool {
+    let Some(suffixes) = suffixes else {
+        return true;
+    };
+    if target.contains('$') {
+        return true;
+    }
+    let name = target
+        .strip_suffix(')')
+        .and_then(|t| t.split_once('('))
+        .map_or(target, |(_, member)| member);
+    suffixes
+        .iter()
+        .any(|s| name.len() > s.len() && name.ends_with(s.as_str()))
+}
+
 /// Check for automatic variables that expand to empty in their context.
 ///
 /// `$<`, `$^`, `$+`, `$?` all expand to (part of) the prerequisite list, so
 /// they're empty in a rule with no prerequisites. `$*` expands to the stem of
-/// a pattern rule, so it's empty in a non-pattern rule. The same goes for
-/// their `D` and `F` forms, such as `$(<D)`.
-fn check_empty_automatic_variables(source_text: &str, makefile: &Makefile) -> Vec<Diagnostic> {
+/// a pattern, static pattern or suffix rule; in an explicit rule GNU make sets
+/// it to the target name minus a known suffix, so it's empty if the target
+/// has none. The same goes for their `D` and `F` forms, such as `$(<D)`.
+///
+/// BSD make always sets `$*` to the target name, minus any known suffix.
+fn check_empty_automatic_variables(
+    source_text: &str,
+    makefile: &Makefile,
+    variant: MakefileVariant,
+) -> Vec<Diagnostic> {
+    let suffixes = match variant {
+        // TODO: nmake's inference rules and its `$*` in explicit rules are
+        // not modelled, so no target is treated as having a suffix.
+        MakefileVariant::NMake => Some(Vec::new()),
+        MakefileVariant::BSDMake => None,
+        _ => gnu_suffixes(makefile),
+    };
+    let suffixes = suffixes.as_deref();
     let mut diagnostics = Vec::new();
 
     for rule in makefile.rules() {
-        let has_prereqs = rule.prerequisites().next().is_some();
-        let is_pattern = rule.targets().any(|t| t.contains('%'));
+        let is_suffix_rule = rule.targets().any(|t| is_suffix_rule_target(&t, suffixes));
+        let is_pattern = rule.static_pattern().is_some() || rule.targets().any(|t| t.contains('%'));
+        // A suffix rule's prerequisite is the implied source.
+        let has_prereqs = is_suffix_rule || rule.prerequisites().next().is_some();
+        let has_stem = is_pattern
+            || is_suffix_rule
+            || variant == MakefileVariant::BSDMake
+            || rule
+                .targets()
+                .any(|t| explicit_target_has_stem(&t, suffixes));
 
-        if has_prereqs && is_pattern {
+        if has_prereqs && has_stem {
             continue;
         }
 
@@ -776,7 +869,7 @@ fn check_empty_automatic_variables(source_text: &str, makefile: &Makefile) -> Ve
             }
             let reason = match var {
                 '<' | '^' | '+' | '?' if !has_prereqs => "rule has no prerequisites",
-                '*' if !is_pattern => "non-pattern rule",
+                '*' if !has_stem => "target has no pattern or known suffix",
                 _ => continue,
             };
             let shown = if name.len() == 1 {
@@ -2910,9 +3003,130 @@ endif
                 ),
                 (
                     Range::new(Position::new(1, 12), Position::new(1, 17)),
-                    "$(*F) expands to empty: non-pattern rule".to_string()
+                    "$(*F) expands to empty: target has no pattern or known suffix".to_string()
                 ),
             ]
+        );
+    }
+
+    fn empty_auto_var_messages(text: &str, variant: MakefileVariant) -> Vec<String> {
+        code_messages(text, variant)
+            .into_iter()
+            .filter(|(code, _)| code == "empty-automatic-variable")
+            .map(|(_, message)| message)
+            .collect()
+    }
+
+    #[test]
+    fn test_static_pattern_rule_stem_ok() {
+        let text = "y.out: %.out: %.in\n\techo $* $< $^\n";
+        assert_eq!(
+            empty_auto_var_messages(text, MakefileVariant::GNUMake),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn test_static_pattern_rule_without_prereqs() {
+        let text = "y.out: %.out:\n\techo $* $<\n";
+        assert_eq!(
+            empty_auto_var_messages(text, MakefileVariant::GNUMake),
+            vec!["$< expands to empty: rule has no prerequisites".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_stem_of_target_with_known_suffix_ok() {
+        let text = "x.o:\n\techo $*\ndir/y.c x.c.o all:\n\techo $*\n";
+        assert_eq!(
+            empty_auto_var_messages(text, MakefileVariant::GNUMake),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn test_stem_of_target_without_known_suffix() {
+        let text = "all:\n\techo $*\nx.foo:\n\techo $*\nx.tar.gz:\n\techo $*\n";
+        let message = "$* expands to empty: target has no pattern or known suffix".to_string();
+        assert_eq!(
+            empty_auto_var_messages(text, MakefileVariant::GNUMake),
+            vec![message.clone(), message.clone(), message]
+        );
+    }
+
+    #[test]
+    fn test_stem_with_suffixes_cleared() {
+        let text = ".SUFFIXES:\nx.o:\n\techo $*\n";
+        assert_eq!(
+            empty_auto_var_messages(text, MakefileVariant::GNUMake),
+            vec!["$* expands to empty: target has no pattern or known suffix".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_stem_with_suffixes_cleared_in_conditional_ok() {
+        let text = "ifdef X\n.SUFFIXES:\nendif\nx.o:\n\techo $*\n";
+        assert_eq!(
+            empty_auto_var_messages(text, MakefileVariant::GNUMake),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn test_stem_with_added_suffix_ok() {
+        // The suffix list is read after the whole makefile, so a later
+        // `.SUFFIXES` counts too.
+        let text = ".SUFFIXES:\n.SUFFIXES: .foo\nx.foo:\n\techo $*\n\
+                    y.bar:\n\techo $*\n.SUFFIXES: .bar\n";
+        assert_eq!(
+            empty_auto_var_messages(text, MakefileVariant::GNUMake),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn test_stem_with_variable_suffix_ok() {
+        let text = ".SUFFIXES: $(S)\nx.foo:\n\techo $*\n";
+        assert_eq!(
+            empty_auto_var_messages(text, MakefileVariant::GNUMake),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn test_stem_of_archive_member() {
+        let text = "lib.a(m.o):\n\techo $*\nlib.a(m):\n\techo $*\n";
+        assert_eq!(
+            empty_auto_var_messages(text, MakefileVariant::GNUMake),
+            vec!["$* expands to empty: target has no pattern or known suffix".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_suffix_rule_ok() {
+        let text = ".c.o:\n\t$(CC) -c $< -o $*.o\n.c:\n\t$(CC) $^ -o $@\n";
+        assert_eq!(
+            empty_auto_var_messages(text, MakefileVariant::GNUMake),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn test_suffix_rule_with_unknown_suffix() {
+        let text = ".foo.o:\n\techo $<\n";
+        assert_eq!(
+            empty_auto_var_messages(text, MakefileVariant::GNUMake),
+            vec!["$< expands to empty: rule has no prerequisites".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_bsd_stem_of_explicit_target_ok() {
+        // BSD make sets `$*` to the target name, minus any known suffix.
+        let text = "all:\n\techo $*\n";
+        assert_eq!(
+            empty_auto_var_messages(text, MakefileVariant::BSDMake),
+            Vec::<String>::new()
         );
     }
 
