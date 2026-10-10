@@ -14,15 +14,17 @@
 //!
 //! - a prerequisite of any rule, special targets like `.PRECIOUS` included,
 //!   or a word in the value of any variable;
-//! - the default goal (any first target that might be read first, and
-//!   `.DEFAULT_GOAL` or BSD `.MAIN`), or a `.PHONY` target;
+//! - a possible default goal of any of the makefiles, from its first rule,
+//!   a `.DEFAULT_GOAL` assignment that may be the last or BSD `.MAIN`, or a
+//!   `.PHONY` target;
 //! - a word in a recipe that runs `$(MAKE)`, or an include file name, as
 //!   make remakes included makefiles;
 //! - a used name with the same stem but another extension, which an
 //!   implicit rule may build it from (`foo.c` for `foo.o`).
 //!
 //! The check is skipped entirely when the set of used names can't be known:
-//! when `MAKECMDGOALS` is consulted, when rules may be generated with
+//! when `MAKECMDGOALS` is consulted, when the default goal may be set to
+//! something that has to be expanded, when rules may be generated with
 //! `$(eval)` and when a prerequisite expands anything but variables,
 //! substitution references and functions that only rearrange words.
 //!
@@ -34,7 +36,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use makefile_lossless::{
-    split_references, FunctionCall, Makefile, MakefileVariant, Modifier, ModifierArg,
+    split_references, DefaultGoal, FunctionCall, Makefile, MakefileVariant, Modifier, ModifierArg,
     ModifierArgPart, ParsedReference, ReferenceError, TextPart,
 };
 use tower_lsp_server::ls_types::{Diagnostic, DiagnosticSeverity, DiagnosticTag, NumberOrString};
@@ -67,7 +69,7 @@ pub fn check_unreachable_targets(files: &FileSet) -> Vec<Diagnostic> {
         return Vec::new();
     };
 
-    let makefile = &makefiles[0].0;
+    let makefile = current.makefile();
     let source_text = current.text();
     let mut reported = HashSet::new();
     let mut diagnostics = Vec::new();
@@ -82,7 +84,7 @@ pub fn check_unreachable_targets(files: &FileSet) -> Vec<Diagnostic> {
         for (name, range) in targets {
             if !is_candidate(&name)
                 || !used.is_derived(&name)
-                || used.double_colon.contains(&name)
+                || used.double_colon.contains(normalize(&name))
                 || used.contains(&name)
                 || !reported.insert(name.clone())
             {
@@ -155,17 +157,16 @@ impl UsedNames {
             {
                 return None;
             }
-            for goal in makefile.variable_definitions_by_name(".DEFAULT_GOAL") {
-                let value = goal.value_for(variant).unwrap_or_default();
-                if value.contains('$') {
+            for goal in makefile.default_goal_candidates(variant) {
+                if matches!(&goal, DefaultGoal::Variable { value, .. } if value.contains('$')) {
                     return None;
                 }
-                used.add_text(&value, variant);
+                used.words
+                    .extend(goal.names().iter().map(|n| normalize(n).to_string()));
             }
             for path in crate::workspace::include_paths(makefile) {
                 used.add_text(&path.name, variant);
             }
-            used.add_default_goal(makefile);
 
             for rule in makefile.rules() {
                 let targets: Vec<String> = rule.targets().collect();
@@ -197,19 +198,21 @@ impl UsedNames {
                     }
                     used.add_text(prereq, variant);
                 }
+                let target_names: Vec<String> =
+                    targets.iter().map(|t| normalize(t).to_string()).collect();
                 if prereqs.is_empty() && rule.recipe_nodes().next().is_none() {
-                    empty.extend(targets.iter().map(|t| normalize(t).to_string()));
+                    empty.extend(target_names.iter().cloned());
                 } else {
-                    nonempty.extend(targets.iter().map(|t| normalize(t).to_string()));
+                    nonempty.extend(target_names.iter().cloned());
                 }
-                for target in &targets {
+                for target in &target_names {
                     used.prerequisites
-                        .entry(normalize(target).to_string())
+                        .entry(target.clone())
                         .or_default()
                         .extend(prereqs.iter().map(|p| normalize(p).to_string()));
                 }
                 if rule.is_double_colon() {
-                    used.double_colon.extend(targets);
+                    used.double_colon.extend(target_names);
                 }
                 for recipe in rule.recipe_nodes() {
                     if recipe
@@ -223,28 +226,6 @@ impl UsedNames {
         }
         used.forced.extend(empty.difference(&nonempty).cloned());
         Some(used)
-    }
-
-    /// Add the targets that may be the default goal of `makefile` if it is
-    /// the first one make reads: the first target that doesn't start with
-    /// `.` and isn't a pattern, of each rule up to the first one outside
-    /// any conditional.
-    fn add_default_goal(&mut self, makefile: &Makefile) {
-        for rule in makefile.rules() {
-            if rule.scoped_assignment().is_some() {
-                continue;
-            }
-            let Some(goal) = rule
-                .targets()
-                .find(|t| !t.contains('%') && (!t.starts_with('.') || t.contains('/')))
-            else {
-                continue;
-            };
-            self.words.insert(normalize(&goal).to_string());
-            if rule.enclosing_branches().is_empty() {
-                break;
-            }
-        }
     }
 
     /// Add the words of `text`, keeping the literal parts of words that
@@ -565,6 +546,14 @@ mod tests {
 
     const PHONY: &str = ".PHONY: all\n";
 
+    /// The used names of `text` parsed as a BSD makefile, which documents
+    /// are never detected as.
+    fn bsd_used(text: &str) -> UsedNames {
+        let variant = MakefileVariant::BSDMake;
+        let makefile = Makefile::parse_with_variant(text, variant).tree();
+        UsedNames::collect(&[(makefile, variant)]).unwrap()
+    }
+
     #[test]
     fn test_unreferenced_file_target() {
         let text =
@@ -636,8 +625,14 @@ mod tests {
 
     #[test]
     fn test_default_goal_in_conditional() {
+        let text = ".PHONY: clean\nifdef X\na.o: x\nendif\nb.o: y\nc.o: z\nclean:\n";
+        assert_eq!(makefile(text), vec![(5, "c.o".to_string())]);
+        // One of the branches always has the first rule.
         let text = ".PHONY: clean\nifdef X\na.o: x\nelse\nb.o: y\nendif\nc.o: z\nd.o: w\nclean:\n";
-        assert_eq!(makefile(text), vec![(7, "d.o".to_string())]);
+        assert_eq!(
+            makefile(text),
+            vec![(6, "c.o".to_string()), (7, "d.o".to_string())]
+        );
     }
 
     #[test]
@@ -646,6 +641,34 @@ mod tests {
         assert_eq!(makefile(text), none());
         let text = ".PHONY: clean\nclean:\n.DEFAULT_GOAL := $(X)\nprog.bin: x\n";
         assert_eq!(makefile(text), none());
+    }
+
+    #[test]
+    fn test_default_goal_variable_overridden() {
+        // It overrides the first rule.
+        let text = ".PHONY: clean\nfirst.o: x\n.DEFAULT_GOAL := clean\n";
+        assert_eq!(makefile(text), vec![(1, "first.o".to_string())]);
+        // An assignment that can't be expanded doesn't matter once overridden.
+        let text = ".PHONY: clean\n.DEFAULT_GOAL := $(X)\n.DEFAULT_GOAL := clean\nstale.o: y\n";
+        assert_eq!(makefile(text), vec![(3, "stale.o".to_string())]);
+        // But one in a conditional may still be final.
+        let text = ".PHONY: clean\n.DEFAULT_GOAL := clean\nifdef X\n.DEFAULT_GOAL := $(X)\nendif\nstale.o: y\n";
+        assert_eq!(makefile(text), none());
+    }
+
+    #[test]
+    fn test_bsd_default_goal_with_dot() {
+        // Unlike GNU make, BSD make doesn't skip targets starting with `.`.
+        let text = ".PHONY: clean\n.a.b.c: x\nprog.bin: y\nclean:\n";
+        assert_eq!(makefile(text), none());
+        assert!(!bsd_used(text).contains("prog.bin"));
+    }
+
+    #[test]
+    fn test_bsd_main_overrides_first_rule() {
+        let used = bsd_used("first.o: x\n.MAIN: prog.bin\nprog.bin: y\n");
+        assert!(!used.contains("first.o"));
+        assert!(used.contains("prog.bin"));
     }
 
     #[test]
@@ -730,6 +753,11 @@ mod tests {
     fn test_double_colon_not_reported() {
         let text = format!("{PHONY}all:\nhook.stamp:: a\n\techo a\nhook.stamp:: b\n\techo b\n");
         assert_eq!(makefile(&text), none());
+        let files = [
+            ("Makefile", ".PHONY: all\nall:\ninclude hooks.mk\nx.o: a\n"),
+            ("hooks.mk", ".PHONY: hook\nhook:\n./x.o:: b\n"),
+        ];
+        assert_eq!(unreachable(&files, "Makefile"), none());
     }
 
     #[test]
