@@ -3,8 +3,9 @@
 use std::collections::{HashMap, HashSet};
 
 use makefile_lossless::{
-    ConditionalBranch, Makefile, MakefileVariant, Modifier, Parse, ParseErrorKind, ParsedReference,
-    PositionedParseError, ReferenceLocation, Rule, TextRange, VariableReference,
+    ConditionalBranch, ConditionalItem, Makefile, MakefileItem, MakefileVariant, Modifier, Parse,
+    ParseErrorKind, ParsedReference, PositionedParseError, ReferenceLocation, Rule, TextRange,
+    VariableReference,
 };
 use tower_lsp_server::ls_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Range};
 
@@ -36,6 +37,7 @@ fn make_diagnostic(
 pub struct ExternalSymbols {
     variables_defined: HashSet<String>,
     variables_referenced: HashSet<String>,
+    variables_tested: HashSet<String>,
     targets: HashSet<String>,
     /// Names used as prerequisites of ordinary (non-special) rules.
     prerequisites: HashSet<String>,
@@ -49,6 +51,7 @@ impl ExternalSymbols {
             .extend(makefile.variable_definitions().filter_map(|v| v.name()));
         self.variables_referenced
             .extend(referenced_variables(makefile));
+        self.variables_tested.extend(tested_variables(makefile));
         self.exports_all_variables |= exports_all_variables(makefile);
         for rule in makefile.rules() {
             let targets: Vec<String> = rule.targets().collect();
@@ -103,6 +106,7 @@ pub fn get_diagnostics(
         &ExternalSymbols::default(),
         &includes,
         OtherMakefiles::Unknown,
+        makefile.includes().next().is_none(),
         base_dir,
     )
 }
@@ -119,6 +123,12 @@ pub fn get_file_set_diagnostics(files: &FileSet) -> Vec<Diagnostic> {
         external.add(makefile);
     }
     let current = files.current();
+    // A fragment may use variables from a makefile that includes it.
+    let unknown_includer = files.includers().is_empty()
+        && current
+            .path()
+            .and_then(std::path::Path::file_name)
+            .is_some_and(|name| !crate::workspace::is_default_makefile_name(name));
     let mut diagnostics = collect_diagnostics(
         current.text(),
         current.parsed(),
@@ -129,6 +139,7 @@ pub fn get_file_set_diagnostics(files: &FileSet) -> Vec<Diagnostic> {
         } else {
             OtherMakefiles::Incomplete
         },
+        files.is_complete() && !unknown_includer,
         current.dir(),
     );
     diagnostics.extend(crate::unreachable::check_unreachable_targets(files));
@@ -152,6 +163,7 @@ fn collect_diagnostics(
     external: &ExternalSymbols,
     includes: &[ResolvedInclude],
     others: OtherMakefiles,
+    all_variables_visible: bool,
     base_dir: Option<&std::path::Path>,
 ) -> Vec<Diagnostic> {
     // Missing endifs are reported by check_unterminated_conditionals, at the
@@ -170,6 +182,7 @@ fn collect_diagnostics(
         &makefile,
         variant,
         external,
+        all_variables_visible,
     ));
     diagnostics.extend(check_recursive_variable_self_reference(
         source_text,
@@ -271,12 +284,27 @@ fn parse_error_diagnostic(source_text: &str, error: &PositionedParseError) -> Di
     )
 }
 
+/// Variables that are conventionally only set on the command line.
+const COMMAND_LINE_VARIABLES: &[&str] = &["DESTDIR"];
+
 /// Check for references to undefined variables.
+///
+/// References in recipes are only checked if `all_variables_visible`, that
+/// is if no makefile that includes this one or is included by it is
+/// missing. Recipes are expanded when they run, so variables defined
+/// anywhere count. Variables that are tested in a conditional may be set on
+/// the command line or in the environment, so they are not flagged in
+/// recipes, and neither is `DESTDIR`.
+///
+/// TODO: check define bodies. They are usually expanded by `$(call)` or
+/// `$(eval)`, where variables defined by other eval'd text and parameters
+/// passed in make most references impossible to resolve statically.
 fn check_undefined_variables(
     source_text: &str,
     makefile: &Makefile,
     variant: MakefileVariant,
     external: &ExternalSymbols,
+    all_variables_visible: bool,
 ) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
 
@@ -285,23 +313,33 @@ fn check_undefined_variables(
         .filter_map(|v| v.name())
         .collect();
     defined_vars.extend(external.variables_defined.iter().cloned());
+    defined_vars.extend(for_loop_variables(makefile));
+    let mut tested = tested_variables(makefile);
+    tested.extend(external.variables_tested.iter().cloned());
 
     for var_ref in makefile.variable_references() {
-        // TODO: also check recipes and define bodies. Variables there are
-        // often set on the command line or in the environment, as DESTDIR
-        // is, so that needs a way to tell those apart first.
-        if crate::references::in_recipe(&var_ref) || crate::references::in_define_body(&var_ref) {
+        if crate::references::in_define_body(&var_ref) {
             continue;
         }
-        let Some(name) = var_ref.name() else {
+        let in_recipe = crate::references::in_recipe(&var_ref);
+        if in_recipe && !all_variables_visible {
+            continue;
+        }
+        // A computed name such as `$(CFLAGS_$(ARCH))` can't be resolved.
+        let Some(name) = var_ref.name().filter(|name| !name.contains('$')) else {
             continue;
         };
         let known = match variant {
             MakefileVariant::NMake => builtins::is_nmake_known_macro(&name),
             MakefileVariant::BSDMake => builtins::is_bsd_known_variable(&name),
-            _ => builtins::is_known_variable(&name),
+            _ => builtins::is_known_variable(&name) || builtins::is_call_parameter(&name),
         };
-        if known || defined_vars.contains(&name) {
+        if known
+            || defined_vars.contains(&name)
+            || is_bound_by_function(source_text, &var_ref, &name)
+            || (in_recipe
+                && (tested.contains(&name) || COMMAND_LINE_VARIABLES.contains(&name.as_str())))
+        {
             continue;
         }
         let range = text_range_to_lsp_range(source_text, var_ref.text_range());
@@ -314,6 +352,62 @@ fn check_undefined_variables(
     }
 
     diagnostics
+}
+
+/// Whether `name` is the variable of an enclosing `$(foreach)` or `$(let)`
+/// whose body `reference` is in.
+fn is_bound_by_function(source_text: &str, reference: &VariableReference, name: &str) -> bool {
+    std::iter::successors(reference.parent_reference(), |r| r.parent_reference()).any(|call| {
+        if !call.is_function_call() || !matches!(call.name().as_deref(), Some("foreach" | "let")) {
+            return false;
+        }
+        let Ok(Some(args)) = call.arguments() else {
+            return false;
+        };
+        let [names, _, body] = args.as_slice() else {
+            return false;
+        };
+        body.contains_range(reference.text_range())
+            && source_text[*names].split_whitespace().any(|n| n == name)
+    })
+}
+
+/// The names of the variables of BSD make `.for` loops.
+fn for_loop_variables(makefile: &Makefile) -> HashSet<String> {
+    let mut names = HashSet::new();
+    let mut queue: Vec<ConditionalItem> = makefile.items().map(ConditionalItem::Item).collect();
+    while let Some(item) = queue.pop() {
+        match item {
+            ConditionalItem::Item(MakefileItem::ForLoop(f)) => {
+                names.extend(f.variables());
+                queue.extend(f.body_items());
+            }
+            ConditionalItem::Item(MakefileItem::Rule(rule)) => queue.extend(rule.body_items()),
+            ConditionalItem::Item(MakefileItem::Conditional(cond)) => {
+                queue.extend(cond.branches().flat_map(|b| b.items().collect::<Vec<_>>()));
+            }
+            _ => {}
+        }
+    }
+    names
+}
+
+/// Variables tested in a conditional, as in `ifdef V` or `ifeq ($(V),1)`.
+fn tested_variables(makefile: &Makefile) -> HashSet<String> {
+    let mut names: HashSet<String> = makefile
+        .all_conditionals()
+        .flat_map(|cond| cond.branches().collect::<Vec<_>>())
+        .flat_map(|branch| branch.tested_variables())
+        .map(|(name, _)| name)
+        .collect();
+    names.extend(makefile.variable_references().filter_map(|reference| {
+        let outer =
+            std::iter::successors(Some(reference.clone()), |r| r.parent_reference()).last()?;
+        matches!(outer.location(), ReferenceLocation::Condition(_))
+            .then(|| reference.name())
+            .flatten()
+    }));
+    names
 }
 
 /// Check for recursive variables that reference themselves, which causes infinite expansion.
@@ -2860,11 +2954,137 @@ endif
         assert!(!codes.contains(&"unused-variable".to_string()));
     }
 
+    /// The line and name of each undefined-variable diagnostic.
+    fn undefined_variables(text: &str) -> Vec<(u32, String)> {
+        get_diags(text)
+            .into_iter()
+            .filter(|d| d.code == Some(NumberOrString::String("undefined-variable".to_string())))
+            .map(|d| (d.range.start.line, d.message))
+            .collect()
+    }
+
+    fn not_defined(line: u32, name: &str) -> (u32, String) {
+        (line, format!("variable '{name}' is not defined"))
+    }
+
     #[test]
-    fn test_undefined_in_recipe_and_define_body_not_flagged() {
-        let text = "define F\n$(1) $(A)\nendef\nall:\n\techo $(B) $@ $(notdir $<)\n";
-        let codes = diag_codes(text);
-        assert!(!codes.contains(&"undefined-variable".to_string()));
+    fn test_undefined_in_recipe() {
+        let text = "all:\n\techo $(B) $@ $(notdir $<)\n\techo $(notdir $(SRC))\n";
+        assert_eq!(
+            undefined_variables(text),
+            vec![not_defined(1, "B"), not_defined(2, "SRC")]
+        );
+    }
+
+    #[test]
+    fn test_undefined_in_recipe_after_semicolon() {
+        assert_eq!(
+            undefined_variables("all: ; echo $(B)\n"),
+            vec![not_defined(0, "B")]
+        );
+    }
+
+    #[test]
+    fn test_undefined_in_define_body_not_flagged() {
+        let text = "define F\n$(1) $(A)\n\techo $(B)\nendef\n";
+        assert_eq!(undefined_variables(text), vec![]);
+    }
+
+    #[test]
+    fn test_recipe_variable_defined_later() {
+        // Recipes are expanded when they run, after the whole makefile is read.
+        let text = "all:\n\techo $(LATER)\nLATER = x\n";
+        assert_eq!(undefined_variables(text), vec![]);
+    }
+
+    #[test]
+    fn test_recipe_target_and_pattern_specific_variables() {
+        let text = "all: X = 1\n%.o: CF = -g\nall: a.o\n\techo $(X)\n%.o: %.c\n\tcc $(CF) -c $<\n";
+        assert_eq!(undefined_variables(text), vec![]);
+    }
+
+    #[test]
+    fn test_recipe_automatic_variables() {
+        let text = "all: a\n\techo $@ $< $^ $+ $? $* $| $(@D) $(<F) $(^D)\n";
+        assert_eq!(undefined_variables(text), vec![]);
+    }
+
+    #[test]
+    fn test_recipe_escaped_dollar_not_flagged() {
+        let text = "all:\n\techo $$HOME $${X} $$(pwd)\n\tfor f in a; do echo $$f; done\n";
+        assert_eq!(undefined_variables(text), vec![]);
+    }
+
+    #[test]
+    fn test_recipe_environment_variables() {
+        let text = "all:\n\techo $(HOME) $(PATH) $(SHELL) $(MAKE)\n";
+        assert_eq!(undefined_variables(text), vec![]);
+    }
+
+    #[test]
+    fn test_recipe_destdir_not_flagged() {
+        // DESTDIR is meant to be set on the command line, see the GNU Coding
+        // Standards.
+        let text = "install:\n\tcp a $(DESTDIR)/usr/bin\n";
+        assert_eq!(undefined_variables(text), vec![]);
+    }
+
+    #[test]
+    fn test_recipe_tested_variables_not_flagged() {
+        // A variable that is tested may be set on the command line or in the
+        // environment; only the test itself is flagged if it is a reference.
+        let text = "ifdef V\nendif\nifeq ($(Q),)\nendif\nall:\n\t$(Q)echo $(V)\n";
+        assert_eq!(undefined_variables(text), vec![not_defined(2, "Q")]);
+    }
+
+    #[test]
+    fn test_recipe_not_checked_with_unfollowed_include() {
+        let text = "include other.mk\nall:\n\techo $(FROM_INCLUDE)\n";
+        assert_eq!(undefined_variables(text), vec![]);
+    }
+
+    #[test]
+    fn test_foreach_variable() {
+        let text = "X := $(foreach v,a b,$(v) $v)\nall:\n\t$(foreach p,a b,echo $(p) $(call f,$p) $(U);)\n";
+        assert_eq!(undefined_variables(text), vec![not_defined(2, "U")]);
+    }
+
+    #[test]
+    fn test_foreach_variable_only_bound_in_body() {
+        // The list is expanded before the loop variable is set.
+        let text = "X := $(foreach v,$(v),x) $(v)\n";
+        assert_eq!(
+            undefined_variables(text),
+            vec![not_defined(0, "v"), not_defined(0, "v")]
+        );
+    }
+
+    #[test]
+    fn test_computed_name_not_flagged() {
+        let text = "X = $(FLAGS_$(ARCH))\nall:\n\techo $(DESC_$(dir $@))\n";
+        assert_eq!(undefined_variables(text), vec![not_defined(0, "ARCH")]);
+    }
+
+    #[test]
+    fn test_let_variables() {
+        let text = "X := $(let a b,1 2 3,$(a)$(b))\nall:\n\techo $(let c,1,$(c))\n";
+        assert_eq!(undefined_variables(text), vec![]);
+    }
+
+    #[test]
+    fn test_call_parameters_not_flagged() {
+        let text = "F = $(1) $(2)\nall:\n\techo $(call F,x) $(0)\n";
+        assert_eq!(undefined_variables(text), vec![]);
+    }
+
+    #[test]
+    fn test_bsd_for_loop_variables() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = ".for f in a b\nX += ${f}\n.endfor\nall:\n.for g in a b\n\techo ${g} ${.TARGET} ${U}\n.endfor\n";
+        assert_eq!(
+            bsd_messages(text, dir.path(), "undefined-variable"),
+            vec!["variable 'U' is not defined".to_string()]
+        );
     }
 
     #[test]
@@ -3909,6 +4129,61 @@ endif
         // TOOL and unused-variable for FROM_RULES and OUT.
         assert_eq!(file_set_codes(&fx, "Makefile"), empty);
         assert_eq!(file_set_codes(&fx, "rules.mk"), vec!["unused-variable"]);
+    }
+
+    fn file_set_undefined(files: &FileSet) -> Vec<(u32, String)> {
+        get_file_set_diagnostics(files)
+            .into_iter()
+            .filter(|d| d.code == Some(NumberOrString::String("undefined-variable".to_string())))
+            .map(|d| (d.range.start.line, d.message))
+            .collect()
+    }
+
+    #[test]
+    fn test_recipe_variables_across_files() {
+        let fx = crate::workspace::tests::Fixture::new(&[
+            (
+                "Makefile",
+                "TOOL = x\ninclude rules.mk\nall:\n\t$(FROM_RULES) $(U1)\n",
+            ),
+            ("rules.mk", "FROM_RULES = y\nout:\n\t$(TOOL) $(U2)\n"),
+        ]);
+        assert_eq!(
+            file_set_undefined(&fx.file_set("Makefile")),
+            vec![not_defined(3, "U1")]
+        );
+        assert_eq!(
+            file_set_undefined(&fx.file_set("rules.mk")),
+            vec![not_defined(2, "U2")]
+        );
+    }
+
+    #[test]
+    fn test_recipe_in_fragment_without_includer_not_checked() {
+        let fx =
+            crate::workspace::tests::Fixture::new(&[("rules.mk", "out:\n\t$(TOOL)\nX = $(U)\n")]);
+        assert_eq!(
+            file_set_undefined(&fx.file_set("rules.mk")),
+            vec![not_defined(2, "U")]
+        );
+    }
+
+    #[test]
+    fn test_recipe_in_including_fragment_without_includer_not_checked() {
+        let fx = crate::workspace::tests::Fixture::new(&[
+            ("rules.mk", "include defs.mk\nout:\n\t$(TOOL) $(A)\n"),
+            ("defs.mk", "A = 1\n"),
+        ]);
+        assert_eq!(file_set_undefined(&fx.file_set("rules.mk")), vec![]);
+    }
+
+    #[test]
+    fn test_recipe_not_checked_with_missing_include() {
+        let fx = crate::workspace::tests::Fixture::new(&[(
+            "Makefile",
+            "include config.mk\nall:\n\t$(FROM_CONFIG)\n",
+        )]);
+        assert_eq!(file_set_undefined(&fx.file_set("Makefile")), vec![]);
     }
 
     #[test]
