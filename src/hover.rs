@@ -273,6 +273,33 @@ mod tests {
     }
 
     #[test]
+    fn test_hover_archive_member_automatic_variable() {
+        assert_eq!(
+            hover_text("lib.a(m.o):\n\techo $%\n", Position::new(1, 7)).as_deref(),
+            Some(
+                "**`$%`**: The target member name, when the target is an archive member: \
+                 `bar.o` for the target `foo.a(bar.o)`. Empty when the target is not an \
+                 archive member."
+            )
+        );
+        assert_eq!(
+            hover_text("lib.a(m.o):\n\techo $(%D)\n", Position::new(1, 8)).as_deref(),
+            Some("**`$%D`**: The directory part of `$%`.")
+        );
+    }
+
+    #[test]
+    fn test_hover_stem_automatic_variable() {
+        assert_eq!(
+            hover_text("%.o: %.c\n\techo $*\n", Position::new(1, 7)).as_deref(),
+            Some(
+                "**`$*`**: The stem with which an implicit rule or static pattern rule \
+                 matches."
+            )
+        );
+    }
+
+    #[test]
     fn test_hover_variable_on_dollar() {
         assert_eq!(
             hover_text("CC = gcc\nall:\n\t$(CC)\n", Position::new(2, 1)).as_deref(),

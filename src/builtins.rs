@@ -228,14 +228,14 @@ pub const AUTOMATIC_VARIABLES: &[(&str, &str)] = &[
     ("^", "The names of all the prerequisites, with spaces between them (no duplicates)."),
     ("+", "Like `$^`, but prerequisites listed more than once are duplicated in the order they were listed."),
     ("?", "The names of all the prerequisites that are newer than the target."),
-    ("*", "The stem with which an implicit rule matches."),
-    ("%", "The stem of a static pattern rule."),
+    ("*", "The stem with which an implicit rule or static pattern rule matches."),
+    ("%", "The target member name, when the target is an archive member: `bar.o` for the target `foo.a(bar.o)`. Empty when the target is not an archive member."),
     ("|", "The names of all the order-only prerequisites."),
 ];
 
 /// GNU Make automatic variable variants (e.g. $(@D), $(@F)).
 pub const AUTOMATIC_VARIABLE_VARIANTS: &[&str] = &[
-    "@D", "@F", "<D", "<F", "^D", "^F", "+D", "+F", "?D", "?F", "*D", "*F",
+    "@D", "@F", "%D", "%F", "<D", "<F", "^D", "^F", "+D", "+F", "?D", "?F", "*D", "*F",
 ];
 
 /// Well-known GNU Make built-in variables with descriptions.
