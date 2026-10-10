@@ -61,7 +61,7 @@ Each diagnostic carries a code, so it can be identified in editors:
 
 | Code | Severity | Description |
 |------|----------|-------------|
-| `undefined-variable` | warning | reference to a variable that is never assigned and not built in (for nmake, its predefined and filename macros; for BSD make, its built-in and local variables) |
+| `undefined-variable` | warning | reference to a variable that is never assigned and not built in (for nmake, its predefined and filename macros; for BSD make, its built-in and local variables); in recipes only when all included and including makefiles are known, and not for `DESTDIR` or variables tested in a conditional; `define` bodies are not checked |
 | `recursive-variable-reference` | warning | `=` assignment that references itself |
 | `empty-variable-reference` | warning | `$()` or `${}` |
 | `empty-automatic-variable` | warning | `$<`, `$^`, `$+` or `$?` in a rule without prerequisites, or `$*` outside a pattern rule |

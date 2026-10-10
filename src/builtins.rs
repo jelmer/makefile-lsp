@@ -230,6 +230,7 @@ pub const AUTOMATIC_VARIABLES: &[(&str, &str)] = &[
     ("?", "The names of all the prerequisites that are newer than the target."),
     ("*", "The stem with which an implicit rule matches."),
     ("%", "The stem of a static pattern rule."),
+    ("|", "The names of all the order-only prerequisites."),
 ];
 
 /// GNU Make automatic variable variants (e.g. $(@D), $(@F)).

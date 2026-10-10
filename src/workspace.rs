@@ -1132,6 +1132,11 @@ impl Workspace {
     }
 }
 
+/// Whether `name` is one that make reads when run without `-f`.
+pub fn is_default_makefile_name(name: &std::ffi::OsStr) -> bool {
+    DEFAULT_MAKEFILES.iter().any(|n| name == *n)
+}
+
 /// Whether `name` is a conventional makefile name.
 pub fn is_makefile_name(name: &str) -> bool {
     DEFAULT_MAKEFILES.contains(&name) || name.ends_with(".mk") || name.ends_with(".mak")
