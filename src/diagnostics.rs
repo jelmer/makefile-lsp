@@ -343,9 +343,16 @@ fn check_undefined_variables(
             continue;
         }
         let range = text_range_to_lsp_range(source_text, var_ref.text_range());
+        // Recipe references are often meant to be set from the command line
+        // or the environment without a default.
+        let severity = if in_recipe {
+            DiagnosticSeverity::INFORMATION
+        } else {
+            DiagnosticSeverity::WARNING
+        };
         diagnostics.push(make_diagnostic(
             range,
-            DiagnosticSeverity::WARNING,
+            severity,
             "undefined-variable",
             format!("variable '{}' is not defined", name),
         ));
@@ -2973,6 +2980,23 @@ endif
         assert_eq!(
             undefined_variables(text),
             vec![not_defined(1, "B"), not_defined(2, "SRC")]
+        );
+    }
+
+    #[test]
+    fn test_undefined_in_recipe_severity() {
+        let text = "X = $(A)\nall:\n\techo $(B)\n";
+        let severities: Vec<_> = get_diags(text)
+            .into_iter()
+            .filter(|d| d.code == Some(NumberOrString::String("undefined-variable".to_string())))
+            .map(|d| (d.range.start.line, d.severity))
+            .collect();
+        assert_eq!(
+            severities,
+            vec![
+                (0, Some(DiagnosticSeverity::WARNING)),
+                (2, Some(DiagnosticSeverity::INFORMATION))
+            ]
         );
     }
 
