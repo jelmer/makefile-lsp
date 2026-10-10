@@ -70,7 +70,7 @@ Each diagnostic carries a code, so it can be identified in editors:
 | `mixed-assignment-operators` | warning | variable assigned with both `=` and `:=` |
 | `shell-in-recursive-assignment` | warning | `$(shell ...)` in an `=` assignment, which runs on every expansion (GNU make only) |
 | `trailing-whitespace-in-value` | warning | trailing whitespace that becomes part of a variable value (not for BSD make, which strips it) |
-| `duplicate-target` | warning | target defined by more than one single-colon rule |
+| `duplicate-target` | warning | target has a recipe in more than one single-colon rule |
 | `mixed-rule-separator` | error | target with both `:` and `::` rules |
 | `self-dependency` | warning | target that lists itself as a prerequisite |
 | `circular-dependency` | warning | cycle between targets |

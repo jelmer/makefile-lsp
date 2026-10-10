@@ -478,16 +478,21 @@ fn separated_rules(makefile: &Makefile) -> impl Iterator<Item = Rule> + '_ {
 
 /// Check for duplicate target definitions.
 ///
-/// In GNU Make, when the same target appears in multiple single-colon rules,
-/// only the last one's recipe is used, which is almost always a mistake.
-/// Double-colon rules (`::`) are intentionally excluded since they allow
-/// multiple recipe blocks, as are rules in different branches of a
-/// conditional, since only one of those takes effect.
+/// In GNU Make, when the same target has a recipe in multiple single-colon
+/// rules, only the last recipe is used, which is almost always a mistake.
+/// Rules without a recipe only add prerequisites, and target-specific
+/// variable assignments such as `foo: CFLAGS = -O2` are not rules at all, so
+/// neither is reported. Double-colon rules (`::`) are intentionally excluded
+/// since they allow multiple recipe blocks, as are rules in different branches
+/// of a conditional, since only one of those takes effect.
 fn check_duplicate_targets(source_text: &str, makefile: &Makefile) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
     let mut seen: HashMap<String, Vec<(Range, Vec<ConditionalBranch>)>> = HashMap::new();
 
     for rule in separated_rules(makefile) {
+        if rule.recipe_count() == 0 {
+            continue;
+        }
         let branches = rule.enclosing_branches();
         for (target, range) in targets_with_ranges(&rule) {
             // Skip pattern rules (contain %)
@@ -2012,6 +2017,56 @@ mod tests {
             ),
             vec![(
                 Range::new(Position::new(7, 0), Position::new(7, 3)),
+                "target 'foo' already defined on line 2".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn test_duplicate_target_target_specific_variable_ok() {
+        assert_eq!(
+            duplicate_target_diags("foo: Y = 1\nfoo:\n\techo $(Y)\n"),
+            vec![]
+        );
+        assert_eq!(
+            duplicate_target_diags("foo:\n\techo $(Y)\nfoo: Y = 1\n"),
+            vec![]
+        );
+        assert_eq!(
+            duplicate_target_diags(
+                "foo: override Y := 1\nfoo: export Z = 2\nfoo: private W = 3\nfoo:\n\techo $(Y)\n"
+            ),
+            vec![]
+        );
+    }
+
+    #[test]
+    fn test_duplicate_target_without_recipe_ok() {
+        // Only one of the rules has a recipe, so make merges them silently.
+        assert_eq!(
+            duplicate_target_diags("foo: a\nfoo: b\n\techo hi\n"),
+            vec![]
+        );
+        assert_eq!(duplicate_target_diags("foo:\n\techo hi\nfoo: b\n"), vec![]);
+    }
+
+    #[test]
+    fn test_duplicate_target_inline_recipe() {
+        assert_eq!(
+            duplicate_target_diags("foo:\n\techo one\nfoo: ; echo two\n"),
+            vec![(
+                Range::new(Position::new(2, 0), Position::new(2, 3)),
+                "target 'foo' already defined on line 1".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn test_duplicate_target_reports_first_recipe() {
+        assert_eq!(
+            duplicate_target_diags("foo: a\nfoo: b\n\techo one\nfoo: c\n\techo two\n"),
+            vec![(
+                Range::new(Position::new(3, 0), Position::new(3, 3)),
                 "target 'foo' already defined on line 2".to_string()
             )]
         );
