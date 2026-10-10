@@ -1,6 +1,7 @@
 //! Diagnostics for Makefile files.
 
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 use makefile_lossless::{
     ConditionalBranch, ConditionalItem, Makefile, MakefileItem, MakefileVariant, Modifier, Parse,
@@ -13,7 +14,9 @@ use crate::builtins;
 use crate::dep_graph::mutually_exclusive;
 use crate::position::text_range_to_lsp_range;
 use crate::targets::targets_with_ranges;
-use crate::workspace::{parsed_variant, FileSet, Resolution, ResolvedInclude};
+use crate::workspace::{
+    is_default_makefile_name, parsed_variant, FileSet, Resolution, ResolvedInclude,
+};
 
 fn make_diagnostic(
     range: Range,
@@ -105,9 +108,12 @@ pub fn get_diagnostics(
         parsed,
         &ExternalSymbols::default(),
         &includes,
-        OtherMakefiles::Unknown,
-        makefile.includes().next().is_none(),
-        base_dir,
+        Context {
+            others: OtherMakefiles::Unknown,
+            all_variables_visible: makefile.includes().next().is_none(),
+            make_dirs: base_dir.as_slice(),
+            base_dir,
+        },
     )
 }
 
@@ -129,21 +135,48 @@ pub fn get_file_set_diagnostics(files: &FileSet) -> Vec<Diagnostic> {
             .path()
             .and_then(std::path::Path::file_name)
             .is_some_and(|name| !crate::workspace::is_default_makefile_name(name));
+    let make_dirs = make_directories(files).unwrap_or_default();
+    let make_dirs: Vec<&Path> = make_dirs.iter().map(PathBuf::as_path).collect();
     let mut diagnostics = collect_diagnostics(
         current.text(),
         current.parsed(),
         &external,
         files.includes(),
-        if files.is_complete() {
-            OtherMakefiles::Complete(&others)
-        } else {
-            OtherMakefiles::Incomplete
+        Context {
+            others: if files.is_complete() {
+                OtherMakefiles::Complete(&others)
+            } else {
+                OtherMakefiles::Incomplete
+            },
+            all_variables_visible: files.is_complete() && !unknown_includer,
+            make_dirs: &make_dirs,
+            base_dir: current.dir(),
         },
-        files.is_complete() && !unknown_includer,
-        current.dir(),
     );
     diagnostics.extend(crate::unreachable::check_unreachable_targets(files));
     diagnostics
+}
+
+/// The directories make may run in when it reads the current document of
+/// `files`: those of the top-level makefiles that include it, or its own
+/// directory if nothing is known to include it.
+///
+/// `None` if one of those makefiles is a fragment rather than a file make
+/// reads by default, as it may be included from a makefile we don't know
+/// or run with `make -f` from any directory.
+fn make_directories(files: &FileSet) -> Option<Vec<PathBuf>> {
+    let current = files.current().path()?;
+    let tops = match files.includers() {
+        [] => vec![current.to_path_buf()],
+        includers => includers.to_vec(),
+    };
+    tops.iter()
+        .map(|top| {
+            top.file_name()
+                .filter(|name| is_default_makefile_name(name))?;
+            top.parent().map(Path::to_path_buf)
+        })
+        .collect()
 }
 
 /// The other makefiles of a file set, for checks that need to know all rules.
@@ -157,15 +190,31 @@ enum OtherMakefiles<'a> {
     Incomplete,
 }
 
+/// What is known about the makefiles around the one being checked.
+struct Context<'a> {
+    others: OtherMakefiles<'a>,
+    /// Whether every makefile that may define a variable used in a recipe
+    /// is known.
+    all_variables_visible: bool,
+    /// The directories make may run in.
+    make_dirs: &'a [&'a Path],
+    /// The directory of the makefile itself.
+    base_dir: Option<&'a Path>,
+}
+
 fn collect_diagnostics(
     source_text: &str,
     parsed: &Parse<makefile_lossless::Makefile>,
     external: &ExternalSymbols,
     includes: &[ResolvedInclude],
-    others: OtherMakefiles,
-    all_variables_visible: bool,
-    base_dir: Option<&std::path::Path>,
+    context: Context,
 ) -> Vec<Diagnostic> {
+    let Context {
+        others,
+        all_variables_visible,
+        make_dirs,
+        base_dir,
+    } = context;
     // Missing endifs are reported by check_unterminated_conditionals, at the
     // opening directive rather than at the end of the file.
     let mut diagnostics: Vec<Diagnostic> = parsed
@@ -242,12 +291,14 @@ fn collect_diagnostics(
         if has_phony {
             diagnostics.extend(check_missing_phony(source_text, &makefile, external, dir));
         }
+    }
+    if !make_dirs.is_empty() {
         diagnostics.extend(check_unresolved_prerequisites(
             source_text,
             &makefile,
             variant,
             others,
-            dir,
+            make_dirs,
         ));
     }
 
@@ -1436,7 +1487,8 @@ fn check_missing_phony(
 ///   archive members are skipped, as are prerequisites of special targets.
 /// - A prerequisite is resolved if it is an explicit target, matches a
 ///   pattern rule target or is declared `.PHONY` (in this makefile or in
-///   `others`), or exists relative to the makefile's directory.
+///   `others`), or exists relative to one of `make_dirs`, the directories
+///   make may run in.
 /// - GNU make's built-in rules can make a file from another one with the
 ///   same stem (`foo.o` or `foo` from `foo.c`), so a prerequisite is also
 ///   resolved if any file with its stem and some extension exists.
@@ -1447,18 +1499,12 @@ fn check_missing_phony(
 ///   `vpath`/`VPATH`, `$(eval)` (also in a recipe) or a line that expands
 ///   to makefile text, a `.DEFAULT` rule, or a target name that isn't a
 ///   plain variable with a literal value.
-///
-/// TODO: a fragment that is included from, or run with `make -f` from,
-/// another directory resolves its paths relative to that directory, and a
-/// fragment opened without its includer may rely on targets defined there.
-/// Resolve paths relative to the top-level makefile and only check fragments
-/// whose includer is known.
 fn check_unresolved_prerequisites(
     source_text: &str,
     makefile: &Makefile,
     variant: MakefileVariant,
     others: OtherMakefiles,
-    base_dir: &std::path::Path,
+    make_dirs: &[&Path],
 ) -> Vec<Diagnostic> {
     let (includes_followed, others) = match others {
         OtherMakefiles::Unknown => (false, &[][..]),
@@ -1503,8 +1549,9 @@ fn check_unresolved_prerequisites(
                 || makefiles
                     .iter()
                     .any(|m| m.find_rule_by_target_pattern(name).is_some() || m.is_phony(name))
-                || base_dir.join(name).exists()
-                || has_file_with_same_stem(&base_dir.join(name))
+                || make_dirs
+                    .iter()
+                    .any(|dir| dir.join(name).exists() || has_file_with_same_stem(&dir.join(name)))
             {
                 continue;
             }
@@ -4565,6 +4612,62 @@ endif
             file_set_unresolved_prereqs(&files, "rules.mk"),
             Vec::<String>::new()
         );
+    }
+
+    fn unresolved_messages(files: &FileSet) -> Vec<String> {
+        get_file_set_diagnostics(files)
+            .into_iter()
+            .filter(|d| {
+                d.code
+                    == Some(NumberOrString::String(
+                        "unresolved-prerequisite".to_string(),
+                    ))
+            })
+            .map(|d| d.message)
+            .collect()
+    }
+
+    #[test]
+    fn test_unresolved_prerequisite_relative_to_includer() {
+        // make resolves the paths in sub/rules.mk relative to the directory
+        // it runs in, that of the top-level makefile.
+        let fx = crate::workspace::tests::Fixture::new(&[
+            ("Makefile", "include sub/rules.mk\n"),
+            ("sub/rules.mk", "out: data.txt src/x.c\n\techo\n"),
+            ("data.txt", ""),
+            ("sub/src/x.c", ""),
+        ]);
+        assert_eq!(
+            unresolved_messages(&fx.file_set("sub/rules.mk")),
+            vec!["no rule to make prerequisite 'src/x.c', and no such file exists".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_unresolved_prerequisite_skipped_without_includer() {
+        let fx = crate::workspace::tests::Fixture::new(&[("rules.mk", "out: missing\n\techo\n")]);
+        assert_eq!(
+            unresolved_messages(&fx.file_set("rules.mk")),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn test_unresolved_prerequisite_skipped_with_fragment_as_top() {
+        // top.mk may be run with `make -f` from any directory.
+        let fx = crate::workspace::tests::Fixture::new(&[
+            ("top.mk", "include rules.mk\nall: missing1\n"),
+            ("rules.mk", "out: missing2\n\techo\n"),
+        ]);
+        let (mut ws, top) = fx.open("top.mk");
+        assert_eq!(
+            unresolved_messages(&ws.file_set(&top).unwrap()),
+            Vec::<String>::new()
+        );
+        let rules = fx.open_in(&mut ws, "rules.mk");
+        let files = ws.file_set(&rules).unwrap();
+        assert_eq!(files.includers(), &[fx.path("top.mk")]);
+        assert_eq!(unresolved_messages(&files), Vec::<String>::new());
     }
 
     #[test]
