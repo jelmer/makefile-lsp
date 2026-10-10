@@ -39,6 +39,12 @@ const DEFAULT_MAKEFILES: &[&str] = &["GNUmakefile", "makefile", "Makefile"];
 /// include it, when the document isn't inside a workspace folder.
 const MAX_PROBE_DEPTH: usize = 2;
 
+/// The directories GNU make searches for included files after the `-I`
+/// directories, skipping those that don't exist. make puts the include
+/// directory of its installation prefix first, which is normally one of
+/// these.
+const DEFAULT_INCLUDE_DIRS: &[&str] = &["/usr/gnu/include", "/usr/local/include", "/usr/include"];
+
 /// A parsed makefile, either an open editor buffer or a file read from disk.
 pub struct Document {
     uri: Uri,
@@ -103,6 +109,16 @@ pub fn file_path(uri: &Uri) -> Option<PathBuf> {
         return None;
     }
     uri.to_file_path().map(|p| normalize(&p))
+}
+
+/// Read the `includeDirs` initialization option: the directories to search
+/// for included makefiles, as with `make -I`.
+pub fn include_dirs_option(options: Option<&serde_json::Value>) -> Result<Vec<PathBuf>, String> {
+    let Some(dirs) = options.and_then(|o| o.get("includeDirs")) else {
+        return Ok(Vec::new());
+    };
+    serde_json::from_value(dirs.clone())
+        .map_err(|e| format!("invalid includeDirs initialization option: {e}"))
 }
 
 /// Lexically normalize a path, removing `.` components and resolving `..`
@@ -174,9 +190,13 @@ pub fn include_paths(makefile: &Makefile) -> Vec<IncludePath> {
 /// This is deliberately conservative: a variable counts only if every
 /// assignment seen is an unconditional, global `=`, `:=`, `::=` or `:::=` of
 /// the same value without variable references or whitespace.
+///
+/// It also records the include directories that assignments to `MAKEFLAGS`
+/// add with `-I`.
 #[derive(Debug, Default)]
 pub struct LiteralVariables {
     values: HashMap<String, Option<String>>,
+    makeflags_include_dirs: Vec<String>,
 }
 
 impl LiteralVariables {
@@ -185,6 +205,12 @@ impl LiteralVariables {
             let Some(name) = def.name() else {
                 continue;
             };
+            if name == "MAKEFLAGS" {
+                if let Some(flags) = makeflags_value(&def, variant) {
+                    self.makeflags_include_dirs
+                        .extend(include_dirs_from_flags(&flags));
+                }
+            }
             let literal = literal_value(&def, variant);
             self.values
                 .entry(name)
@@ -204,6 +230,82 @@ impl LiteralVariables {
     fn is_assigned(&self, name: &str) -> bool {
         self.values.contains_key(name)
     }
+}
+
+/// The directories make searches for an include file name that isn't found
+/// in its working directory `cwd`, apart from its default ones:
+/// `configured`, the directories the user would pass with `-I`, and for GNU
+/// make includes those added to `MAKEFLAGS`. Relative directories are taken
+/// relative to `cwd`, and dropped if it isn't known.
+pub fn include_dirs(
+    configured: &[PathBuf],
+    vars: &LiteralVariables,
+    gnu: bool,
+    cwd: Option<&Path>,
+) -> Vec<PathBuf> {
+    let makeflags = if gnu {
+        vars.makeflags_include_dirs.as_slice()
+    } else {
+        &[]
+    };
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    for dir in configured
+        .iter()
+        .map(PathBuf::as_path)
+        .chain(makeflags.iter().map(Path::new))
+    {
+        let dir = if dir.is_absolute() {
+            normalize(dir)
+        } else if let Some(cwd) = cwd {
+            normalize(&cwd.join(dir))
+        } else {
+            continue;
+        };
+        if !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
+    }
+    dirs
+}
+
+/// The value of an assignment to `MAKEFLAGS` that GNU make applies while
+/// reading the makefiles, if it is unconditional and has no references.
+fn makeflags_value(
+    def: &makefile_lossless::VariableDefinition,
+    variant: MakefileVariant,
+) -> Option<String> {
+    let op = def.assignment_operator()?;
+    if !matches!(op.as_str(), "=" | ":=" | "::=" | ":::=" | "+=") || def.is_define() {
+        return None;
+    }
+    if def.is_target_specific() || !def.enclosing_branches().is_empty() {
+        return None;
+    }
+    def.value_for(variant).filter(|v| !v.contains('$'))
+}
+
+/// The directories given with `-I DIR`, `-IDIR` or `--include-dir=DIR` in
+/// make command line flags. `-I-` drops the directories before it.
+///
+/// TODO: make `-I-` drop the configured and default directories too, like
+/// make does.
+fn include_dirs_from_flags(flags: &str) -> Vec<String> {
+    let mut words = flags.split_whitespace();
+    let mut dirs = Vec::new();
+    while let Some(word) = words.next() {
+        let dir = match word {
+            "-I" | "--include-dir" => words.next(),
+            _ => word
+                .strip_prefix("--include-dir=")
+                .or_else(|| word.strip_prefix("-I")),
+        };
+        match dir {
+            Some("-") => dirs.clear(),
+            Some(dir) => dirs.push(dir.to_string()),
+            None => {}
+        }
+    }
+    dirs
 }
 
 fn literal_value(
@@ -505,19 +607,19 @@ pub struct ResolvedInclude {
 /// GNU make resolves relative names against its working directory, which is
 /// normally the directory of the top-level makefile (`cwd`). Names are also
 /// tried relative to the including file's directory (`dir`), since fragments
-/// are often written that way.
+/// are often written that way. Relative names that aren't found there are
+/// looked for in the [`include_dirs`] for `configured`, then for GNU make
+/// includes in make's default include directories.
 ///
 /// GNU make expands wildcards in the name, giving one resolution per
 /// matching file. A pattern that matches nothing is used as a file name.
-///
-/// TODO: try `-I` directories and make's default include directories; those
-/// aren't known to the server.
 pub fn resolve_include(
     path: &IncludePath,
     vars: &LiteralVariables,
     variant: MakefileVariant,
     cwd: Option<&Path>,
     dir: Option<&Path>,
+    configured: &[PathBuf],
     exists: &dyn Fn(&Path) -> bool,
 ) -> Vec<Resolution> {
     let Some(mut expanded) = expand(&path.name, vars, variant, cwd) else {
@@ -548,33 +650,51 @@ pub fn resolve_include(
             }
         }
     }
-    vec![resolve_name(Path::new(&expanded), cwd, dir, exists)]
+    vec![resolve_name(
+        path,
+        Path::new(&expanded),
+        vars,
+        cwd,
+        dir,
+        configured,
+        exists,
+    )]
 }
 
 fn resolve_name(
+    path: &IncludePath,
     expanded: &Path,
+    vars: &LiteralVariables,
     cwd: Option<&Path>,
     dir: Option<&Path>,
+    configured: &[PathBuf],
     exists: &dyn Fn(&Path) -> bool,
 ) -> Resolution {
-    let candidates: Vec<PathBuf> = if expanded.is_absolute() {
-        vec![normalize(expanded)]
-    } else {
-        let mut candidates: Vec<PathBuf> = Vec::new();
-        for base in [cwd, dir].into_iter().flatten() {
-            let candidate = normalize(&base.join(expanded));
-            if !candidates.contains(&candidate) {
-                candidates.push(candidate);
-            }
-        }
-        candidates
-    };
-    if let Some(found) = candidates.iter().find(|c| exists(c)) {
-        return Resolution::Found(found.clone());
+    if expanded.is_absolute() {
+        let absolute = normalize(expanded);
+        return if exists(&absolute) {
+            Resolution::Found(absolute)
+        } else {
+            Resolution::Missing(absolute)
+        };
     }
-    match candidates.into_iter().next() {
-        Some(first) => Resolution::Missing(first),
-        None => Resolution::Unresolved,
+    let bases: Vec<&Path> = [cwd, dir].into_iter().flatten().collect();
+    // Without a working directory there's no telling where make would look
+    // first, but a file found in the include directories is still read.
+    let first = bases.first().map(|base| normalize(&base.join(expanded)));
+    let mut search = include_dirs(configured, vars, path.gnu, cwd);
+    if path.gnu {
+        search.extend(DEFAULT_INCLUDE_DIRS.iter().map(PathBuf::from));
+    }
+    let found = bases
+        .into_iter()
+        .chain(search.iter().map(PathBuf::as_path))
+        .map(|base| normalize(&base.join(expanded)))
+        .find(|candidate| exists(candidate));
+    match (found, first) {
+        (Some(found), _) => Resolution::Found(found),
+        (None, Some(first)) => Resolution::Missing(first),
+        (None, None) => Resolution::Unresolved,
     }
 }
 
@@ -615,6 +735,8 @@ pub struct FileSet {
     editable: Vec<bool>,
     /// The include directives of the current document.
     includes: Vec<ResolvedInclude>,
+    /// The [`include_dirs`] for the current document's GNU make includes.
+    include_dirs: Vec<PathBuf>,
     /// Whether every include directive in the documents was resolved to a
     /// file that could be loaded.
     complete: bool,
@@ -630,6 +752,7 @@ impl FileSet {
             docs: vec![Arc::new(doc)],
             editable: vec![true],
             includes: Vec::new(),
+            include_dirs: Vec::new(),
             complete: false,
             includers: Vec::new(),
         }
@@ -668,6 +791,12 @@ impl FileSet {
     /// document, in path order.
     pub fn includers(&self) -> &[PathBuf] {
         &self.includers
+    }
+
+    /// The directories searched for included files besides make's working
+    /// directory and its default include directories.
+    pub fn include_dirs(&self) -> &[PathBuf] {
+        &self.include_dirs
     }
 
     /// Whether the set holds every makefile that its documents include, so
@@ -731,6 +860,8 @@ pub struct Workspace {
     visible: HashMap<Uri, BTreeSet<PathBuf>>,
     /// Workspace folders.
     roots: Vec<PathBuf>,
+    /// Include directories configured by the user, as with `make -I`.
+    include_dirs: Vec<PathBuf>,
 }
 
 impl Workspace {
@@ -740,6 +871,13 @@ impl Workspace {
 
     pub fn set_roots(&mut self, roots: Vec<PathBuf>) {
         self.roots = roots.iter().map(|r| normalize(r)).collect();
+    }
+
+    /// Set the directories to search for included files, as `make -I` does.
+    /// Relative directories are taken relative to the directory of the
+    /// top-level makefile.
+    pub fn set_include_dirs(&mut self, dirs: Vec<PathBuf>) {
+        self.include_dirs = dirs;
     }
 
     /// Add or replace an open editor buffer.
@@ -797,6 +935,7 @@ impl Workspace {
         let mut docs = walk.docs;
         let mut includes = walk.includes.remove(&uri).unwrap_or_default();
         let mut includers = Vec::new();
+        let mut search_dirs = include_dirs(&self.include_dirs, &walk.vars, true, current.dir());
 
         if let Some(path) = current.path() {
             self.probe_includers(path);
@@ -810,7 +949,6 @@ impl Workspace {
                     continue;
                 }
                 complete &= root_walk.is_complete();
-                includers.push(root);
                 for doc in root_walk.docs {
                     if !docs.iter().any(|d| d.uri() == doc.uri()) {
                         docs.push(doc);
@@ -819,6 +957,12 @@ impl Workspace {
                 if let Some(root_includes) = root_walk.includes.get(&uri) {
                     merge_includes(&mut includes, root_includes);
                 }
+                for dir in include_dirs(&self.include_dirs, &root_walk.vars, true, root.parent()) {
+                    if !search_dirs.contains(&dir) {
+                        search_dirs.push(dir);
+                    }
+                }
+                includers.push(root);
             }
         }
 
@@ -827,6 +971,7 @@ impl Workspace {
             docs,
             editable,
             includes,
+            include_dirs: search_dirs,
             complete,
             includers,
         }
@@ -1048,8 +1193,15 @@ impl Workspace {
         let mut children = BTreeSet::new();
         for path in include_paths(&makefile) {
             let exists = |p: &Path| self.open_paths.contains_key(p) || p.is_file();
-            let resolutions =
-                resolve_include(&path, &walk.vars, doc.variant(), cwd, doc.dir(), &exists);
+            let resolutions = resolve_include(
+                &path,
+                &walk.vars,
+                doc.variant(),
+                cwd,
+                doc.dir(),
+                &self.include_dirs,
+                &exists,
+            );
             for mut resolution in resolutions {
                 if let Resolution::Found(target) = &resolution {
                     let target = target.clone();
@@ -1501,6 +1653,7 @@ pub mod tests {
                 MakefileVariant::GNUMake,
                 Some(Path::new("/top")),
                 Some(Path::new("/top/sub")),
+                &[],
                 &exists
             ),
             vec![Resolution::Found(PathBuf::from("/top/x.mk"))]
@@ -1512,6 +1665,7 @@ pub mod tests {
                 MakefileVariant::GNUMake,
                 Some(Path::new("/elsewhere")),
                 Some(Path::new("/top/sub")),
+                &[],
                 &exists
             ),
             vec![Resolution::Found(PathBuf::from("/top/sub/x.mk"))]
@@ -1523,6 +1677,7 @@ pub mod tests {
                 MakefileVariant::GNUMake,
                 Some(Path::new("/top")),
                 None,
+                &[],
                 &exists
             ),
             vec![Resolution::Missing(PathBuf::from("/top/y.mk"))]
@@ -1534,6 +1689,7 @@ pub mod tests {
                 MakefileVariant::GNUMake,
                 None,
                 None,
+                &[],
                 &exists
             ),
             vec![Resolution::Unresolved]
@@ -1555,6 +1711,7 @@ pub mod tests {
                     MakefileVariant::BSDMake,
                     Some(Path::new("/top")),
                     None,
+                    &[],
                     &exists
                 ))
                 .collect::<Vec<_>>(),
@@ -1752,6 +1909,150 @@ pub mod tests {
                 include("x.mk", 5, Resolution::Missing("/a/x.mk".into())),
             ]
         );
+    }
+
+    #[test]
+    fn test_include_dirs_from_flags() {
+        assert_eq!(
+            include_dirs_from_flags("-k -I a -Ib --include-dir=c --include-dir d -j4"),
+            vec!["a", "b", "c", "d"]
+        );
+        assert_eq!(include_dirs_from_flags("-I"), Vec::<String>::new());
+        assert_eq!(include_dirs_from_flags("-I a -I- -I b"), vec!["b"]);
+    }
+
+    #[test]
+    fn test_include_dirs() {
+        let v = vars("MAKEFLAGS += -I mf\nifdef X\nMAKEFLAGS += -I cond\nendif\n");
+        let configured = [PathBuf::from("conf"), PathBuf::from("/abs/../abs2")];
+        assert_eq!(
+            include_dirs(&configured, &v, true, Some(Path::new("/top"))),
+            vec![
+                PathBuf::from("/top/conf"),
+                PathBuf::from("/abs2"),
+                PathBuf::from("/top/mf")
+            ]
+        );
+        assert_eq!(
+            include_dirs(&configured, &v, false, Some(Path::new("/top"))),
+            vec![PathBuf::from("/top/conf"), PathBuf::from("/abs2")]
+        );
+        assert_eq!(
+            include_dirs(&configured, &v, true, None),
+            vec![PathBuf::from("/abs2")]
+        );
+    }
+
+    #[test]
+    fn test_resolve_default_include_dirs() {
+        let v = LiteralVariables::default();
+        let exists = |p: &Path| p == Path::new("/usr/include/x.mk");
+        assert_eq!(
+            resolve_include(
+                &gnu_path("x.mk"),
+                &v,
+                MakefileVariant::GNUMake,
+                Some(Path::new("/top")),
+                None,
+                &[],
+                &exists
+            ),
+            vec![Resolution::Found(PathBuf::from("/usr/include/x.mk"))]
+        );
+        assert_eq!(
+            resolve_include(
+                &gnu_path("x.mk"),
+                &v,
+                MakefileVariant::GNUMake,
+                None,
+                None,
+                &[],
+                &exists
+            ),
+            vec![Resolution::Found(PathBuf::from("/usr/include/x.mk"))]
+        );
+        let bsd = IncludePath {
+            gnu: false,
+            ..gnu_path("x.mk")
+        };
+        assert_eq!(
+            resolve_include(
+                &bsd,
+                &v,
+                MakefileVariant::BSDMake,
+                Some(Path::new("/top")),
+                None,
+                &[],
+                &exists
+            ),
+            vec![Resolution::Missing(PathBuf::from("/top/x.mk"))]
+        );
+    }
+
+    #[test]
+    fn test_include_dirs_option() {
+        assert_eq!(include_dirs_option(None), Ok(vec![]));
+        assert_eq!(
+            include_dirs_option(Some(&serde_json::json!({"other": 1}))),
+            Ok(vec![])
+        );
+        assert_eq!(
+            include_dirs_option(Some(
+                &serde_json::json!({"includeDirs": ["mk", "/usr/share/mk"]})
+            )),
+            Ok(vec![PathBuf::from("mk"), PathBuf::from("/usr/share/mk")])
+        );
+        assert_eq!(
+            include_dirs_option(Some(&serde_json::json!({"includeDirs": "mk"}))),
+            Err(
+                "invalid includeDirs initialization option: invalid type: string \"mk\", expected a sequence"
+                    .to_string()
+            )
+        );
+    }
+
+    fn file_set_with_include_dirs(fx: &Fixture, name: &str, dirs: &[&str]) -> FileSet {
+        let mut ws = Workspace::new();
+        ws.set_roots(vec![fx.path("")]);
+        ws.set_include_dirs(dirs.iter().map(PathBuf::from).collect());
+        let uri = fx.open_in(&mut ws, name);
+        ws.file_set(&uri).unwrap()
+    }
+
+    #[test]
+    fn test_file_set_configured_include_dir() {
+        let fx = Fixture::new(&[
+            ("Makefile", "include x.mk y.mk z.mk\n"),
+            ("x.mk", ""),
+            ("inc/x.mk", ""),
+            ("inc/y.mk", ""),
+            ("other/y.mk", ""),
+        ]);
+        let set = file_set_with_include_dirs(&fx, "Makefile", &["inc", "other"]);
+        assert_eq!(fx.names(&set), vec!["Makefile", "x.mk", "inc/y.mk"]);
+        assert_eq!(
+            set.includes()
+                .iter()
+                .map(|i| i.resolution.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                Resolution::Found(fx.path("x.mk")),
+                Resolution::Found(fx.path("inc/y.mk")),
+                Resolution::Missing(fx.path("z.mk")),
+            ]
+        );
+        assert_eq!(set.include_dirs(), [fx.path("inc"), fx.path("other")]);
+    }
+
+    #[test]
+    fn test_file_set_makeflags_include_dir() {
+        let fx = Fixture::new(&[
+            ("Makefile", "MAKEFLAGS += -Iinc\ninclude x.mk\n"),
+            ("inc/x.mk", ""),
+        ]);
+        let set = fx.file_set("Makefile");
+        assert_eq!(fx.names(&set), vec!["Makefile", "inc/x.mk"]);
+        assert_eq!(set.include_dirs(), [fx.path("inc")]);
     }
 
     #[test]

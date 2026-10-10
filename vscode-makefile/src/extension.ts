@@ -107,7 +107,8 @@ export function activate(context: ExtensionContext) {
     initializationOptions: {
       codeLens: {
         runTarget: config.get<boolean>('codeLens.runTarget', true)
-      }
+      },
+      includeDirs: config.get<string[]>('includeDirs', [])
     }
   };
 

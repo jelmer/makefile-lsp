@@ -1,6 +1,6 @@
 //! Completion provider for Makefiles.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use makefile_lossless::{Makefile, MakefileVariant, TextRange, TextSize};
 use tower_lsp_server::ls_types::{
@@ -17,13 +17,15 @@ use crate::position::try_position_to_offset;
 /// makefiles visible from it (included or including ones), whose targets and
 /// variables are offered too. `base_dir` is the directory of the source file;
 /// used to resolve relative paths when offering filesystem completions for
-/// prerequisites. `snippets` is the make variant to offer snippets for, or
+/// prerequisites. `include_dirs` are the other directories searched for
+/// included files. `snippets` is the make variant to offer snippets for, or
 /// `None` if the client does not support snippets.
 pub fn get_completions(
     makefiles: &[Makefile],
     source_text: &str,
     position: Position,
     base_dir: Option<&Path>,
+    include_dirs: &[PathBuf],
     snippets: Option<MakefileVariant>,
 ) -> Vec<CompletionItem> {
     let lines: Vec<&str> = source_text.lines().collect();
@@ -58,7 +60,7 @@ pub fn get_completions(
         // In the file names of an include directive, offer filesystem
         // completions, ranking common Makefile fragment names first.
         if let Some(partial) = include_partial(makefile, source_text, offset) {
-            return get_include_completions(partial, base_dir);
+            return get_include_completions(partial, base_dir, include_dirs);
         }
 
         // If the cursor sits in the prerequisites area, offer target names and
@@ -537,18 +539,23 @@ fn is_makefile_fragment(name: &str) -> bool {
         || name == "GNUmakefile"
 }
 
-/// Generate filesystem completions for an include directive path, ranking
-/// common Makefile fragment names (`*.mk`, `Makefile.*`, ...) ahead of other
-/// entries.
-fn get_include_completions(partial: &str, base_dir: Option<&Path>) -> Vec<CompletionItem> {
-    let Some(base) = base_dir else {
-        return Vec::new();
-    };
-
-    // TODO: also offer files from `-I`/`--include-dir` search directories once
-    // those are tracked; for now we only complete paths relative to base_dir.
-    filesystem_completions(base, partial)
+/// Generate filesystem completions for an include directive path, from
+/// `base_dir` and then `include_dirs`, ranking common Makefile fragment names
+/// (`*.mk`, `Makefile.*`, ...) ahead of other entries.
+///
+/// make's default include directories are left out, since they mostly hold
+/// C headers.
+fn get_include_completions(
+    partial: &str,
+    base_dir: Option<&Path>,
+    include_dirs: &[PathBuf],
+) -> Vec<CompletionItem> {
+    let mut seen = std::collections::HashSet::new();
+    base_dir
         .into_iter()
+        .chain(include_dirs.iter().map(PathBuf::as_path))
+        .flat_map(|dir| filesystem_completions(dir, partial))
+        .filter(|item| seen.insert(item.label.clone()))
         .map(|mut item| {
             let is_dir = item.kind == Some(CompletionItemKind::FOLDER);
             let basename = item.label.rsplit('/').next().unwrap_or(&item.label);
@@ -699,7 +706,7 @@ mod tests {
         let text = "all: build\n\n";
         let parsed = Makefile::parse(text);
         let makefile = parsed.tree();
-        let completions = get_completions(&[makefile], text, Position::new(1, 0), None, None);
+        let completions = get_completions(&[makefile], text, Position::new(1, 0), None, &[], None);
         assert!(!completions.is_empty());
         assert!(completions.iter().any(|c| c.label == ".PHONY"));
     }
@@ -709,7 +716,7 @@ mod tests {
         let text = ".PHONY: all\n\n";
         let parsed = Makefile::parse(text);
         let makefile = parsed.tree();
-        let completions = get_completions(&[makefile], text, Position::new(1, 0), None, None);
+        let completions = get_completions(&[makefile], text, Position::new(1, 0), None, &[], None);
         assert!(!completions.iter().any(|c| c.label == ".PHONY"));
     }
 
@@ -718,7 +725,7 @@ mod tests {
         let text = "all:\n\t";
         let parsed = Makefile::parse(text);
         let makefile = parsed.tree();
-        let completions = get_completions(&[makefile], text, Position::new(1, 1), None, None);
+        let completions = get_completions(&[makefile], text, Position::new(1, 1), None, &[], None);
         assert!(completions.is_empty());
     }
 
@@ -727,7 +734,7 @@ mod tests {
         let text = "CC = gcc\nCFLAGS = -Wall\n";
         let parsed = Makefile::parse(text);
         let makefile = parsed.tree();
-        let completions = get_completions(&[makefile], text, Position::new(2, 1), None, None);
+        let completions = get_completions(&[makefile], text, Position::new(2, 1), None, &[], None);
         // Should not crash, may offer variable completions
         let _ = completions;
     }
@@ -737,7 +744,7 @@ mod tests {
         let text = "all:\n\t$(";
         let parsed = Makefile::parse(text);
         let makefile = parsed.tree();
-        let completions = get_completions(&[makefile], text, Position::new(1, 3), None, None);
+        let completions = get_completions(&[makefile], text, Position::new(1, 3), None, &[], None);
         let make = completions.iter().find(|c| c.label == "MAKE").unwrap();
         assert_eq!(make.insert_text.as_deref(), Some("MAKE)"));
         assert!(completions.iter().any(|c| c.label == "MAKEFLAGS"));
@@ -751,7 +758,7 @@ mod tests {
         let text = "CC = gcc\nall:\n\t$(";
         let parsed = Makefile::parse(text);
         let makefile = parsed.tree();
-        let completions = get_completions(&[makefile], text, Position::new(2, 3), None, None);
+        let completions = get_completions(&[makefile], text, Position::new(2, 3), None, &[], None);
         let cc = completions.iter().find(|c| c.label == "CC").unwrap();
         assert_eq!(cc.insert_text.as_deref(), Some("CC)"));
     }
@@ -803,7 +810,7 @@ mod tests {
         let parsed = Makefile::parse(text);
         let makefile = parsed.tree();
         // Position cursor right after "all: "
-        let completions = get_completions(&[makefile], text, Position::new(6, 5), None, None);
+        let completions = get_completions(&[makefile], text, Position::new(6, 5), None, &[], None);
         let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
         assert!(
             labels.contains(&"build"),
@@ -818,7 +825,7 @@ mod tests {
         let text = ".PHONY: build\n\n%.o: %.c\n\techo compile\n\nbuild:\n\techo build\n\nall: \n";
         let parsed = Makefile::parse(text);
         let makefile = parsed.tree();
-        let completions = get_completions(&[makefile], text, Position::new(8, 5), None, None);
+        let completions = get_completions(&[makefile], text, Position::new(8, 5), None, &[], None);
         let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
         assert!(labels.contains(&"build"));
         assert!(!labels.iter().any(|l| l.contains('%')));
@@ -829,7 +836,7 @@ mod tests {
     fn test_prerequisite_completions_on_continuation_line() {
         let text = "build:\nall: a \\\n  \n";
         let makefile = Makefile::parse(text).tree();
-        let completions = get_completions(&[makefile], text, Position::new(2, 2), None, None);
+        let completions = get_completions(&[makefile], text, Position::new(2, 2), None, &[], None);
         let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
         assert_eq!(labels, vec!["build", "all"]);
     }
@@ -838,7 +845,7 @@ mod tests {
     fn test_no_prerequisite_completions_in_variable_value() {
         let text = "build:\nFOO := b";
         let makefile = Makefile::parse(text).tree();
-        let completions = get_completions(&[makefile], text, Position::new(1, 8), None, None);
+        let completions = get_completions(&[makefile], text, Position::new(1, 8), None, &[], None);
         assert_eq!(completions, vec![]);
     }
 
@@ -857,6 +864,7 @@ mod tests {
             text,
             Position::new(0, 5),
             Some(dir.path()),
+            &[],
             None,
         );
 
@@ -885,6 +893,7 @@ mod tests {
             text,
             Position::new(0, 9),
             Some(dir.path()),
+            &[],
             None,
         );
 
@@ -907,6 +916,7 @@ mod tests {
             text,
             Position::new(0, 5),
             Some(dir.path()),
+            &[],
             None,
         );
         let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
@@ -928,6 +938,7 @@ mod tests {
             text,
             Position::new(0, 6),
             Some(dir.path()),
+            &[],
             None,
         );
         let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
@@ -971,6 +982,7 @@ mod tests {
             text,
             Position::new(0, 8),
             Some(dir.path()),
+            &[],
             None,
         );
 
@@ -993,6 +1005,41 @@ mod tests {
     }
 
     #[test]
+    fn test_include_completions_from_include_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::create_dir_all(dir.path().join("inc/sub")).unwrap();
+        std::fs::write(dir.path().join("src/local.mk"), "").unwrap();
+        std::fs::write(dir.path().join("src/both.mk"), "").unwrap();
+        std::fs::write(dir.path().join("inc/both.mk"), "").unwrap();
+        std::fs::write(dir.path().join("inc/rules.mk"), "").unwrap();
+        let text = "include \n";
+        let parsed = Makefile::parse(text);
+        let completions = get_completions(
+            &[parsed.tree()],
+            text,
+            Position::new(0, 8),
+            Some(&dir.path().join("src")),
+            &[dir.path().join("inc")],
+            None,
+        );
+        let mut labels: Vec<(&str, Option<CompletionItemKind>)> = completions
+            .iter()
+            .map(|c| (c.label.as_str(), c.kind))
+            .collect();
+        labels.sort_by_key(|(label, _)| *label);
+        assert_eq!(
+            labels,
+            vec![
+                ("both.mk", Some(CompletionItemKind::FILE)),
+                ("local.mk", Some(CompletionItemKind::FILE)),
+                ("rules.mk", Some(CompletionItemKind::FILE)),
+                ("sub", Some(CompletionItemKind::FOLDER)),
+            ]
+        );
+    }
+
+    #[test]
     fn test_include_completions_for_earlier_path() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("rules")).unwrap();
@@ -1003,6 +1050,7 @@ mod tests {
             text,
             Position::new(0, 10),
             Some(dir.path()),
+            &[],
             None,
         );
         let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
@@ -1020,6 +1068,7 @@ mod tests {
             text,
             Position::new(1, 0),
             Some(dir.path()),
+            &[],
             None,
         );
         assert!(completions.iter().all(|c| c.label != "rules"));
@@ -1050,6 +1099,7 @@ mod tests {
             text,
             Position::new(0, 14),
             Some(dir.path()),
+            &[],
             None,
         );
         let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
@@ -1059,7 +1109,7 @@ mod tests {
     fn labels(text: &str, pos: Position) -> Vec<String> {
         let parsed = Makefile::parse(text);
         let makefile = parsed.tree();
-        get_completions(&[makefile], text, pos, None, None)
+        get_completions(&[makefile], text, pos, None, &[], None)
             .into_iter()
             .map(|c| c.label)
             .collect()
@@ -1078,7 +1128,7 @@ mod tests {
         let text = "CC = gcc\nifd\n";
         let parsed = Makefile::parse(text);
         let makefile = parsed.tree();
-        let completions = get_completions(&[makefile], text, Position::new(1, 3), None, None);
+        let completions = get_completions(&[makefile], text, Position::new(1, 3), None, &[], None);
         let ifdef = completions.iter().find(|c| c.label == "ifdef").unwrap();
         assert_eq!(ifdef.kind, Some(CompletionItemKind::KEYWORD));
         assert_eq!(ifdef.insert_text.as_deref(), Some("ifdef "));
@@ -1153,7 +1203,7 @@ mod tests {
         let set = fx.file_set("Makefile");
         let makefiles: Vec<Makefile> = set.docs().map(|d| d.makefile()).collect();
         let mut labels: Vec<String> =
-            get_completions(&makefiles, set.current().text(), pos, None, None)
+            get_completions(&makefiles, set.current().text(), pos, None, &[], None)
                 .into_iter()
                 .filter(|c| c.kind != Some(CompletionItemKind::FUNCTION))
                 .filter(|c| {
@@ -1222,7 +1272,7 @@ mod tests {
 
     fn snippets(text: &str, pos: Position, variant: MakefileVariant) -> Vec<(String, String)> {
         let makefile = Makefile::parse(text).tree();
-        get_completions(&[makefile], text, pos, None, Some(variant))
+        get_completions(&[makefile], text, pos, None, &[], Some(variant))
             .into_iter()
             .filter(|c| c.kind == Some(CompletionItemKind::SNIPPET))
             .map(|c| {
@@ -1273,7 +1323,14 @@ mod tests {
     #[test]
     fn test_no_snippets_without_client_support() {
         let makefile = Makefile::parse("all:\n\n").tree();
-        let completions = get_completions(&[makefile], "all:\n\n", Position::new(1, 0), None, None);
+        let completions = get_completions(
+            &[makefile],
+            "all:\n\n",
+            Position::new(1, 0),
+            None,
+            &[],
+            None,
+        );
         assert!(!completions.is_empty());
         assert_eq!(
             completions
@@ -1292,6 +1349,7 @@ mod tests {
             "  ife",
             Position::new(0, 5),
             None,
+            &[],
             Some(MakefileVariant::GNUMake),
         )
         .into_iter()
@@ -1426,6 +1484,7 @@ mod tests {
             text,
             pos,
             None,
+            &[],
             snippets.then_some(MakefileVariant::GNUMake),
         )
         .into_iter()
