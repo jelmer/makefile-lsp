@@ -265,7 +265,13 @@ impl LanguageServer for Backend {
                 .into_iter()
                 .collect(),
         };
-        self.workspace.lock().await.set_roots(roots);
+        let include_dirs = workspace::include_dirs_option(params.initialization_options.as_ref())
+            .map_err(Error::invalid_params)?;
+        {
+            let mut workspace = self.workspace.lock().await;
+            workspace.set_roots(roots);
+            workspace.set_include_dirs(include_dirs);
+        }
         let watch_files = params
             .capabilities
             .workspace
@@ -484,6 +490,7 @@ impl LanguageServer for Backend {
             doc.text(),
             position,
             doc.dir(),
+            files.include_dirs(),
             self.snippet_support
                 .load(Ordering::Relaxed)
                 .then(|| doc.variant()),

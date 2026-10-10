@@ -26,6 +26,8 @@ Settings in `coc-settings.json`:
   lenses when `codeLens.enable` is set
 - `make.makeProgram` (string, default `"make"`): the make program used to run
   targets, such as `gmake`, `bmake` or `nmake`
+- `make.includeDirs` (array of strings, default `[]`): directories to search
+  for included makefiles, as with `make -I`
 
 ## Development
 

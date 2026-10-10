@@ -87,7 +87,7 @@ pub fn get_diagnostics(
             include_paths(&makefile)
                 .into_iter()
                 .flat_map(|path| {
-                    resolve_include(&path, &vars, variant, Some(dir), Some(dir), &|p| {
+                    resolve_include(&path, &vars, variant, Some(dir), Some(dir), &[], &|p| {
                         p.is_file()
                     })
                     .into_iter()

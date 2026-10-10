@@ -93,7 +93,8 @@ export async function activate(context: ExtensionContext): Promise<void> {
     initializationOptions: {
       codeLens: {
         runTarget: config.get<boolean>('codeLens.runTarget', true)
-      }
+      },
+      includeDirs: config.get<string[]>('includeDirs', [])
     }
   };
 

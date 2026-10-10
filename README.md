@@ -120,7 +120,16 @@ to the directory of the top-level makefile and of the including file.
 Variable references in include paths are expanded when the variable has a
 single plain value, as in `TOPDIR := ..` followed by `include
 $(TOPDIR)/rules.mk`, and wildcards in GNU make includes such as `include
-*.mk` are expanded; other paths and `-I` directories are not resolved.
+*.mk` are expanded; other paths are not resolved.
+
+Like `make`, the server also looks for included files in the include
+directories: those given with the `includeDirs` initialization option (a
+list of paths, relative ones taken relative to the top-level makefile's
+directory, as with `make -I`), those added with `-I` in an unconditional
+`MAKEFLAGS` assignment, and GNU make's default directories
+(`/usr/gnu/include`, `/usr/local/include`, `/usr/include`). Include path
+completion offers files from the first two. Changing `includeDirs` takes
+effect when the server restarts.
 
 A fragment such as `rules.mk` opened on its own also sees the makefile that
 includes it, if that makefile is open or is the `GNUmakefile`, `makefile`
@@ -164,7 +173,8 @@ vim.api.nvim_create_autocmd("FileType", {
 ### VS Code
 
 The `vscode-makefile` directory contains a VS Code extension that runs
-`makefile-lsp`. Set `makefile.serverPath` to use a specific binary.
+`makefile-lsp`. Set `makefile.serverPath` to use a specific binary and
+`makefile.includeDirs` to set the include directories.
 `makefile.makeProgram` (default `make`) is the program used to run targets
 from their code lenses, which run as VS Code tasks;
 `makefile.codeLens.runTarget` turns these lenses off.

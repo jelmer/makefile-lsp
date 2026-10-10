@@ -49,6 +49,14 @@
           "type": "string",
           "default": "make",
           "description": "The make program used to run targets, such as make, gmake, bmake or nmake"
+        },
+        "make.includeDirs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Directories to search for included makefiles, as with make -I. Relative paths are taken relative to the directory of the top-level makefile."
         }
       }
     },
