@@ -433,21 +433,14 @@ fn escape_snippet(text: &str) -> String {
     escaped
 }
 
-/// The recipe prefix in effect at `offset`: the first character of the last
-/// `.RECIPEPREFIX` set before it, or a tab.
-// TODO: use a makefile-lossless API for this once there is one; this misses
-// .RECIPEPREFIX set in included files and does not expand its value.
+/// The recipe prefix in effect at `offset`: the one set with `.RECIPEPREFIX`
+/// for GNU make, or a tab.
+// TODO: take .RECIPEPREFIX set in included files into account.
 fn recipe_prefix(makefile: &Makefile, variant: MakefileVariant, offset: TextSize) -> char {
     if variant != MakefileVariant::GNUMake {
         return '\t';
     }
-    makefile
-        .variable_definitions_by_name(".RECIPEPREFIX")
-        .filter(|v| v.text_range().end() <= offset)
-        .last()
-        .and_then(|v| v.raw_value())
-        .and_then(|value| value.trim().chars().next())
-        .unwrap_or('\t')
+    makefile.recipe_prefix_at(offset)
 }
 
 /// Generate variable reference completions for use after `$(`: well-known
@@ -1436,6 +1429,31 @@ mod tests {
             .find(|(label, _)| label == "rule")
             .unwrap();
         assert_eq!(rule.1, "${1:target}: ${2:prerequisites}\n\t$0");
+    }
+
+    #[test]
+    fn test_snippets_recipe_prefix_expansion() {
+        let rule = |text: &str| {
+            snippets(text, Position::new(2, 0), MakefileVariant::GNUMake)
+                .into_iter()
+                .find(|(label, _)| label == "rule")
+                .unwrap()
+                .1
+        };
+        // := expands the value, = does not.
+        assert_eq!(
+            rule("X = >\n.RECIPEPREFIX := $(X)\n\n"),
+            "${1:target}: ${2:prerequisites}\n>$0"
+        );
+        assert_eq!(
+            rule("X = >\n.RECIPEPREFIX = $(X)\n\n"),
+            "${1:target}: ${2:prerequisites}\n\\$$0"
+        );
+        // .RECIPEPREFIX is always defined, so ?= has no effect.
+        assert_eq!(
+            rule("X = >\n.RECIPEPREFIX ?= >\n\n"),
+            "${1:target}: ${2:prerequisites}\n\t$0"
+        );
     }
 
     #[test]
