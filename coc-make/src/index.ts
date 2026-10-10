@@ -1,11 +1,40 @@
+import * as path from 'path';
 import {
+  commands,
   ExtensionContext,
   LanguageClient,
   LanguageClientOptions,
   ServerOptions,
   services,
+  window,
   workspace
 } from 'coc.nvim';
+
+interface RunTargetArgs {
+  makefile?: string;
+  directory?: string;
+  target?: string;
+}
+
+/**
+ * Run a target in a terminal, for the "Run" code lenses.
+ */
+async function runTarget(args?: RunTargetArgs): Promise<void> {
+  if (!args?.makefile || !args.target) {
+    window.showErrorMessage('makefile-lsp.runTarget needs a makefile and a target');
+    return;
+  }
+  const program = workspace.getConfiguration('make').get<string>('makeProgram', 'make');
+  // nmake takes /F rather than -f.
+  const isNmake = path.basename(program).toLowerCase().replace(/\.exe$/, '') === 'nmake';
+  const terminal = await window.createTerminal({
+    name: `make ${args.target}`,
+    shellPath: program,
+    shellArgs: [isNmake ? '/F' : '-f', args.makefile, args.target],
+    cwd: args.directory ?? path.dirname(args.makefile)
+  });
+  await terminal.show(true);
+}
 
 /**
  * Set up highlight links for semantic token types.
@@ -39,6 +68,10 @@ export async function activate(context: ExtensionContext): Promise<void> {
 
   setupSemanticHighlights();
 
+  context.subscriptions.push(
+    commands.registerCommand('makefile-lsp.runTarget', runTarget, null, true)
+  );
+
   const serverPath = config.get<string>('serverPath', 'makefile-lsp');
 
   const serverOptions: ServerOptions = {
@@ -56,6 +89,11 @@ export async function activate(context: ExtensionContext): Promise<void> {
     ],
     synchronize: {
       fileEvents: workspace.createFileSystemWatcher('**/{Makefile,makefile,GNUmakefile,*.mk}')
+    },
+    initializationOptions: {
+      codeLens: {
+        runTarget: config.get<boolean>('codeLens.runTarget', true)
+      }
     }
   };
 

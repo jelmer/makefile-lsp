@@ -39,6 +39,16 @@
           "type": "string",
           "default": "makefile-lsp",
           "description": "Path to makefile-lsp executable"
+        },
+        "make.codeLens.runTarget": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show a code lens above each target that runs it with make (needs codeLens.enable)"
+        },
+        "make.makeProgram": {
+          "type": "string",
+          "default": "make",
+          "description": "The make program used to run targets, such as make, gmake, bmake or nmake"
         }
       }
     },
