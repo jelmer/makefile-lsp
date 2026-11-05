@@ -215,6 +215,10 @@ jobs:
           cache: 'npm'
           cache-dependency-path: coc-make/package-lock.json
 
+      # Trusted publishing requires npm >= 11.5.1
+      - name: Update npm
+        run: npm install -g npm@latest
+
       - name: Install dependencies
         run: npm ci
 
