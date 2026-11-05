@@ -5,7 +5,9 @@ A Language Server Protocol (LSP) implementation for Makefiles, built in Rust.
 ## Features
 
 All analysis is done on a lossless syntax tree of the makefile and the
-makefiles it includes (see below); the Makefile is never executed.
+makefiles it includes (see below); the Makefile is never executed. GNU make,
+BSD make and nmake syntax are supported, and checks, completion and hover
+adapt to the variant in use.
 
 - **Diagnostics** - parse errors plus a set of lint checks (listed below)
 - **Code actions** - quick fixes and refactorings (listed below)
@@ -45,8 +47,9 @@ makefiles it includes (see below); the Makefile is never executed.
   enclosing rule, variable or conditional, and the whole file
 - **Semantic tokens** - highlighting for targets, variables, prerequisites,
   recipes, directive keywords and comments
-- **Formatting** - converts space-indented recipes to tabs, trims trailing
-  whitespace where make ignores it, and normalizes the final newline
+- **Formatting** - of the whole document or a range: converts
+  space-indented recipes to tabs, trims trailing whitespace where make
+  ignores it, and normalizes the final newline
 - **On-type formatting** - inserts a tab after pressing enter on a rule line
 - **Command-line checking** - report diagnostics in CI, as text or SARIF
   (see below)
@@ -91,6 +94,7 @@ Each diagnostic carries a code, so it can be identified in editors:
 | `include-missing-path` | error | `include` without a path |
 | `missing-include-file` | warning | `include` of a file that does not exist |
 | `unreadable-include-file` | warning | `include` of a file that exists but cannot be read |
+| `parse-error` | error | syntax the parser can't make sense of |
 
 nmake has no `.PHONY`, so the checks for phony targets are skipped for nmake
 makefiles.
@@ -136,7 +140,10 @@ includes it, if that makefile is open or is the `GNUmakefile`, `makefile`
 or `Makefile` in the fragment's directory or one above it (up to the
 workspace folder).
 
-Open editor buffers take precedence over files on disk. Rename only edits
+Open editor buffers take precedence over files on disk. The server watches
+makefiles in the workspace (`*.mk`, `*.make`, `Makefile`, `makefile` and
+`GNUmakefile`) for changes made outside the editor and updates diagnostics
+for the open files that see them. Rename only edits
 open files and files inside the workspace folders.
 
 ## Installation
@@ -173,7 +180,7 @@ vim.api.nvim_create_autocmd("FileType", {
 ### VS Code
 
 The `vscode-makefile` directory contains a VS Code extension that runs
-`makefile-lsp`. Set `makefile.serverPath` to use a specific binary and
+`makefile-lsp`; the published extension bundles the server binary. Set `makefile.serverPath` to use a specific binary and
 `makefile.includeDirs` to set the include directories.
 `makefile.makeProgram` (default `make`) is the program used to run targets
 from their code lenses, which run as VS Code tasks;
